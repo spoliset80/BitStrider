@@ -1,6 +1,39 @@
 {
-  "generated_at": "2026-04-15T13:23:30-04:00",
+  "generated_at": "2026-04-15T17:29:10-04:00",
   "date": "2026-04-15",
   "market_regime": "bull",
-  "picks": []
+  "picks": [
+    {
+      "symbol": "HIMS",
+      "action": "buy",
+      "price": 24.38,
+      "confidence": 0.92,
+      "strategy": "Sentiment",
+      "reason": "Sentiment bullish + vol x5.18 + price>20SMA"
+    },
+    {
+      "symbol": "TSHA",
+      "action": "buy",
+      "price": 5.99,
+      "confidence": 0.92,
+      "strategy": "Sentiment",
+      "reason": "Sentiment bullish + vol x7.06 + price>20SMA"
+    },
+    {
+      "symbol": "DOO",
+      "action": "buy",
+      "price": 50.92,
+      "confidence": 0.92,
+      "strategy": "Sentiment",
+      "reason": "Sentiment bullish + vol x8.77 + price>20SMA"
+    },
+    {
+      "symbol": "IFS",
+      "action": "buy",
+      "price": 45.92,
+      "confidence": 0.92,
+      "strategy": "Sentiment",
+      "reason": "Sentiment bullish + vol x5.28 + price>20SMA"
+    }
+  ]
 }
