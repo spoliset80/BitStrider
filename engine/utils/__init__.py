@@ -19,6 +19,7 @@ import pytz
 import pandas as pd
 from typing import Optional, Dict, Tuple
 import os
+import sys
 
 # ── Per-cycle bar cache ─────────────────────────────────────────
 # Keyed by (symbol, period, interval). Each symbol is only ever
@@ -87,6 +88,7 @@ _option_data_client = None
 # ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 def setup_logging() -> logging.Logger:
     from logging.handlers import TimedRotatingFileHandler
+    import io
 
     fmt = "%(asctime)s [%(levelname)s] %(message)s"
     formatter = logging.Formatter(fmt)
@@ -101,7 +103,17 @@ def setup_logging() -> logging.Logger:
     for handler in list(root.handlers):
         root.removeHandler(handler)
 
-    console_handler = logging.StreamHandler()
+    # Fix Windows console encoding: wrap stdout with UTF-8 codec
+    # This ensures Unicode characters (like ≥ from Trade Ideas) can be printed
+    if sys.platform == "win32":
+        try:
+            console_stream = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
+        except Exception:
+            console_stream = sys.stdout
+    else:
+        console_stream = sys.stdout
+
+    console_handler = logging.StreamHandler(console_stream)
     console_handler.setFormatter(formatter)
 
     file_handler = TimedRotatingFileHandler(

@@ -134,7 +134,7 @@ class AutoBotWatchdog:
             self.logger.info("Launching main.py in %s mode", mode.upper())
 
             process = subprocess.Popen(
-                [str(python_exe), str(MAIN_SCRIPT), "--force"],
+                [str(python_exe), str(MAIN_SCRIPT)],
                 cwd=str(BASE_DIR),
                 env=env,
                 stdout=subprocess.PIPE,

@@ -1238,19 +1238,188 @@ class PowerOf3Strategy:
         )
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Trade Ideas Ensemble Strategy (TI + Sweepea Composite - HIGHEST PRIORITY)
+# ──────────────────────────────────────────────────────────────────────────────
+class TradeIdeasEnsembleStrategy:
+    """Composite ensemble: TI + Sweepea dual confirmation for maximum conviction.
+
+    Scoring:
+    - Both fire (TI + Sweepea) → 92% confidence (highest conviction)
+    - TI alone → 85% confidence (pre-filtered quality)
+    - Sweepea alone → 75% confidence (pattern signal without TI)
+    - Neither → no signal
+
+    Rationale:
+    - TI pre-filters quality (85% baseline)
+    - Sweepea validates with technical pattern (~72-88%)
+    - When BOTH agree → 92% composite confidence
+    - Reduces false signals, increases win rate
+    """
+
+    def __init__(self):
+        self._ti_strategy = TradeIdeasEquityStrategy()
+        self._sweepea_strategy = SweepeaStrategy()
+
+    def scan(self, symbol: str) -> Optional[Signal]:
+        """Run both strategies, return composite signal if either/both fire."""
+        ti_signal = self._ti_strategy.scan(symbol)
+        sweepea_signal = self._sweepea_strategy.scan(symbol)
+
+        # Both fire: maximum confidence (dual confirmation)
+        if ti_signal and sweepea_signal:
+            composite_confidence = min(0.92, max(ti_signal.confidence, sweepea_signal.confidence) + 0.07)
+            return Signal(
+                symbol, "buy", ti_signal.price, round(composite_confidence, 2),
+                f"TI + Sweepea dual confirm | TI {ti_signal.confidence:.0%} + Sweepea {sweepea_signal.confidence:.0%}",
+                "TradeIdeasEnsemble",
+                atr_stop=ti_signal.atr_stop or sweepea_signal.atr_stop,
+            )
+
+        # TI alone: solid confidence (pre-filtered quality)
+        if ti_signal:
+            return ti_signal
+
+        # Sweepea alone: lower confidence without TI confirmation
+        if sweepea_signal:
+            weaker_conf = max(sweepea_signal.confidence - 0.08, 0.75)
+            return Signal(
+                symbol, "buy", sweepea_signal.price, round(weaker_conf, 2),
+                f"Sweepea only (no TI) | {sweepea_signal.reason}",
+                "TradeIdeasEnsemble",
+                atr_stop=sweepea_signal.atr_stop,
+            )
+
+        return None
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Trade Ideas Equity Strategy (Primary Signal Source for TI Tickers)
+# ──────────────────────────────────────────────────────────────────────────────
+class TradeIdeasEquityStrategy:
+    """Prioritizes tickers from Trade Ideas primary universe (data/ti_primary.json).
+
+    Rationale:
+    - TI scrapers already filter high-conviction scans (marketscope, unusual options, etc.)
+    - Being in TI universe = signal with ~85% inherent confidence
+    - Apply basic guardrails (price, volume) but keep bar low
+    - Result: high-probability equity entries for extended-hours and regular trading
+
+    Configuration:
+    - USE_TI_PRIMARY_EQUITY_TRADING: Enable/disable this strategy
+    - TI_EQUITY_BASE_CONFIDENCE: Base confidence for TI tickers (default 0.85)
+    - Extended hours: Prioritize when 4AM-9:30AM (pre-market) for immediate execution
+    """
+
+    def __init__(self):
+        self._ti_primary_cache = None
+        self._cache_ts = 0.0
+        self._cache_ttl = 300.0  # Refresh every 5 min
+
+    def _get_ti_primary(self) -> list:
+        """Load TI primary tickers from data/ti_primary.json, with caching."""
+        now = time.monotonic()
+        if self._ti_primary_cache is not None and (now - self._cache_ts) < self._cache_ttl:
+            return self._ti_primary_cache
+
+        try:
+            from engine.equity.universe import get_ti_primary as _get_ti_primary
+            tickers = _get_ti_primary()
+            self._ti_primary_cache = list(tickers) if tickers else []
+            self._cache_ts = now
+            return self._ti_primary_cache
+        except Exception as e:
+            import logging
+            logging.getLogger("ApexTrader").warning(f"Failed to load TI primary tickers: {e}")
+            return []
+
+    def scan(self, symbol: str) -> Optional[Signal]:
+        """Check if symbol is in TI primary universe; return high-confidence buy signal."""
+        try:
+            from engine.config import USE_TI_PRIMARY_EQUITY_TRADING, TI_EQUITY_BASE_CONFIDENCE
+            if not USE_TI_PRIMARY_EQUITY_TRADING:
+                return None
+        except ImportError:
+            return None
+
+        # Check if symbol is in TI primary
+        ti_primary = self._get_ti_primary()
+        if symbol not in ti_primary:
+            return None
+
+        # Get current price and apply basic guardrails
+        try:
+            intraday = get_bars(symbol, "1d", "1m")
+            if intraday.empty or len(intraday) < 3:
+                return None
+
+            price = float(intraday["close"].iloc[-1])
+            if price < 1.0:  # Minimum viable price
+                return None
+
+            # Volume gate: at least some activity
+            vol_avg = float(intraday["volume"].mean())
+            if vol_avg < 1000:  # Minimum liquidity
+                return None
+
+            daily = get_bars(symbol, "5d", "1d")
+            if daily.empty or len(daily) < 2:
+                return None
+
+            prior_close = float(daily["close"].iloc[-2])
+            if prior_close <= 0:
+                return None
+
+            gap_pct = ((price - prior_close) / prior_close) * 100
+
+            # TI universe entry is the signal; base confidence from config
+            base_conf = float(TI_EQUITY_BASE_CONFIDENCE)
+            confidence = round(base_conf, 2)
+
+            # Slight boost if gap is favorable (up or tight)
+            if -2.0 <= gap_pct <= 5.0:
+                confidence = round(min(base_conf + 0.03, 0.99), 2)
+
+            atr14 = _calc_atr14(daily)
+            return Signal(
+                symbol, "buy", price, confidence,
+                f"Trade Ideas primary ticker | gap {gap_pct:+.1f}%",
+                "TradeIdeasEquity",
+                atr_stop=atr14 * ATR_STOP_MULTIPLIER if atr14 > 0 else None,
+            )
+        except Exception as e:
+            import logging
+            logging.getLogger("ApexTrader").debug(f"TradeIdeasEquity scan failed for {symbol}: {e}")
+            return None
+
+
 def get_strategy_instances(bear_regime: bool = True):
-    """Return instantiated strategy objects for current market regime."""
+    """Return instantiated strategy objects in priority order.
+    
+    4-Layer Equity Ensemble (PRIMARY):
+    1. TradeIdeasEnsembleStrategy - TI + Sweepea dual confirmation (92-85%)
+    2. PreMarketMomentum - Extended hours gap + momentum (7-10AM)
+    3. Momentum - Volume surge confirmation
+    4. TrendBreaker - Institutional breakouts
+    
+    Secondary/Fallback (for non-TI signals):
+    - GapBreakout, ORB, VWAP, FloatRotation, Technical, Sentiment
+    - OpeningBell, PMHigh, EarlyQuint, PowerOf3, BearBreakdown
+    """
     strategies = [
+        # PRIMARY: 4-Layer Equity Ensemble
+        TradeIdeasEnsembleStrategy(),           # Layer 1: TI + Sweepea (92-85%)
+        PreMarketMomentumStrategy(),            # Layer 2: Extended hours (7-10AM)
+        MomentumStrategy(),                     # Layer 3: Volume confirmation
+        TrendBreakerStrategy(),                 # Layer 4: Institutional breakouts
+        
+        # SECONDARY: Additional confirmation strategies
         GapBreakoutStrategy(),
         ORBStrategy(),
         VWAPReclaimStrategy(),
         FloatRotationStrategy(),
-        MomentumStrategy(),
         TechnicalStrategy(),
-        SweepeaStrategy(),
-        TrendBreakerStrategy(),
         SentimentStrategy(),
-        PreMarketMomentumStrategy(),
         OpeningBellSurgeStrategy(),
         PMHighBreakoutStrategy(),
         EarlySqueezeDetector(),

@@ -42,6 +42,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
+# ── Fix Windows console encoding to UTF-8 for Unicode characters ────────
+if sys.platform == "win32":
+    try:
+        import io
+        sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
+        sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
+    except Exception:
+        pass
+
 # ── optional PIL for timestamp overlay ──────────────────────────
 try:
     from PIL import Image, ImageDraw

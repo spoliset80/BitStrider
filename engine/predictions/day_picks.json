@@ -1,47 +1,47 @@
 {
-  "generated_at": "2026-04-14T23:27:49-04:00",
-  "date": "2026-04-14",
+  "generated_at": "2026-04-15T08:30:51-04:00",
+  "date": "2026-04-15",
   "market_regime": "bull",
   "picks": [
     {
-      "symbol": "KMX",
+      "symbol": "SG",
       "action": "buy",
-      "price": 41.67,
+      "price": 6.195,
       "confidence": 0.92,
-      "strategy": "Sentiment",
-      "reason": "Sentiment bullish + vol x4.89 + price>20SMA"
-    },
-    {
-      "symbol": "TVTX",
-      "action": "buy",
-      "price": 42.13,
-      "confidence": 0.889,
-      "strategy": "Sentiment",
-      "reason": "Sentiment bullish + vol x4.39 + price>20SMA"
-    },
-    {
-      "symbol": "TWST",
-      "action": "buy",
-      "price": 57.41,
-      "confidence": 0.8651,
-      "strategy": "Sentiment",
-      "reason": "Sentiment bullish + vol x4.15 + price>20SMA"
+      "strategy": "TradeIdeasEnsemble",
+      "reason": "TI + Sweepea dual confirm | TI 85% + Sweepea 82%"
     },
     {
       "symbol": "IONL",
       "action": "buy",
-      "price": 15.92,
-      "confidence": 0.83,
-      "strategy": "TrendBreaker",
-      "reason": "Trend break above 20SMA + 10d high | vol x4.8 | RSI 56"
+      "price": 15.86,
+      "confidence": 0.92,
+      "strategy": "TradeIdeasEnsemble",
+      "reason": "TI + Sweepea dual confirm | TI 85% + Sweepea 82%"
     },
     {
-      "symbol": "BKSY",
+      "symbol": "IONX",
       "action": "buy",
-      "price": 32.04,
-      "confidence": 0.82,
-      "strategy": "Sweepea",
-      "reason": "Daily Sweepea pullback to 8-EMA | ATR $3.91"
+      "price": 30.56,
+      "confidence": 0.92,
+      "strategy": "TradeIdeasEnsemble",
+      "reason": "TI + Sweepea dual confirm | TI 85% + Sweepea 82%"
+    },
+    {
+      "symbol": "QBTS",
+      "action": "buy",
+      "price": 16.99,
+      "confidence": 0.92,
+      "strategy": "TradeIdeasEnsemble",
+      "reason": "TI + Sweepea dual confirm | TI 85% + Sweepea 82%"
+    },
+    {
+      "symbol": "PII",
+      "action": "buy",
+      "price": 57.46,
+      "confidence": 0.92,
+      "strategy": "TradeIdeasEnsemble",
+      "reason": "TI + Sweepea dual confirm | TI 88% + Sweepea 82%"
     }
   ]
 }

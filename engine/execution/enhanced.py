@@ -286,23 +286,31 @@ class EnhancedExecutor:
 
         positions = self._get_positions()
 
-        # Dynamic max positions: use equity-based strategic capacity (not raw buying_power).
-        # buying_power can be artificially depressed by leveraged/inverse ETF margin requirements,
-        # causing the bot to permanently block new entries even when capital is available.
-        # We compute effective_max from equity × position_size_pct, then separately gate each
-        # execution on whether buying_power is sufficient for one position.
+        # Calculate position capacity from BOTH equity and buying power.
+        # equity-based capacity: conservative (avoids over-leverage from margin)
+        # bp-based capacity: uses actual available liquidity (more aggressive)
+        # Use the HIGHER of both to unlock available buying power while staying safe.
         _pos_size_pct = (
             SMALL_ACCOUNT_POSITION_SIZE_PCT
             if acct.equity < SMALL_ACCOUNT_EQUITY_THRESHOLD
             else POSITION_SIZE_PCT
         )
         _pos_size_dollars = max(MIN_POSITION_DOLLARS, acct.equity * _pos_size_pct / 100.0)
-        # Strategic max: how many positions our equity allocation strategy supports
+        
+        # Capacity from equity (conservative)
         equity_capacity = max(1, int(acct.equity * 0.95 / _pos_size_dollars))
-        effective_max = min(MAX_POSITIONS, equity_capacity)
+        
+        # Capacity from buying power (more aggressive, with 15% safety reserve)
+        # Keep 15% of BP as a safety buffer for slippage and portfolio margin requirements
+        usable_bp = acct.buying_power * 0.85
+        bp_capacity = max(1, int(usable_bp / _pos_size_dollars))
+        
+        # Use the HIGHER capacity to unlock buying power effectively
+        calculated_max = max(equity_capacity, bp_capacity)
+        effective_max = min(MAX_POSITIONS, calculated_max)
         log.debug(
-            f"[DBG] effective_max={effective_max} equity={acct.equity:.0f} bp={acct.buying_power:.0f} "
-            f"pos_size=${_pos_size_dollars:.0f} ({_pos_size_pct:.0f}%) equity_cap={equity_capacity}"
+            f"[DBG] effective_max={effective_max} (eq_cap={equity_capacity}, bp_cap={bp_capacity}, max_pos={MAX_POSITIONS}) "
+            f"equity=${acct.equity:.0f} usable_bp=${usable_bp:.0f} pos_size=${_pos_size_dollars:.0f}"
         )
 
         # ── Max positions gate (must come first) ────────────────────────────
@@ -779,7 +787,15 @@ class EnhancedExecutor:
         so the position is never left naked intraday.  A GTC trailing stop that
         fills same-day will count as a day trade; the PDT violation alert in
         _validate_trade fires if the count exceeds PDT_MAX_TRADES.
+        
+        **SMARTER FLOW**: Skips all updates outside regular market hours to prevent
+        options close failures that cascade into lost equity signals (off-hours protection
+        is attempted next session when market opens).
         """
+        from engine.utils import is_regular_hours
+        if not is_regular_hours():
+            return
+        
         positions = []
         covered = set()
 

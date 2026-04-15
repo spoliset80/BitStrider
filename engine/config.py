@@ -34,6 +34,7 @@ OPTIONS_BROKER = "alpaca"                               # Only Alpaca supports o
 OPTIONS_ENABLED             = os.getenv("OPTIONS_ENABLED", "true").lower() in ("1", "true", "yes")
 OPTIONS_ALLOCATION_PCT      = float(os.getenv("OPTIONS_ALLOCATION_PCT", "28.0"))  # % of equity for all options (increased for sniper focus)
 OPTIONS_MAX_POSITIONS       = int(os.getenv("OPTIONS_MAX_POSITIONS", "5"))        # max open options contracts (5 max for sniper + momentum)
+EXTENDED_HOURS_EQUITY_TRADING = os.getenv("EXTENDED_HOURS_EQUITY_TRADING", "false").lower() in ("1", "true", "yes")  # Allow equity trades pre/post market
 OPTIONS_DTE_MIN             = int(os.getenv("OPTIONS_DTE_MIN", "14"))             # min days-to-expiry at entry (14 avoids forced same-day close = PDT hit)
 OPTIONS_DTE_MAX             = int(os.getenv("OPTIONS_DTE_MAX", "40"))             # max days-to-expiry at entry
 OPTIONS_DELTA_TARGET        = float(os.getenv("OPTIONS_DELTA_TARGET", "0.40"))    # target delta (0.30-0.50)
@@ -67,6 +68,71 @@ OPTIONS_MIN_ADV             = float(os.getenv("OPTIONS_MIN_ADV", "250_000"))    
 OPTIONS_UNIVERSE_OVERRIDE   = os.getenv("OPTIONS_UNIVERSE_OVERRIDE", "").strip()  # comma-separated tickers to force a smaller options universe
 OPTIONS_STOP_COOLDOWN_DAYS  = int(os.getenv("OPTIONS_STOP_COOLDOWN_DAYS", "2"))   # no re-entry within N days after a stop on same symbol
 OPTIONS_EARNINGS_AVOID_DAYS = int(os.getenv("OPTIONS_EARNINGS_AVOID_DAYS", "15")) # skip entries if earnings within N calendar days
+
+# ─────────────────────────────────────────────────────────────────
+# SMART UNIVERSE — Tier-Based Ticker Segmentation
+# ─────────────────────────────────────────────────────────────────
+SMART_UNIVERSE_ENABLED      = os.getenv("SMART_UNIVERSE_ENABLED", "true").lower() in ("1", "true", "yes")
+
+# TIER A — Mega-Liquid Segment (Always scan, 60% of options capital if signal fires)
+TIER_A_ALLOCATION_PCT       = float(os.getenv("TIER_A_ALLOCATION_PCT", "18.0"))    # 18% of equity to mega-caps
+TIER_A_MAX_POSITIONS        = int(os.getenv("TIER_A_MAX_POSITIONS", "2"))         # Max 2 concurrent mega-cap positions
+TIER_A_CONFIDENCE_MIN       = float(os.getenv("TIER_A_CONFIDENCE_MIN", "0.85"))   # Strict: 85%+ only
+TIER_A_SCAN_EVERY_MIN       = int(os.getenv("TIER_A_SCAN_EVERY_MIN", "5"))       # Re-scan every 5 minutes
+
+# TIER B — Unusual Volume/Opportunity Segment (Dynamic, 30% capital, higher turnover)
+TIER_B_ALLOCATION_PCT       = float(os.getenv("TIER_B_ALLOCATION_PCT", "8.0"))    # 8% of equity to unusual vol plays
+TIER_B_MAX_POSITIONS        = int(os.getenv("TIER_B_MAX_POSITIONS", "3"))         # Max 3 concurrent positions
+TIER_B_CONFIDENCE_MIN       = float(os.getenv("TIER_B_CONFIDENCE_MIN", "0.70"))   # Relaxed: 70%+ OK (faster rotation)
+TIER_B_IV_RANK_MAX          = float(os.getenv("TIER_B_IV_RANK_MAX", "30.0"))     # Hunt for IV Rank <30% (cheap vol)
+TIER_B_HOLD_DAYS            = int(os.getenv("TIER_B_HOLD_DAYS", "5"))            # Max 5 days per position (rotate out)
+TIER_B_SCAN_EVERY_MIN       = int(os.getenv("TIER_B_SCAN_EVERY_MIN", "30"))      # Re-scan TI every 30 minutes
+TIER_B_LIQUID_HOURS_ONLY    = os.getenv("TIER_B_LIQUID_HOURS_ONLY", "true").lower() in ("1", "true", "yes")  # 9:30-11am + 2-3pm only
+
+# TIER C — Equity Breakout Bridge (10% capital, hedge + correlation play)
+TIER_C_ALLOCATION_PCT       = float(os.getenv("TIER_C_ALLOCATION_PCT", "2.0"))    # 2% of equity capital
+TIER_C_MAX_POSITIONS        = int(os.getenv("TIER_C_MAX_POSITIONS", "2"))         # Max 2 positions
+TIER_C_CONFIDENCE_MIN       = float(os.getenv("TIER_C_CONFIDENCE_MIN", "0.65"))   # Relaxed: 65%+ (supporting equities)
+TIER_C_SELL_PUT_BUFFER_PCT  = float(os.getenv("TIER_C_SELL_PUT_BUFFER_PCT", "5.0"))  # Sell puts 5% below support
+TIER_C_BUY_CALL_BUFFER_PCT  = float(os.getenv("TIER_C_BUY_CALL_BUFFER_PCT", "2.0"))  # Buy calls 2% above resistance
+
+# Tier A: Mega-Liquid Tickers (Static, Core Scanning Universe)
+TIER_A_TICKERS = os.getenv("TIER_A_TICKERS", "SPY,QQQ,AAPL,MSFT,NVDA,TSLA,AMD,GOOGL,META,AMZN,NFLX").split(",")
+TIER_A_TICKERS = [t.strip().upper() for t in TIER_A_TICKERS if t.strip()]
+
+# ─────────────────────────────────────────────────────────────────
+# ADAPTIVE INTELLIGENCE — Dynamic Filtering & Sizing
+# ─────────────────────────────────────────────────────────────────
+ADAPTIVE_SIGNAL_FILTERING = os.getenv("ADAPTIVE_SIGNAL_FILTERING", "true").lower() in ("1", "true", "yes")
+ADAPTIVE_POSITION_SIZING = os.getenv("ADAPTIVE_POSITION_SIZING", "true").lower() in ("1", "true", "yes")
+ADAPTIVE_VOLATILITY_GATES = os.getenv("ADAPTIVE_VOLATILITY_GATES", "true").lower() in ("1", "true", "yes")
+
+# Signal validation: Confidence gates adapt to regime
+SIGNAL_CONFIDENCE_BULL_RELAX_PCT = float(os.getenv("SIGNAL_CONFIDENCE_BULL_RELAX_PCT", "5.0"))  # Relax 5% in bull
+SIGNAL_CONFIDENCE_BEAR_TIGHTEN_PCT = float(os.getenv("SIGNAL_CONFIDENCE_BEAR_TIGHTEN_PCT", "5.0"))  # Tighten 5% in bear
+
+# Position sizing: Adjust multipliers based on strategy win rate (from daily analytics)
+POSITION_SIZE_DYNAMIC = os.getenv("POSITION_SIZE_DYNAMIC", "true").lower() in ("1", "true", "yes")
+POSITION_SIZE_WIN_RATE_BOOST = float(os.getenv("POSITION_SIZE_WIN_RATE_BOOST", "1.3"))  # 30% boost at 70%+ win rate
+POSITION_SIZE_WIN_RATE_THRESHOLD = float(os.getenv("POSITION_SIZE_WIN_RATE_THRESHOLD", "0.65"))  # Boost threshold
+
+# Smart position rotation (score-based SWAP instead of age-based)
+POSITION_ROTATION_ENABLED = os.getenv("POSITION_ROTATION_ENABLED", "true").lower() in ("1", "true", "yes")
+POSITION_ROTATION_MIN_SCORE = float(os.getenv("POSITION_ROTATION_MIN_SCORE", "50.0"))  # Only rotate if <50
+
+# Risk monitoring: Circuit breakers
+RISK_MONITOR_ENABLED = os.getenv("RISK_MONITOR_ENABLED", "true").lower() in ("1", "true", "yes")
+DRAWDOWN_WARNING_PCT = float(os.getenv("DRAWDOWN_WARNING_PCT", "-5.0"))  # Warning at -5%
+DRAWDOWN_CAUTION_PCT = float(os.getenv("DRAWDOWN_CAUTION_PCT", "-8.0"))  # Caution at -8%
+DRAWDOWN_CIRCUIT_BREAKER_PCT = float(os.getenv("DRAWDOWN_CIRCUIT_BREAKER_PCT", "-10.0"))  # Halt at -10%
+DRAWDOWN_EMERGENCY_PCT = float(os.getenv("DRAWDOWN_EMERGENCY_PCT", "-15.0"))  # Full halt at -15%
+
+# Performance analytics: Track metrics for continuous improvement
+PERFORMANCE_ANALYTICS_ENABLED = os.getenv("PERFORMANCE_ANALYTICS_ENABLED", "true").lower() in ("1", "true", "yes")
+ANALYTICS_HOURLY_REPORTING = os.getenv("ANALYTICS_HOURLY_REPORTING", "true").lower() in ("1", "true", "yes")
+ANALYTICS_STRATEGY_BREAKDOWN = os.getenv("ANALYTICS_STRATEGY_BREAKDOWN", "true").lower() in ("1", "true", "yes")
+ANALYTICS_REGIME_METRICS = os.getenv("ANALYTICS_REGIME_METRICS", "true").lower() in ("1", "true", "yes")
+
 # ─────────────────────────────────────────────────────────────────
 # Tickers that actively trade liquid options.
 # Loaded dynamically from data/ti_unusual_options.json (written by capture_tradeideas.py
@@ -82,6 +148,41 @@ _OPTIONS_FALLBACK_UNIVERSE = [
     # Biotech / speculative with options
     "MRNA", "BCRX",
 ]
+
+# ────────────────────────────────────────────────────────────────────────────────
+# TRADE IDEAS EQUITY TRADING (Primary Signal Source for TI Tickers)
+# ────────────────────────────────────────────────────────────────────────────────
+# When enabled, the TradeIdeasEquityStrategy prioritizes tickers from TI primary
+# universe (data/ti_primary.json) during equity scans. Enables immediate equity trading
+# during extended hours (4AM-9:30AM pre-market) without waiting for market open.
+#
+# Configuration:
+#   USE_TI_PRIMARY_EQUITY_TRADING: Enable TI tickers as primary equity signal source (default: true)
+#   TI_EQUITY_BASE_CONFIDENCE: Base confidence for TI tickers (default: 0.85, range: 0.80-0.95)
+#
+USE_TI_PRIMARY_EQUITY_TRADING = os.getenv('USE_TI_PRIMARY_EQUITY_TRADING', 'true').lower() in ('1', 'true', 'yes')
+TI_EQUITY_BASE_CONFIDENCE = float(os.getenv('TI_EQUITY_BASE_CONFIDENCE', '0.85'))
+
+# ────────────────────────────────────────────────────────────────────────────────
+# EQUITY ENSEMBLE CONFIGURATION
+# ────────────────────────────────────────────────────────────────────────────────
+# 4-Layer Equity Ensemble with TI + Sweepea dual confirmation
+USE_EQUITY_ENSEMBLE = os.getenv('USE_EQUITY_ENSEMBLE', 'true').lower() in ('1', 'true', 'yes')
+EQUITY_ENSEMBLE_TI_SWEEPEA_DUAL_CONFIDENCE = 0.92  # TI + Sweepea both fire
+EQUITY_ENSEMBLE_TI_ALONE_CONFIDENCE = 0.85         # TI only
+EQUITY_ENSEMBLE_SWEEPEA_ALONE_CONFIDENCE = 0.75    # Sweepea without TI
+
+# ────────────────────────────────────────────────────────────────────────────────
+# OPTIONS ENSEMBLE CONFIGURATION
+# ────────────────────────────────────────────────────────────────────────────────
+# 4-Layer Options Ensemble with cross-asset linking
+USE_OPTIONS_ENSEMBLE = os.getenv('USE_OPTIONS_ENSEMBLE', 'true').lower() in ('1', 'true', 'yes')
+OPTIONS_UNUSUAL_VOLUME_CONFIDENCE = 0.82            # TI unusual options
+OPTIONS_IV_RANK_CONFIDENCE_HIGH = 0.78              # High IV rank
+OPTIONS_IV_RANK_CONFIDENCE_LOW = 0.72               # Low IV rank
+OPTIONS_DIRECTIONAL_CROSSOVER_BONUS = 0.05          # +5% when equity+options align
+OPTIONS_GREEKS_DELTA_MIN = 0.25                     # Minimum delta (avoid edge cases)
+OPTIONS_GREEKS_DELTA_MAX = 0.75                     # Maximum delta (sweet spot)
 
 def _load_options_universe() -> list:
     """Load live TI unusual-options-volume tickers.
@@ -263,7 +364,7 @@ STOCKS = {
 # ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 # Trading Parameters ΓÇö Swing Trading Optimized
 # ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
-MAX_POSITIONS        = 12     # 7.5% × 12 = 90% of usable equity (within 10% BP reserve)
+MAX_POSITIONS        = 25     # Temporarily increased to match current portfolio (was 12); will reduce once positions manage down
 # When full, close the weakest position to make room if new signal conf > this threshold
 SWAP_ON_FULL         = True   # enabled — close weakest position for a better signal when full
 SWAP_MIN_CONFIDENCE  = 0.75   # Swap out weakest when new signal >= this confidence (was 0.85)

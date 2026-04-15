@@ -48,6 +48,8 @@ from engine.broker.broker_factory import BrokerFactory
 from .predictions import save_day_picks
 from engine.options.executor import OptionsExecutor
 from engine.options.strategies import scan_options_universe
+from engine.options.smart_universe import get_smart_universe, SMART_UNIVERSE_ENABLED
+from engine.options.tier_sizing import get_tier_allocation_engine
 from .equity import discovery as _discovery
 from . import session as _session
 from engine.risk import kill_mode as _kill_mode
@@ -71,6 +73,15 @@ if cfg.OPTIONS_ENABLED:
 coordinator = AdaptiveExecutionCoordinator()
 if cfg.USE_MULTI_REGIME:
     log.info("Adaptive intelligence ENABLED: Multi-regime detection, strategy feedback, timing awareness")
+
+# Initialize smart universe for tier-based options scanning
+if SMART_UNIVERSE_ENABLED:
+    smart_universe = get_smart_universe()
+    tier_allocation_engine = get_tier_allocation_engine()
+    log.info("Smart Universe ENABLED: Tier-based scanning (Mega-Liquid + Unusual Vol + Equity Bridge)")
+else:
+    smart_universe = None
+    tier_allocation_engine = None
 
 _session.load_quarterly_state()
 _last_market_regime: str = "bull"
@@ -230,6 +241,14 @@ def scan_and_trade() -> None:
     )
 
     executor._swap_cycle_closed.clear()
+
+    # SMARTER FLOW: Skip SWAP during off-hours to prevent cascading failures
+    # (equity trades execute solo instead, avoiding options API errors outside market hours)
+    from engine.utils import is_regular_hours
+    skip_swap = not is_regular_hours()
+    if skip_swap:
+        log.info("[SYSTEM] Off-hours: SWAP skipped (executing equity trades solo)")
+        executor._swap_cycle_closed = set([pos.symbol for pos in client.get_all_positions()])  # force no-swap
 
     signals_cap = cfg.MAX_SIGNALS_PER_CYCLE
     market_regime = _last_market_regime
