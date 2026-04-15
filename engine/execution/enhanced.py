@@ -48,6 +48,8 @@ from engine.config import (
     LIVE,
 )
 from engine.equity.strategies import Signal
+from engine.execution.timing import get_timing_engine
+from engine.analytics.strategy_metrics import get_strategy_tracker
 from engine.utils import is_regular_hours, calculate_risk_adjusted_size, check_vix_roc_filter, get_dynamic_tier
 from engine.notifications.notifications import send_email
 
@@ -119,14 +121,16 @@ class EnhancedExecutor:
         self.client              = client
         self.use_bracket_orders  = use_bracket_orders
         self.pdt                 = PDTTracker()
-        self.order_cache:  Dict[str, str] = {}
+        self.timing_engine       = get_timing_engine()  # Market phase aware execution
+        self.strategy_tracker    = get_strategy_tracker()  # Trade recording for feedback loop
+        self.order_cache:  Dict[str, str] = {}  
         self._position_cache: Optional[PositionInfo]    = None
         self._cache_timestamp: float = 0
         self._cache_ttl:       float = 5.0
         self._account_cache:  Optional[AccountSnapshot] = None
         self._account_ttl:    float = 2.0   # tight TTL — buying power must be fresh between orders
         self._htb_cache:      set   = set()   # hard-to-borrow symbols — skip shorts this session
-        self._entry_log:   Dict[str, dict] = {}  # {symbol: {"strategy": str, "date": date}}
+        self._entry_log:   Dict[str, dict] = {}  # {symbol: {"strategy": str, "date": date, "entry_time": datetime}}
         self._swap_cycle_closed: set = set()     # positions already swapped this scan cycle
         self._tp_targets: Dict[str, float] = {} # {symbol: take-profit price} for ATR-based TP tracking
         self.shorting_blocked: bool = False  # set true when broker rejects all short attempts for account
@@ -342,14 +346,30 @@ class EnhancedExecutor:
         self, buying_power: float, signal: Signal,
         risk_info: Dict, order_type: OrderType
     ) -> Tuple[int, Optional[str]]:
-        """Returns (shares, skip_reason). Downsizes if BP constrained, skips if below min."""
+        """Returns (shares, skip_reason). Downsizes if BP constrained, skips if below min.
+        Applies timing-based position multipliers for market phases."""
         from engine.config import SMALL_ACCOUNT_EQUITY_THRESHOLD, SMALL_ACCOUNT_MIN_POSITION_DOLLARS
+
+        # Get timing multiplier for current market phase
+        phase = self.timing_engine.get_market_phase()
+        timing_mult = self.timing_engine.get_position_size_multiplier(phase)
+        
+        if timing_mult < 0.1:  # Skip entry if liquidity too thin
+            return 0, f"Market phase {phase.value}: liquidity too low (timing_mult={timing_mult:.0%})"
+        
+        # Log timing info at 50% reduction
+        if timing_mult < 0.7:
+            log.info(f"[TIMING] {phase.value}: position sized at {timing_mult:.0%} (illiquid phase)")
 
         margin  = 2.0 if order_type == OrderType.SHORT else 1.0
         usable  = buying_power * (1.0 - MIN_BUYING_POWER_PCT / 100.0)
         desired = int(risk_info["dollar_amount"] / signal.price)
+        
+        # Apply timing multiplier to desired shares
+        desired_adjusted = int(desired * timing_mult)
+        
         max_bp  = int(usable / (signal.price * margin))
-        shares  = min(desired, max_bp)
+        shares  = min(desired_adjusted, max_bp)
 
         account_snapshot = self._account_cache or self._get_account()  # use cached if available
         min_position = SMALL_ACCOUNT_MIN_POSITION_DOLLARS if account_snapshot.equity < SMALL_ACCOUNT_EQUITY_THRESHOLD else MIN_POSITION_DOLLARS
@@ -357,7 +377,7 @@ class EnhancedExecutor:
         if shares < 1:
             return 0, (
                 f"Insufficient BP: ${buying_power:,.0f} usable ${usable:,.0f} "
-                f"for {signal.symbol} @ ${signal.price:.2f} (x{margin:.0f} margin)"
+                f"for {signal.symbol} @ ${signal.price:.2f} (x{margin:.0f} margin, timing_mult={timing_mult:.0%})"
             )
 
         cost = shares * signal.price
@@ -365,7 +385,8 @@ class EnhancedExecutor:
         # Debug trace for min position handling.
         log.debug(
             f"size check {signal.symbol}: equity={account_snapshot.equity:.2f}, "
-            f"min_position=${min_position:.2f}, shares={shares}, cost=${cost:.2f}, desired={desired}, max_bp={max_bp}, usable=${usable:.2f}"
+            f"min_position=${min_position:.2f}, shares={shares}, cost=${cost:.2f}, desired={desired}, "
+            f"desired_adjusted={desired_adjusted}, timing_mult={timing_mult:.0%}, max_bp={max_bp}, usable=${usable:.2f}"
         )
 
         if cost < min_position:
@@ -373,8 +394,8 @@ class EnhancedExecutor:
 
         if shares < desired:
             log.info(
-                f"  BP downsize {signal.symbol}: {desired} -> {shares} shares "
-                f"(BP ${buying_power:,.0f}, usable ${usable:,.0f}, cost ${cost:,.0f})"
+                f"  BP downsize {signal.symbol}: {desired} -> {desired_adjusted} (timing) -> {shares} shares "
+                f"(BP ${buying_power:,.0f}, phase={phase.value}, mult={timing_mult:.0%})"
             )
         return shares, None
 
@@ -606,7 +627,12 @@ class EnhancedExecutor:
         if self.use_bracket_orders and is_regular_hours():
             if self._create_bracket_order(signal, shares, risk_info, order_type):
                 self.pdt.add(datetime.date.today())
-                self._entry_log[signal.symbol] = {"strategy": signal.strategy, "date": datetime.date.today(), "confidence": signal.confidence}
+                self._entry_log[signal.symbol] = {
+                    "strategy": signal.strategy, 
+                    "date": datetime.date.today(), 
+                    "confidence": signal.confidence,
+                    "entry_price": signal.price
+                }
                 self._swap_cycle_closed.add(signal.symbol)  # protect from same-cycle swap-out
                 self._get_positions(force_refresh=True)
                 self._get_account(force_refresh=True)
@@ -614,7 +640,12 @@ class EnhancedExecutor:
 
         if self._create_simple_order(signal, shares, order_type):
             self.pdt.add(datetime.date.today())
-            self._entry_log[signal.symbol] = {"strategy": signal.strategy, "date": datetime.date.today(), "confidence": signal.confidence}
+            self._entry_log[signal.symbol] = {
+                "strategy": signal.strategy, 
+                "date": datetime.date.today(), 
+                "confidence": signal.confidence,
+                "entry_price": signal.price
+            }
             self._swap_cycle_closed.add(signal.symbol)  # protect from same-cycle swap-out
             self._get_positions(force_refresh=True)
             self._get_account(force_refresh=True)
@@ -653,6 +684,32 @@ class EnhancedExecutor:
             log.error(f"Execute error {signal.symbol}: {e}")
         return False
 
+    # ΓöÇΓöÇ Trade Recording ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+    def _record_trade_close(self, symbol: str, exit_price: float, qty: int) -> None:
+        """Record a closed trade for strategy feedback loop tracking."""
+        entry_info = self._entry_log.get(symbol, {})
+        if not entry_info:
+            return  # Entry not tracked
+        
+        try:
+            entry_price = entry_info.get("entry_price")
+            strategy = entry_info.get("strategy")
+            confidence = entry_info.get("confidence", 0.5)
+            
+            if entry_price and strategy:
+                pnl_pct = ((exit_price - entry_price) / entry_price * 100) if entry_price > 0 else 0
+                self.strategy_tracker.record_trade(
+                    strategy=strategy,
+                    symbol=symbol,
+                    entry_price=entry_price,
+                    exit_price=exit_price,
+                    shares=qty,
+                    confidence=confidence
+                )
+                log.debug(f"Trade recorded: {symbol} {strategy} PnL {pnl_pct:+.1f}%")
+        except Exception as e:
+            log.debug(f"Trade recording failed for {symbol}: {e}")
+
     # ΓöÇΓöÇ Close Short ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
     def _close_short_position(self, signal: Signal, equity: float) -> bool:
         positions = self._get_positions()
@@ -675,6 +732,8 @@ class EnhancedExecutor:
             self.client.submit_order(req)
             # Closing a short that was opened today is a day trade round-trip
             self.pdt.add(datetime.date.today())
+            self._record_trade_close(signal.symbol, signal.price, qty)  # Record for feedback loop
+            self._entry_log.pop(signal.symbol, None)  # Clean up tracking
             log.info(f"COVER {signal.symbol}: {qty} @ ${signal.price:.2f} | {signal.strategy}")
             return True
         except Exception as e:
@@ -699,6 +758,8 @@ class EnhancedExecutor:
             # NOTE: closing an existing position is NOT a new day trade.
             # Alpaca counts the round-trip (open+close same day) as one trade;
             # pdt.add() is intentionally omitted here — it was already counted at entry.
+            self._record_trade_close(signal.symbol, signal.price, qty)  # Record for feedback loop
+            self._entry_log.pop(signal.symbol, None)  # Clean up tracking
             self._get_positions(force_refresh=True)
             log.info(f"SELL {signal.symbol}: {qty} shares | {signal.strategy}")
             return True
@@ -836,6 +897,9 @@ class EnhancedExecutor:
                             side          = side,
                             time_in_force = TimeInForce.DAY,
                         ))
+                        # Record trade close at software SL
+                        self._record_trade_close(sym, stop_price, abs(qty))
+                        self._entry_log.pop(sym, None)
                         self._pdt_stop_blocked.pop(sym, None)
                         log.warning(
                             f"SOFTWARE SL HIT {sym}: price ${current:.2f} crossed stop ${stop_price:.2f} — "
@@ -923,6 +987,10 @@ class EnhancedExecutor:
                     side=side, time_in_force=TimeInForce.DAY,
                 )
                 self.client.submit_order(req)
+                
+                # Record trade close for feedback loop
+                exit_price = float(pos.current_price or 0) or signal.price  # Use current price if available
+                self._record_trade_close(sym, exit_price, abs(qty))
                 self._entry_log.pop(sym, None)
 
                 pnl = float(pos.unrealized_pl)
@@ -1204,6 +1272,9 @@ class EnhancedExecutor:
                         time_in_force = TimeInForce.DAY,
                     )
                     self.client.submit_order(req)
+                    # Record trade close at TP target
+                    self._record_trade_close(sym, tp_price, abs(qty))
+                    self._entry_log.pop(sym, None)
                     log.info(
                         f"TP HIT {sym}: ${cur_price:.2f} {'>=  ' if is_long else '<= '}"
                         f"${tp_price:.2f} → market {'sell' if is_long else 'buy-to-cover'}"

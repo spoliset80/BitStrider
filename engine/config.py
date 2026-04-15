@@ -32,8 +32,8 @@ OPTIONS_BROKER = "alpaca"                               # Only Alpaca supports o
 # covered calls on held positions. Expiry: 7–21 DTE (near-term).
 # ─────────────────────────────────────────────────────────────────
 OPTIONS_ENABLED             = os.getenv("OPTIONS_ENABLED", "true").lower() in ("1", "true", "yes")
-OPTIONS_ALLOCATION_PCT      = float(os.getenv("OPTIONS_ALLOCATION_PCT", "15.0"))  # % of equity for all options
-OPTIONS_MAX_POSITIONS       = int(os.getenv("OPTIONS_MAX_POSITIONS", "3"))        # max open options contracts
+OPTIONS_ALLOCATION_PCT      = float(os.getenv("OPTIONS_ALLOCATION_PCT", "28.0"))  # % of equity for all options (increased for sniper focus)
+OPTIONS_MAX_POSITIONS       = int(os.getenv("OPTIONS_MAX_POSITIONS", "5"))        # max open options contracts (5 max for sniper + momentum)
 OPTIONS_DTE_MIN             = int(os.getenv("OPTIONS_DTE_MIN", "14"))             # min days-to-expiry at entry (14 avoids forced same-day close = PDT hit)
 OPTIONS_DTE_MAX             = int(os.getenv("OPTIONS_DTE_MAX", "40"))             # max days-to-expiry at entry
 OPTIONS_DELTA_TARGET        = float(os.getenv("OPTIONS_DELTA_TARGET", "0.40"))    # target delta (0.30-0.50)
@@ -43,6 +43,21 @@ OPTIONS_MAX_IV_PCT          = float(os.getenv("OPTIONS_MAX_IV_PCT", "150.0"))   
 OPTIONS_MIN_IV_PCT          = float(os.getenv("OPTIONS_MIN_IV_PCT", "15.0"))      # skip when IV is too flat
 OPTIONS_PROFIT_TARGET_PCT   = float(os.getenv("OPTIONS_PROFIT_TARGET_PCT", "50.0"))  # close at +50% gain
 OPTIONS_STOP_LOSS_PCT       = float(os.getenv("OPTIONS_STOP_LOSS_PCT", "30.0"))      # close at -30% loss
+
+# ─────────────────────────────────────────────────────────────────
+# SNIPER OPTIONS MODE — High-Confidence, Precision Entry
+# ─────────────────────────────────────────────────────────────────
+OPTIONS_SNIPER_MODE_ENABLED = os.getenv("OPTIONS_SNIPER_MODE", "true").lower() in ("1", "true", "yes")
+OPTIONS_SNIPER_CONFIDENCE_MIN = float(os.getenv("OPTIONS_SNIPER_CONFIDENCE_MIN", "0.85"))  # Only 85%+ confidence
+OPTIONS_SNIPER_UNUSUAL_VOL_MIN = float(os.getenv("OPTIONS_SNIPER_UNUSUAL_VOL_MIN", "3.0"))  # 3x IV rank or better
+OPTIONS_SNIPER_IV_RANK_MAX_CALL = float(os.getenv("OPTIONS_SNIPER_IV_RANK_MAX_CALL", "35.0"))  # Buy cheap calls
+OPTIONS_SNIPER_IV_RANK_MAX_PUT = float(os.getenv("OPTIONS_SNIPER_IV_RANK_MAX_PUT", "50.0"))   # Buy cheap puts
+OPTIONS_SNIPER_OI_MIN = int(os.getenv("OPTIONS_SNIPER_OI_MIN", "1000"))  # Tight OI requirement
+OPTIONS_SNIPER_MAX_SPREAD_PCT = float(os.getenv("OPTIONS_SNIPER_MAX_SPREAD_PCT", "8.0"))  # <8% bid/ask
+OPTIONS_SNIPER_RR_MIN = float(os.getenv("OPTIONS_SNIPER_RR_MIN", "2.0"))  # 2:1 min risk/reward
+OPTIONS_SNIPER_ALLOCATION_PCT = float(os.getenv("OPTIONS_SNIPER_ALLOCATION_PCT", "12.0"))  # 12% of total equity to sniper
+OPTIONS_MOMENTUM_ALLOCATION_PCT = float(os.getenv("OPTIONS_MOMENTUM_ALLOCATION_PCT", "10.0"))  # 10% to momentum
+OPTIONS_INCOME_ALLOCATION_PCT = float(os.getenv("OPTIONS_INCOME_ALLOCATION_PCT", "6.0"))   # 6% to covered calls
 OPTIONS_COVERED_CALL_DELTA  = float(os.getenv("OPTIONS_COVERED_CALL_DELTA", "0.25")) # sell OTM calls ~0.25 delta
 OPTIONS_MIN_SIGNAL_CONFIDENCE = float(os.getenv("OPTIONS_MIN_SIGNAL_CONFIDENCE", "0.70"))  # relaxed from 0.80 to 0.70
 OPTIONS_MIN_STOCK_PRICE     = float(os.getenv("OPTIONS_MIN_STOCK_PRICE", "4.0"))  # tighter low-price gate to avoid noisy penny names
@@ -52,6 +67,7 @@ OPTIONS_MIN_ADV             = float(os.getenv("OPTIONS_MIN_ADV", "250_000"))    
 OPTIONS_UNIVERSE_OVERRIDE   = os.getenv("OPTIONS_UNIVERSE_OVERRIDE", "").strip()  # comma-separated tickers to force a smaller options universe
 OPTIONS_STOP_COOLDOWN_DAYS  = int(os.getenv("OPTIONS_STOP_COOLDOWN_DAYS", "2"))   # no re-entry within N days after a stop on same symbol
 OPTIONS_EARNINGS_AVOID_DAYS = int(os.getenv("OPTIONS_EARNINGS_AVOID_DAYS", "15")) # skip entries if earnings within N calendar days
+# ─────────────────────────────────────────────────────────────────
 # Tickers that actively trade liquid options.
 # Loaded dynamically from data/ti_unusual_options.json (written by capture_tradeideas.py
 # every time the TI unusualoptionsvolume scan is scraped).  Falls back to the
@@ -62,7 +78,7 @@ _OPTIONS_FALLBACK_UNIVERSE = [
     # High-beta momentum favourites
     "MARA", "COIN", "PLTR", "SMCI", "CRWD", "NET", "SNOW",
     # ETFs with liquid options chains
-    "SPY", "QQQ", "IWM", "SQQQ", "SPXU", "UVXY",
+    "SPY", "QQQ", "IWM", "SQQQ", "SPXU", "UVXY", "VIX",
     # Biotech / speculative with options
     "MRNA", "BCRX",
 ]
@@ -455,8 +471,88 @@ SCAN_SYMBOL_TIMEOUT = 15   # Max seconds per symbol before it is skipped
 SCAN_MAX_SYMBOLS    = 75   # Max symbols to scan per cycle (increased for better bear regime coverage)
 BEAR_SHORT_TARGET_RESERVE = 30  # In bear regime, reserve more scan slots for short universe backups
 
-# ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
-# Strategy Parameters
+# ─────────────────────────────────────────────────────────────────
+# ADAPTIVE / INTELLIGENT EXECUTION FRAMEWORK
+# ─────────────────────────────────────────────────────────────────
+USE_MULTI_REGIME = os.getenv("USE_MULTI_REGIME", "true").lower() in ("1", "true", "yes")  # Enable multi-axis regime
+USE_STRATEGY_FEEDBACK = os.getenv("USE_STRATEGY_FEEDBACK", "true").lower() in ("1", "true", "yes")  # Adaptive allocation
+USE_TIMING_AWARE_ENTRY = os.getenv("USE_TIMING_AWARE_ENTRY", "true").lower() in ("1", "true", "yes")  # Market phase sizing
+USE_ADAPTIVE_PDT_RESERVE = os.getenv("USE_ADAPTIVE_PDT_RESERVE", "true").lower() in ("1", "true", "yes")  # Dynamic PDT buffer
+USE_REGIME_STOPS = os.getenv("USE_REGIME_STOPS", "true").lower() in ("1", "true", "yes")  # Tighten stops in volatility
+
+# Adaptive Stop Loss Tightening (when volatility spikes)
+STOP_LOSS_MULTIPLIER_EXTREME = 0.65  # Tighten stops by 35% in extreme VIX (>=40)
+STOP_LOSS_MULTIPLIER_HIGH = 0.85     # Tighten by 15% in high vol (VIX 25-40)
+STOP_LOSS_MULTIPLIER_NORMAL = 1.0    # Normal stops
+STOP_LOSS_MULTIPLIER_CALM = 1.15     # Widen by 15% in calm markets
+
+# Strategy Performance Tracking
+STRATEGY_METRICS_DB = os.path.join(os.path.dirname(__file__), "..", "..", "strategy_metrics.db")
+STRATEGY_STATS_LOOKBACK_DAYS = int(os.getenv("STRATEGY_STATS_LOOKBACK_DAYS", "30"))
+MIN_TRADES_FOR_FEEDBACK = int(os.getenv("MIN_TRADES_FOR_FEEDBACK", "10"))  # Require 10 trades before using feedback
+
+# Regime-Adaptive Strategy Configuration
+STRATEGY_REGIME_CONFIG = {
+    # Format: (trend, volatility) -> config
+    ("uptrend", "normal"): {
+        "active_strategies": ["TrendBreaker", "Momentum", "Sweepea", "FloatRotation", "GapBreakout"],
+        "confidence_min": 0.68,
+        "rvol_min_override": None,  # Use default
+        "max_positions_override": None,
+        "position_size_mult": 1.0,
+        "description": "Bull+Normal: All strategies active, normal sizing",
+    },
+    ("uptrend", "high"): {
+        "active_strategies": ["TrendBreaker", "Momentum", "Sweepea"],
+        "confidence_min": 0.75,
+        "rvol_min_override": 1.8,
+        "max_positions_override": 8,
+        "position_size_mult": 0.85,
+        "description": "Bull+HighVol: Tighter filters, reduced sizing",
+    },
+    ("uptrend", "extreme"): {
+        "active_strategies": ["TrendBreaker"],  # Only most robust
+        "confidence_min": 0.82,
+        "rvol_min_override": 2.5,
+        "max_positions_override": 4,
+        "position_size_mult": 0.5,
+        "description": "Bull+ExtremeVol: Conservative, size down 50%",
+    },
+    ("range", "normal"): {
+        "active_strategies": ["Sweepea", "ORB", "VWAP Reclaim"],
+        "confidence_min": 0.70,
+        "rvol_min_override": 1.2,
+        "max_positions_override": 10,
+        "position_size_mult": 1.0,
+        "description": "Range+Normal: Range strategies preferred",
+    },
+    ("range", "high"): {
+        "active_strategies": ["Sweepea"],  # Range best in ranges
+        "confidence_min": 0.78,
+        "rvol_min_override": 1.5,
+        "max_positions_override": 6,
+        "position_size_mult": 0.75,
+        "description": "Range+HighVol: Sweepea + tight filters",
+    },
+    ("downtrend", "normal"): {
+        "active_strategies": ["Momentum", "ORB", "VWAP Reclaim"],
+        "confidence_min": 0.80,  # Tighter in bear
+        "rvol_min_override": 2.0,
+        "max_positions_override": 6,
+        "position_size_mult": 0.8,
+        "description": "Bear+Normal: Long entries swap-only or closed, short emphasis",
+    },
+    ("downtrend", "high"): {
+        "active_strategies": ["Momentum"],  # Only strong signals
+        "confidence_min": 0.85,
+        "rvol_min_override": 2.5,
+        "max_positions_override": 3,
+        "position_size_mult": 0.5,
+        "description": "Bear+HighVol: Extreme caution, minimal sizing",
+    },
+}
+
+# ─────────────────────────────────────────────────────────────────
 # ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 SWEEPEA = {
     "timeframe":        15,

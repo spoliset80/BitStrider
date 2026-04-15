@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-04-14T22:38:19-04:00",
+  "generated_at": "2026-04-14T23:27:49-04:00",
   "date": "2026-04-14",
   "market_regime": "bull",
   "picks": [
@@ -36,12 +36,12 @@
       "reason": "Trend break above 20SMA + 10d high | vol x4.8 | RSI 56"
     },
     {
-      "symbol": "IONX",
+      "symbol": "BKSY",
       "action": "buy",
-      "price": 30.54,
+      "price": 32.04,
       "confidence": 0.82,
       "strategy": "Sweepea",
-      "reason": "Daily Sweepea pullback to 20-EMA | ATR $3.54"
+      "reason": "Daily Sweepea pullback to 8-EMA | ATR $3.91"
     }
   ]
 }

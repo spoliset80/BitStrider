@@ -40,6 +40,7 @@ from .utils import (
 )
 from .equity.strategies import _is_bull_regime
 from engine.execution.enhanced import EnhancedExecutor
+from engine.execution.adaptive_coordinator import AdaptiveExecutionCoordinator
 from .notifications import notify_scan_results, notify_eod
 from .equity.scan import get_scan_targets, scan_universe, filter_signals
 from .equity.universe import filter_universe_by_positions
@@ -65,6 +66,11 @@ executor = EnhancedExecutor(client, use_bracket_orders=True)
 options_executor = OptionsExecutor(client) if cfg.OPTIONS_ENABLED else None
 if cfg.OPTIONS_ENABLED:
     log.info("Options trading ENABLED (Level 3, 15% allocation, 7-21 DTE)")
+
+# Initialize adaptive coordination framework
+coordinator = AdaptiveExecutionCoordinator()
+if cfg.USE_MULTI_REGIME:
+    log.info("Adaptive intelligence ENABLED: Multi-regime detection, strategy feedback, timing awareness")
 
 _session.load_quarterly_state()
 _last_market_regime: str = "bull"
@@ -182,6 +188,14 @@ def scan_and_trade() -> None:
         return
 
     _session.refresh_daily_pnl(client)
+    
+    # Update adaptive regime detection and log status
+    if cfg.USE_MULTI_REGIME:
+        try:
+            coordinator.update_regime(force_refresh=False)
+            coordinator.log_regime_status()
+        except Exception as e:
+            log.error(f"[SYSTEM] Adaptive regime update FAILED: {e}", exc_info=True)
 
     _loss_pct = cfg.DAILY_LOSS_LIMIT_BEAR_PCT if _last_market_regime == "bear" else cfg.DAILY_LOSS_LIMIT_BULL_PCT
     _daily_loss_limit = -(_session.daily_start_equity * _loss_pct / 100) if _session.daily_start_equity > 0 else -999_999
