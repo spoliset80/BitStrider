@@ -585,6 +585,14 @@ class EnhancedExecutor:
         risk_info = calculate_risk_adjusted_size(acct.equity, signal.symbol, signal.price)
         shares, skip_reason = self._size_with_buying_power(acct.buying_power, signal, risk_info, order_type)
         if shares < 1:
+            # Only attempt swap if buying power is critically low (< 3% of equity remaining)
+            # Otherwise skip the swap and just reject the entry
+            bp_threshold = acct.equity * 0.03  # 3% of equity
+            if acct.buying_power > bp_threshold:
+                # Buying power still available — don't force a swap, just skip this signal
+                log.info(f"Skip {signal.symbol}: {skip_reason} (BP available: ${acct.buying_power:,.0f} > ${bp_threshold:,.0f})")
+                return False
+            
             # Confidence-swap: if a held position has lower entry confidence, rotate into the new signal.
             # Skip entirely when PDT = 0 — closing a same-day position would itself be a day trade.
             _dt_left_swap = self.pdt.remaining(acct.equity, acct.daytrade_count)
@@ -593,7 +601,7 @@ class EnhancedExecutor:
                 if victim:
                     log.info(
                         f"CONF-SWAP: closing {victim} (conf={victim_conf:.0%}) "
-                        f"to make room for {signal.symbol} (conf={signal.confidence:.0%})"
+                        f"to make room for {signal.symbol} (conf={signal.confidence:.0%}) — BP critically low (${acct.buying_power:,.0f})"
                     )
                     try:
                         self.client.close_position(victim)

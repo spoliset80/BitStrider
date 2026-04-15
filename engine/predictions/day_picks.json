@@ -1,47 +1,31 @@
 {
-  "generated_at": "2026-04-14T23:27:49-04:00",
-  "date": "2026-04-14",
+  "generated_at": "2026-04-15T12:26:53-04:00",
+  "date": "2026-04-15",
   "market_regime": "bull",
   "picks": [
     {
-      "symbol": "KMX",
+      "symbol": "MNTS",
       "action": "buy",
-      "price": 41.67,
-      "confidence": 0.92,
+      "price": 7.15,
+      "confidence": 0.873,
       "strategy": "Sentiment",
-      "reason": "Sentiment bullish + vol x4.89 + price>20SMA"
+      "reason": "Sentiment bullish + vol x4.23 + price>20SMA"
     },
     {
-      "symbol": "TVTX",
+      "symbol": "QUBT",
       "action": "buy",
-      "price": 42.13,
-      "confidence": 0.889,
+      "price": 9.638,
+      "confidence": 0.8023,
       "strategy": "Sentiment",
-      "reason": "Sentiment bullish + vol x4.39 + price>20SMA"
+      "reason": "Sentiment bullish + vol x3.52 + price>20SMA"
     },
     {
-      "symbol": "TWST",
+      "symbol": "QBTS",
       "action": "buy",
-      "price": 57.41,
-      "confidence": 0.8651,
+      "price": 20.945,
+      "confidence": 0.7222,
       "strategy": "Sentiment",
-      "reason": "Sentiment bullish + vol x4.15 + price>20SMA"
-    },
-    {
-      "symbol": "IONL",
-      "action": "buy",
-      "price": 15.92,
-      "confidence": 0.83,
-      "strategy": "TrendBreaker",
-      "reason": "Trend break above 20SMA + 10d high | vol x4.8 | RSI 56"
-    },
-    {
-      "symbol": "BKSY",
-      "action": "buy",
-      "price": 32.04,
-      "confidence": 0.82,
-      "strategy": "Sweepea",
-      "reason": "Daily Sweepea pullback to 8-EMA | ATR $3.91"
+      "reason": "Sentiment bullish + vol x2.72 + price>20SMA"
     }
   ]
 }
