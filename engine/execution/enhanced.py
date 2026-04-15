@@ -44,6 +44,7 @@ from engine.config import (
     STALE_ORDER_MINUTES, STALE_ORDER_MINUTES_INTRADAY,
     KILL_MODE_TRAIL_PCT,
     SMALL_ACCOUNT_EQUITY_THRESHOLD, SMALL_ACCOUNT_MAX_POSITIONS,
+    SMALL_ACCOUNT_MIN_POSITION_DOLLARS,
     POSITION_SIZE_PCT, SMALL_ACCOUNT_POSITION_SIZE_PCT,
     LIVE,
 )
@@ -301,33 +302,51 @@ class EnhancedExecutor:
             f"pos_size=${_pos_size_dollars:.0f} ({_pos_size_pct:.0f}%) equity_cap={equity_capacity}"
         )
 
-        # ── Max positions gate (must come first) ────────────────────────────
+        # ── Buying power gate (must come first) ───────────────────────────
+        # Check if sufficient buying power for this trade (primary constraint).
+        # This allows entry even when at max positions if capital is available.
+        margin = 2.0 if order_type == OrderType.SHORT else 1.0
+        min_usable = (SMALL_ACCOUNT_MIN_POSITION_DOLLARS 
+                      if acct.equity < SMALL_ACCOUNT_EQUITY_THRESHOLD 
+                      else MIN_POSITION_DOLLARS)
+        min_bp_needed = min_usable * margin
+        
+        if acct.buying_power < min_bp_needed:
+            return False, (
+                f"Insufficient buying power: ${acct.buying_power:,.0f} "
+                f"(need ${min_bp_needed:,.0f} for minimum position)"
+            )
+        
+        # ── Max positions gate (secondary; optional swap if at limit) ─────
         if positions.total_count >= effective_max:
             if not (SWAP_ON_FULL and signal.confidence >= SWAP_MIN_CONFIDENCE):
-                return False, (
-                    f"Max positions: {positions.total_count}/{effective_max} "
-                    f"(config {MAX_POSITIONS}, BP ${acct.buying_power:,.0f})"
+                # At max but BP available — log and allow (no swap needed)
+                log.info(
+                    f"At max positions {positions.total_count}/{effective_max} but allowing entry "
+                    f"due to available BP ${acct.buying_power:,.0f}"
                 )
-            # Bear or bull: close weakest to make room
-            label = "SWAP (bear)" if swap_only else "SWAP"
-            weakest = self._find_weakest_position()
-            if not weakest:
-                return False, (
-                    f"Max positions: {positions.total_count}/{effective_max} — no swappable position found"
-                )
-            log.info(
-                f"{label}: closing {weakest} (weakest) to make room for "
-                f"{signal.symbol} (conf={signal.confidence:.0%})"
-            )
-            try:
-                self.client.close_position(weakest)
-                self._swap_cycle_closed.add(weakest)
-                self.pdt.add(datetime.date.today())  # swap close counts as a day trade
-                positions = self._get_positions(force_refresh=True)
-            except Exception as e:
-                log.warning(f"SWAP close failed for {weakest}: {e}")
-                return False, f"Swap close failed: {e}"
-        # Below max: bear mode still allows entry freely (no forced swap)
+            else:
+                # Strong confidence signal + at max: prefer swap to maintain position count
+                label = "SWAP (bear)" if swap_only else "SWAP"
+                weakest = self._find_weakest_position()
+                if weakest:
+                    log.info(
+                        f"{label}: closing {weakest} (weakest) to make room for "
+                        f"{signal.symbol} (conf={signal.confidence:.0%})"
+                    )
+                    try:
+                        self.client.close_position(weakest)
+                        self._swap_cycle_closed.add(weakest)
+                        self.pdt.add(datetime.date.today())  # swap close counts as a day trade
+                        positions = self._get_positions(force_refresh=True)
+                    except Exception as e:
+                        log.warning(f"SWAP close failed for {weakest}: {e}")
+                        return False, f"Swap close failed: {e}"
+                else:
+                    # No position to swap, but BP available — allow entry anyway
+                    log.info(
+                        f"No swappable position found, but allowing entry due to available BP ${acct.buying_power:,.0f}"
+                    )
 
         if positions.has_position(signal.symbol):
             if order_type == OrderType.LONG  and positions.is_long(signal.symbol):
@@ -343,8 +362,6 @@ class EnhancedExecutor:
         risk_info: Dict, order_type: OrderType
     ) -> Tuple[int, Optional[str]]:
         """Returns (shares, skip_reason). Downsizes if BP constrained, skips if below min."""
-        from engine.config import SMALL_ACCOUNT_EQUITY_THRESHOLD, SMALL_ACCOUNT_MIN_POSITION_DOLLARS
-
         margin  = 2.0 if order_type == OrderType.SHORT else 1.0
         usable  = buying_power * (1.0 - MIN_BUYING_POWER_PCT / 100.0)
         desired = int(risk_info["dollar_amount"] / signal.price)

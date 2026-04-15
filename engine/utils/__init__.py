@@ -568,7 +568,7 @@ def get_bars(symbol: str, period: str = "5d", interval: str = "15m") -> pd.DataF
             trading_client = BrokerFactory.create_stock_client("alpaca")
             asset = trading_client.get_asset(symbol)
             if not getattr(asset, "tradable", True):
-                log.warning(f"{symbol}: Not tradable on Alpaca")
+                log.debug(f"{symbol}: Not tradable on Alpaca")
                 raise Exception("Symbol not tradable")
 
             client = get_data_client()

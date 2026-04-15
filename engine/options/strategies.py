@@ -142,9 +142,9 @@ _IV_RANK_CC_MIN   = 50.0  # covered calls: sell when IV is elevated (static)
 @dataclass
 class OptionSignal:
     symbol:        str
-    option_type:   str          # 'call' or 'put'
-    action:        str          # 'buy_to_open' or 'sell_to_open' (covered call)
-    strike:        float
+    option_type:   str          # 'call', 'put', 'call_butterfly', 'iron_condor', etc.
+    action:        str          # 'buy_to_open' or 'sell_to_open'
+    strike:        float        # primary leg strike
     expiry:        datetime.date
     mid_price:     float        # estimated entry price per share (*100 for notional)
     confidence:    float
@@ -156,9 +156,17 @@ class OptionSignal:
     open_interest: int   = 0
     rr_ratio:      float = 0.0  # R/R: ATR expected move / premium
     breakeven:     float = 0.0  # breakeven price at expiry
-    # Debit spread fields (TrendPullbackSpread only; None = single-leg)
+    
+    # Debit spread fields (TrendPullbackSpread: 2-leg; None = single-leg)
     spread_sell_strike: Optional[float] = None   # short leg strike
     spread_sell_mid:    Optional[float] = None   # credit received from short leg per share
+    
+    # Multi-leg butterfly fields (buy low, sell 2 mid, buy high; None = not a butterfly)
+    butterfly_low_strike:  Optional[float] = None   # lowest strike (buy 1)
+    butterfly_low_mid:     Optional[float] = None   # cost of low strike
+    butterfly_high_strike: Optional[float] = None   # highest strike (buy 1)
+    butterfly_high_mid:    Optional[float] = None   # cost of high strike
+    # For butterfly: strike = mid_strike (sell 2x), spread_sell_strike = mid_strike (unused), mid_price = net_debit
 
 
 @dataclass
@@ -1112,6 +1120,12 @@ class ButterflyStrategy:
                 open_interest=int(mid_row.iloc[0].get("openinterest", 0)),
                 rr_ratio=round(max_profit / net_debit, 2),
                 breakeven=None,
+                # Butterfly: 4 legs (buy low, sell 2 mid, buy high)
+                butterfly_low_strike=low_strike,
+                butterfly_low_mid=low_mid,
+                butterfly_high_strike=high_strike,
+                butterfly_high_mid=high_mid,
+                # Legacy spread fields (not used for butterfly but kept for compatibility)
                 spread_sell_strike=mid_strike,
                 spread_sell_mid=mid_mid,
             )

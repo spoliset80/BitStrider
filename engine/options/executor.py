@@ -85,14 +85,35 @@ class OptionsExecutor:
     # ── Allocation / Budget ────────────────────────────────────────────────────
 
     def _get_options_budget(self) -> Tuple[float, float]:
-        """Returns (total_options_budget $, remaining_budget $) based on current equity."""
+        """Returns (total_options_budget $, remaining_budget $) based on current equity and Alpaca's options_buying_power.
+        
+        Uses the stricter of:
+        - Configured allocation (15% of equity)
+        - Alpaca's actual options_buying_power (accounts for margin, positions, etc.)
+        """
         try:
             acct          = self.client.get_account()
             equity        = float(acct.equity)
-            total_budget  = equity * (OPTIONS_ALLOCATION_PCT / 100.0)
+            # Get Alpaca's actual options buying power (most important constraint)
+            alpaca_options_bp = float(getattr(acct, "options_buying_power", 0.0))
+            
+            # Configured allocation as secondary constraint
+            configured_budget = equity * (OPTIONS_ALLOCATION_PCT / 100.0)
+            
             # Deduct current open option premium cost
-            used          = self._current_options_cost()
-            remaining     = max(0.0, total_budget - used)
+            used = self._current_options_cost()
+            
+            # Use the stricter of the two
+            total_budget = min(configured_budget, alpaca_options_bp)
+            remaining = max(0.0, total_budget - used)
+            
+            # Debug: log when Alpaca constraint is binding
+            if alpaca_options_bp < configured_budget:
+                log.debug(
+                    f"[OPTIONS] Alpaca OBP ${alpaca_options_bp:.2f} < configured ${configured_budget:.2f} "
+                    f"(limiting budget to ${total_budget:.2f})"
+                )
+            
             return total_budget, remaining
         except Exception as e:
             log.warning(f"[OPTIONS] Could not fetch account budget: {e}", exc_info=True)
@@ -132,6 +153,14 @@ class OptionsExecutor:
         """
         if not OPTIONS_ENABLED:
             return False
+
+        # ── Skip multi-leg strategies not yet supported ─────────────────────────
+        # Butterflies are now supported as MLEG orders! Iron condors still need work.
+        if "condor" in signal.strategy.lower():
+            log.info(
+                f"[OPTIONS] Skipping {signal.symbol} {signal.strategy} — iron condor multi-leg orders not yet supported"
+            )
+            return True
 
         # ── PDT & small-account guard ──────────────────────────────────────────
         try:
@@ -175,6 +204,82 @@ class OptionsExecutor:
             log.info(f"[OPTIONS] {signal.symbol} — not enough budget for 1 contract (need ${signal.mid_price * CONTRACT_SIZE:.2f})")
             return False
 
+        # ── Handle butterfly as MLEG order ────────────────────────────────────────
+        is_butterfly = "butterfly" in signal.option_type.lower()
+        if is_butterfly:
+            if not all([signal.butterfly_low_strike, signal.butterfly_high_strike, 
+                       signal.butterfly_low_mid, signal.butterfly_high_mid]):
+                log.error(f"[OPTIONS] Butterfly {signal.symbol} missing leg data, skipping")
+                return False
+            
+            try:
+                # Extract call or put from option_type (e.g., "call_butterfly" → "call")
+                cp_type = "call" if "call" in signal.option_type.lower() else "put"
+                
+                # Build 4-leg butterfly (buy low, sell 2 mid, buy high)
+                legs = [
+                    {
+                        "symbol": _alpaca_option_symbol(signal.symbol, signal.expiry, cp_type, signal.butterfly_low_strike),
+                        "side": "buy",
+                        "ratio_qty": 1
+                    },
+                    {
+                        "symbol": _alpaca_option_symbol(signal.symbol, signal.expiry, cp_type, signal.strike),
+                        "side": "sell",
+                        "ratio_qty": 2
+                    },
+                    {
+                        "symbol": _alpaca_option_symbol(signal.symbol, signal.expiry, cp_type, signal.butterfly_high_strike),
+                        "side": "buy",
+                        "ratio_qty": 1
+                    }
+                ]
+                
+                # net_debit (positive for butterfly debit; limit_price is what we're willing to pay)
+                net_debit = signal.mid_price
+                limit_price = round(net_debit * 1.02, 2)  # 2% buffer
+                
+                # Build MLEG payload
+                mleg_payload = {
+                    "order_class": "mleg",
+                    "type": "limit",
+                    "limit_price": str(limit_price),
+                    "time_in_force": "day",
+                    "legs": legs
+                }
+                
+                # Submit as raw order (Alpaca SDK may need direct HTTP for MLEG)
+                order = self.client.submit_order(mleg_payload)
+                
+                pdt_note = f" [PDT {dt_left}DT left]" if is_small else ""
+                log.info(
+                    f"[OPTIONS] MLEG BUTTERFLY: {signal.symbol} {signal.reason} | "
+                    f"net_debit=${net_debit:.2f} limit=${limit_price:.2f} | conf={signal.confidence:.0%}{pdt_note}"
+                )
+                
+                # Track as single position (composite of 3 legs)
+                occ_sym = _alpaca_option_symbol(signal.symbol, signal.expiry, cp_type, signal.strike)
+                self._positions[occ_sym] = OptionsPosition(
+                    occ_symbol=occ_sym,
+                    symbol=signal.symbol,
+                    option_type=signal.option_type,
+                    action=signal.action,
+                    strike=signal.strike,
+                    expiry=signal.expiry,
+                    contracts=contracts,
+                    entry_price=signal.mid_price,
+                    strategy=signal.strategy,
+                    short_occ_symbol=None,  # For butterfly, all legs are tracked in strategy
+                    short_strike=None,
+                    short_entry_price=None,
+                )
+                return True
+                
+            except Exception as e:
+                log.error(f"[OPTIONS] Butterfly MLEG order failed for {signal.symbol}: {e}")
+                return False
+
+        # ── Handle simple and 2-leg spreads ───────────────────────────────────────
         occ_sym = _alpaca_option_symbol(
             signal.symbol, signal.expiry, signal.option_type, signal.strike
         )
