@@ -14,7 +14,7 @@ Responsibilities:
 import logging
 import datetime
 import time
-from typing import Optional, List, Dict, Tuple
+from typing import List, Dict, Tuple
 from dataclasses import dataclass, field
 import json
 from alpaca.trading.client import TradingClient
@@ -23,11 +23,7 @@ from alpaca.trading.requests import (
     MarketOrderRequest,
     GetOrdersRequest,
 )
-from alpaca.trading.enums import OrderSide, TimeInForce, QueryOrderStatus
-from alpaca.trading.requests import OrderRequest, LimitOrderRequest
-from alpaca.trading.enums import OrderClass, OrderType, TimeInForce, OrderSide
-from alpaca.trading.requests import OrderRequest, LimitOrderRequest, OptionLegRequest
-from alpaca.trading.enums import OrderClass, OrderType, TimeInForce, OrderSide
+from alpaca.trading.enums import OrderClass, OrderSide, TimeInForce, QueryOrderStatus
 
 from engine.config import (
     OPTIONS_ENABLED,
@@ -61,21 +57,21 @@ def _alpaca_option_symbol(symbol: str, expiry: datetime.date, option_type: str, 
 @dataclass
 class OptionsPosition:
     """Tracked open options position."""
-    occ_symbol:  str
-    symbol:      str
+    occ_symbol:  str               # primary leg OCC symbol (key in _positions dict)
+    symbol:      str               # underlying ticker
     option_type: str
-    action:      str          # 'buy_to_open' or 'sell_to_open'
-    strike:      float
+    action:      str               # 'buy_to_open' or 'sell_to_open'
+    strike:      float             # primary leg strike
     expiry:      datetime.date
     contracts:   int
-    entry_price: float        # per-share premium paid/received (net debit for spreads)
+    entry_price: float             # signed net value at entry: positive = net debit paid,
+                                   # negative = net credit received (per share)
     strategy:    str
     entered_at:  datetime.date = field(default_factory=datetime.date.today)
-    peak_pnl_pct: float = 0.0   # highest observed P&L % (for trailing stop)
-    # Debit spread: short leg fields (None for single-leg positions)
-    short_occ_symbol:  Optional[str]   = None
-    short_strike:      Optional[float] = None
-    short_entry_price: Optional[float] = None   # credit received per share
+    peak_pnl_pct: float = 0.0     # highest observed P&L % (trailing stop reference)
+    # All legs stored at entry — enables strategy-agnostic close and P&L calculation.
+    # Each entry: {"occ_symbol": str, "side": "buy"|"sell", "ratio_qty": int}
+    legs: list = field(default_factory=list)
 
 
 class OptionsExecutor:
@@ -195,8 +191,13 @@ class OptionsExecutor:
         cp_type = "call" if "call" in signal.option_type.lower() else "put"
 
         try:
-            # Buffer: Paying 2% more than mid for debits (or accepting 2% less for credits)
-            limit_price = round(signal.mid_price * 1.02, 2)
+            # Price improvement: for debits (buy) bid 1% below mid to lower cost;
+            # for credits (sell) offer 1% above mid to collect more.
+            # Avoid the prior mistake of always paying 2% over mid on debit orders.
+            if "buy" in signal.action:
+                limit_price = round(signal.mid_price * 0.99, 2)   # bid below mid
+            else:
+                limit_price = round(signal.mid_price * 1.01, 2)   # offer above mid
 
             # ── CASE A: MULTI-LEG (Spreads, Butterflies, Condors) ────────────────
             if is_mleg:
@@ -255,9 +256,17 @@ class OptionsExecutor:
                 log.info(f"[OPTIONS] Submitting SINGLE {occ_sym}")
                 self.client.submit_order(order_req)
 
-            # 5. Tracking (REPAIRED: Includes all required positional arguments)
+            # 5. Tracking — store all leg OCC symbols for strategy-agnostic close/monitor
             primary_occ = _alpaca_option_symbol(signal.symbol, signal.expiry, cp_type, signal.strike)
-            
+            entry_legs = [
+                {
+                    "occ_symbol": l["symbol"],
+                    "side": l["side"].value if hasattr(l["side"], "value") else str(l["side"]),
+                    "ratio_qty": l["ratio_qty"],
+                }
+                for l in (legs_list if is_mleg else [{"symbol": primary_occ, "side": OrderSide.BUY, "ratio_qty": 1}])
+            ]
+
             self._positions[primary_occ] = OptionsPosition(
                 occ_symbol=primary_occ,
                 symbol=signal.symbol,
@@ -267,10 +276,14 @@ class OptionsExecutor:
                 expiry=signal.expiry,
                 contracts=contracts,
                 entry_price=signal.mid_price,
-                strategy=signal.strategy
+                strategy=signal.strategy,
+                legs=entry_legs,
             )
 
-            log.info(f"[OPTIONS] SUCCESS: Position tracked for {signal.symbol}")
+            leg_summary = ", ".join(
+                f"{l['side'].upper()} {l['occ_symbol']}" for l in entry_legs
+            )
+            log.info(f"[OPTIONS] Tracked {signal.symbol} ({len(entry_legs)} leg(s)): {leg_summary}")
             return True
 
         except Exception as e:
@@ -327,76 +340,72 @@ class OptionsExecutor:
 
         for occ_sym, pos in list(self._positions.items()):
             dte = (pos.expiry - today).days
+            same_day_entry = pos.entered_at == today
+            pdt_block = pdt_small_account and same_day_entry and dt_left_today <= 1
 
             # 1. Theta guard: exit within OPTIONS_THETA_EXIT_DTE days to avoid accelerating decay
+            # Skip if entered today and PDT-blocked — Alpaca will reject the close anyway
             if dte <= OPTIONS_THETA_EXIT_DTE:
-                log.warning(f"OPTIONS: {occ_sym} within {OPTIONS_THETA_EXIT_DTE}d of expiry (DTE={dte}) — closing")
-                to_close.append(occ_sym)
+                if pdt_block or same_day_entry:
+                    log.debug(
+                        f"OPTIONS: {occ_sym} theta guard (DTE={dte}) deferred — entered today, will close tomorrow"
+                    )
+                else:
+                    log.warning(f"OPTIONS: {occ_sym} within {OPTIONS_THETA_EXIT_DTE}d of expiry (DTE={dte}) — closing")
+                    to_close.append(occ_sym)
                 continue
 
-            # 2. Net Value Calculation for MLEG
+            # 2. Net value = sum(sign * ratio * current_price) across all stored legs
+            # sign: +1 for buy legs (we own), -1 for sell legs (we owe)
+            # This formula works identically for single, spread, butterfly, and condor.
             try:
-                # Get the long leg (primary)
-                ap = all_positions.get(occ_sym)
-                if ap is None:
-                    log.info(f"OPTIONS: {occ_sym} primary leg gone, clearing tracker")
+                current_net_value = 0.0
+                any_leg_missing = False
+                for leg in pos.legs:
+                    leg_pos = all_positions.get(leg["occ_symbol"])
+                    if leg_pos is None:
+                        any_leg_missing = True
+                        break
+                    sign = 1 if leg["side"] == "buy" else -1
+                    current_net_value += sign * leg["ratio_qty"] * float(leg_pos.current_price)
+
+                if any_leg_missing:
+                    log.info(f"OPTIONS: {occ_sym} leg(s) closed externally — clearing tracker")
                     del self._positions[occ_sym]
                     continue
 
-                # Calculate Net Current Value
-                strat = pos.strategy.lower()
-                is_butterfly = "butterfly" in strat
-                is_condor = "condor" in strat
-                
-                current_net_value = float(ap.current_price)
-                
-                # Add/Subtract other legs to get the Net Strategy Price
-                if is_butterfly:
-                    # Butterfly: Low(Long) - 2*Mid(Short) + High(Long)
-                    # Note: We use the ratio_qty stored in your state
-                    mid_leg = all_positions.get(pos.mid_occ_symbol) # You must store this at entry
-                    high_leg = all_positions.get(pos.high_occ_symbol)
-                    if mid_leg and high_leg:
-                        current_net_value = (float(ap.current_price) + float(high_leg.current_price)) - (2 * float(mid_leg.current_price))
-                
-                elif is_condor:
-                    # Iron Condor: (PL + CL) - (PS + CS)
-                    # Reconstruct from stored legs
-                    legs = [all_positions.get(l) for l in pos.all_leg_symbols]
-                    if all(legs):
-                        # Calculate net credit/debit based on side
-                        # This is a simplified version; adjust based on your specific side tracking
-                        current_net_value = sum([float(l.current_price) * (1 if l.side == 'long' else -1) for l in legs])
-
-                elif pos.short_occ_symbol: # Vertical Spread
-                    short_ap = all_positions.get(pos.short_occ_symbol)
-                    if short_ap:
-                        current_net_value = float(ap.current_price) - float(short_ap.current_price)
-
-                # 3. P&L Logic
+                # 3. P&L — normalise by abs(entry) so credit and debit strategies
+                # both show positive % when profitable
                 entry_price = pos.entry_price
-                pnl_pct = (current_net_value - entry_price) / entry_price * 100 if entry_price > 0 else 0
+                if abs(entry_price) < 0.001:
+                    continue
+                pnl_pct = (current_net_value - entry_price) / abs(entry_price) * 100
 
-                # Track peak P&L
                 if pnl_pct > pos.peak_pnl_pct:
                     pos.peak_pnl_pct = pnl_pct
 
-                # 4. Exit Decision Matrix
-                pdt_block = pdt_small_account and pos.entered_at == today and dt_left_today <= 1
-                
-                # Profit Target (Butterflies often target 25-50% of debit paid)
-                target = 50.0 if is_butterfly else OPTIONS_PROFIT_TARGET_PCT
-                
-                if pnl_pct >= target:
+                log.debug(
+                    f"[OPTIONS] {pos.symbol} {pos.strategy} net=${current_net_value:.2f} "
+                    f"entry=${entry_price:.2f} P&L={pnl_pct:+.1f}% peak={pos.peak_pnl_pct:.1f}%"
+                )
+
+                # 4. Exit decision  (same_day_entry / pdt_block computed at top of loop)
+
+                if pnl_pct >= OPTIONS_PROFIT_TARGET_PCT:
                     if pdt_block:
-                        log.info(f"OPTIONS: {pos.symbol} at target {pnl_pct:.1f}% but PDT blocked.")
+                        log.info(f"OPTIONS: {pos.symbol} at target {pnl_pct:.1f}% but PDT blocked")
                     else:
-                        log.info(f"OPTIONS: {pos.symbol} target hit ({pnl_pct:.1f}%) — closing.")
+                        log.info(f"OPTIONS: {pos.symbol} target hit ({pnl_pct:.1f}%) — closing")
                         to_close.append(occ_sym)
 
                 elif pnl_pct <= -OPTIONS_STOP_LOSS_PCT:
-                    if not pdt_block:
-                        log.warning(f"OPTIONS: {pos.symbol} stop loss hit ({pnl_pct:.1f}%) — closing.")
+                    if same_day_entry:
+                        # Never stop out on entry day — let the position breathe overnight
+                        log.debug(
+                            f"OPTIONS: {pos.symbol} at stop ({pnl_pct:.1f}%) but entered today — holding"
+                        )
+                    elif not pdt_block:
+                        log.warning(f"OPTIONS: {pos.symbol} stop hit ({pnl_pct:.1f}%) — closing")
                         to_close.append(occ_sym)
                         stop_symbols.append(pos.symbol)
 
@@ -408,66 +417,41 @@ class OptionsExecutor:
             self._close_option(occ_sym)
 
     def _close_option(self, occ_sym: str) -> None:
-        """
-        Market close an options position using MLEG to ensure atomic execution.
+        """Close an options position by reversing all stored legs atomically.
+        Works identically for single, spread, butterfly, and condor positions.
         """
         pos = self._positions.get(occ_sym)
         if pos is None:
             return
 
-        strat = pos.strategy.lower()
-        is_butterfly = "butterfly" in strat
-        is_condor = "condor" in strat
-        # Determine if it was a spread based on presence of short_occ_symbol
-        is_spread = getattr(pos, 'short_occ_symbol', None) is not None and not (is_butterfly or is_condor)
-        is_mleg = is_butterfly or is_spread or is_condor
-
         try:
-            if is_mleg:
-                # ── REVERSE THE LEGS ──
-                # Use the stored strikes/details from the 'pos' object
-                # Note: We reverse the 'side' (BUY becomes SELL, SELL becomes BUY)
-                legs_list = []
-
-                if is_condor:
-                    legs_list = [
-                        {"symbol": self._get_occ(pos, "put_long"), "side": OrderSide.SELL, "ratio_qty": 1},
-                        {"symbol": self._get_occ(pos, "put_short"), "side": OrderSide.BUY, "ratio_qty": 1},
-                        {"symbol": self._get_occ(pos, "call_short"), "side": OrderSide.BUY, "ratio_qty": 1},
-                        {"symbol": self._get_occ(pos, "call_long"), "side": OrderSide.SELL, "ratio_qty": 1}
-                    ]
-                elif is_butterfly:
-                    legs_list = [
-                        {"symbol": self._get_occ(pos, "low"), "side": OrderSide.SELL, "ratio_qty": 1},
-                        {"symbol": self._get_occ(pos, "mid"), "side": OrderSide.BUY, "ratio_qty": 2},
-                        {"symbol": self._get_occ(pos, "high"), "side": OrderSide.SELL, "ratio_qty": 1}
-                    ]
-                else: # Spread
-                    legs_list = [
-                        {"symbol": pos.occ_symbol, "side": OrderSide.SELL, "ratio_qty": 1},
-                        {"symbol": pos.short_occ_symbol, "side": OrderSide.BUY, "ratio_qty": 1}
-                    ]
-
+            if len(pos.legs) > 1:
+                # Multi-leg: reverse every side and submit as a single mleg order
+                reversed_legs = [
+                    {
+                        "symbol": l["occ_symbol"],
+                        "side": "sell" if l["side"] == "buy" else "buy",
+                        "ratio_qty": str(float(l["ratio_qty"])),
+                    }
+                    for l in pos.legs
+                ]
                 payload = {
                     "symbol": "",
                     "qty": str(float(pos.contracts)),
-                    "side": "sell",  # Closing a 'buy' entry is a 'sell' exit
+                    "side": "sell",
                     "type": "market",
                     "order_class": "mleg",
                     "time_in_force": "day",
-                    "legs": [
-                        {
-                            "symbol": l["symbol"],
-                            "side": l["side"].value,
-                            "ratio_qty": str(float(l["ratio_qty"]))
-                        } for l in legs_list
-                    ]
+                    "legs": reversed_legs,
                 }
-                log.info(f"OPTIONS MLEG CLOSE: {pos.symbol} {strat}")
+                log.info(
+                    f"OPTIONS MLEG CLOSE: {pos.symbol} {pos.strategy} "
+                    f"({len(pos.legs)} legs, {pos.contracts} contract(s))"
+                )
                 self.client.post("/orders", payload)
 
             else:
-                # ── STANDARD SINGLE CLOSE ──
+                # Single leg
                 side = OrderSide.SELL if pos.action == "buy_to_open" else OrderSide.BUY
                 order_req = MarketOrderRequest(
                     symbol=occ_sym,
@@ -478,17 +462,17 @@ class OptionsExecutor:
                 self.client.submit_order(order_req)
                 log.info(f"OPTIONS CLOSE: {side.value.upper()} {pos.contracts}x {occ_sym}")
 
-            # Always cleanup state
             del self._positions[occ_sym]
 
         except Exception as e:
-            log.error(f"Options close failed for {occ_sym}: {e}", exc_info=True)
-
-    def _get_occ(self, pos, leg_type):
-        """Helper to reconstruct OCC symbols for multi-leg exits."""
-        # This assumes your OptionsPosition object stores necessary strikes 
-        # or you have a helper to re-derive them from the strategy name.
-        pass
+            if "40310100" in str(e):
+                # PDT protection — Alpaca rejected the close because it would be a day trade.
+                # Leave the position in the tracker so it is retried next session.
+                log.warning(
+                    f"[OPTIONS] PDT block on close {occ_sym} — position held, will retry next session"
+                )
+            else:
+                log.error(f"Options close failed for {occ_sym}: {e}", exc_info=True)
 
     def close_all(self) -> None:
         """Emergency: close all open options positions."""

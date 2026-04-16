@@ -66,7 +66,10 @@ client = BrokerFactory.create_stock_client(cfg.STOCKS_BROKER)
 executor = EnhancedExecutor(client, use_bracket_orders=True)
 options_executor = OptionsExecutor(client) if cfg.OPTIONS_ENABLED else None
 if cfg.OPTIONS_ENABLED:
-    log.info("Options trading ENABLED (Level 3, 15% allocation, 7-21 DTE)")
+    log.info(
+        f"Options trading ENABLED ({int(cfg.OPTIONS_ALLOCATION_PCT)}% allocation, "
+        f"{cfg.OPTIONS_DTE_MIN}-{cfg.OPTIONS_DTE_MAX} DTE)"
+    )
 
 _last_market_regime: str = "bull"
 _short_fail_cooldown: dict = {}

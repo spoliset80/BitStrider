@@ -9,6 +9,7 @@ Optimized trade executor with consolidated logic:
 
 import logging
 import datetime
+import re
 import time
 from typing import Optional, Dict, Tuple
 from dataclasses import dataclass, field
@@ -133,6 +134,48 @@ class EnhancedExecutor:
         self.shorting_blocked: bool = False  # set true when broker rejects all short attempts for account
         self._pdt_stop_blocked: Dict[str, float] = {}  # {symbol: stop_price} — broker-rejected stops; monitored in software
         self._pdt_overnight_forced: set = set()  # symbols where PDT also blocks close — forced overnight, no retries
+        self._rebuild_entry_log_from_orders()
+
+    # -- Entry Log Rebuild (survive restarts) ----------------------------
+    def _rebuild_entry_log_from_orders(self) -> None:
+        """On startup, reconstruct today's entry log from Alpaca filled buy orders.
+        Prevents swap-closes of same-day positions after a bot restart, which would
+        trigger Alpaca PDT protection (error 40310100)."""
+        try:
+            today = datetime.date.today()
+            import pytz
+            from alpaca.trading.requests import GetOrdersRequest
+            from alpaca.trading.enums import QueryOrderStatus
+            et = pytz.timezone("America/New_York")
+            req = GetOrdersRequest(status=QueryOrderStatus.CLOSED)
+            filled_orders = self.client.get_orders(filter=req)
+            for order in filled_orders:
+                filled_at = getattr(order, "filled_at", None)
+                if filled_at is None:
+                    continue
+                if hasattr(filled_at, "astimezone"):
+                    order_date = filled_at.astimezone(et).date()
+                else:
+                    order_date = today  # conservative fallback
+                if order_date != today:
+                    continue
+                side = str(getattr(order, "side", "")).lower()
+                if side != "buy":
+                    continue
+                sym = order.symbol
+                if sym not in self._entry_log:
+                    self._entry_log[sym] = {
+                        "strategy": "restored",
+                        "date": today,
+                        "confidence": 0.0,
+                    }
+            if self._entry_log:
+                log.info(
+                    f"Entry log rebuilt from today's orders: "
+                    f"{', '.join(self._entry_log.keys())}"
+                )
+        except Exception as e:
+            log.warning(f"_rebuild_entry_log_from_orders failed (non-fatal): {e}")
 
     # -- Position Cache ----------------------------------------------------
     def _find_weakest_position(self) -> Optional[str]:
@@ -153,6 +196,7 @@ class EnhancedExecutor:
                 and float(getattr(p, "qty_available", p.qty)) > 0
                 and p.symbol not in self._swap_cycle_closed
                 and p.symbol not in entered_today
+                and not re.match(r'^[A-Z]+\d{6}[CP]\d{8}$', p.symbol)  # skip OCC option symbols
             ]
             if not longs:
                 return None
@@ -180,6 +224,7 @@ class EnhancedExecutor:
                 and float(getattr(p, "qty_available", p.qty)) > 0
                 and p.symbol not in self._swap_cycle_closed
                 and p.symbol not in entered_today
+                and not re.match(r'^[A-Z]+\d{6}[CP]\d{8}$', p.symbol)  # skip OCC option symbols
             ]
             if not candidates:
                 return None, 1.0
@@ -335,11 +380,26 @@ class EnhancedExecutor:
                     try:
                         self.client.close_position(weakest)
                         self._swap_cycle_closed.add(weakest)
-                        self.pdt.add(datetime.date.today())  # swap close counts as a day trade
+                        # Closing a prior-day position is NOT a day trade — do not count against PDT
                         positions = self._get_positions(force_refresh=True)
                     except Exception as e:
-                        log.warning(f"SWAP close failed for {weakest}: {e}")
-                        return False, f"Swap close failed: {e}"
+                        err_str = str(e)
+                        if "40310100" in err_str:
+                            # Alpaca PDT protection: position was entered today — can't close same day.
+                            # Mark as today's entry so it's never selected as swap candidate again.
+                            self._entry_log[weakest] = {
+                                "strategy": "restored",
+                                "date": datetime.date.today(),
+                                "confidence": 0.0,
+                            }
+                            log.warning(
+                                f"SWAP skip {weakest}: PDT same-day protection (40310100) — "
+                                f"marked as today entry, will not retry this session"
+                            )
+                            # Don't block the new signal — allow entry without the swap
+                        else:
+                            log.warning(f"SWAP close failed for {weakest}: {e}")
+                            return False, f"Swap close failed: {e}"
                 else:
                     # No position to swap, but BP available — allow entry anyway
                     log.info(
@@ -756,6 +816,12 @@ class EnhancedExecutor:
 
         for pos in positions:
             sym = pos.symbol
+
+            # Skip options legs — OCC symbols (e.g. AEHR260515C00080000) are managed
+            # by OptionsExecutor.monitor_positions(); trailing stops are invalid for options
+            # (Alpaca error 42210000).  OCC symbols always match <ticker><YYMMDD><C|P><8digits>.
+            if re.match(r'^[A-Z]+\d{6}[CP]\d{8}$', sym):
+                continue
 
             # Primary guard: don't add orders if symbol already has any active order
             if sym in covered:

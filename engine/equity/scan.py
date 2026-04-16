@@ -23,7 +23,6 @@ from engine.config import (
     MAX_GAP_CHASE_PCT,
     GAP_CHASE_CONSOL_BARS,
     BEAR_SHORT_UNIVERSE,
-    BEAR_SHORT_TARGET_RESERVE,
 )
 from engine.utils import clear_bar_cache, get_bars, is_market_open, is_dead_ticker
 from .universe import get_tier as _get_tier_live, get_latest_batch as _get_latest_batch, get_ti_primary as _get_ti_primary
@@ -156,10 +155,10 @@ def get_scan_targets(excluded: Set[str] = None) -> List[str]:
             seen.add(s)
             targets.append(s)
 
-    # TI-latest-batch guarantee: ALL tickers from the latest primary TI capture
-    # are pushed before rotation so they appear in every cycle regardless of universe size.
-    latest_batch = ti_primary if ti_primary else [s for s in _get_latest_batch(window_minutes=5)
-                                                 if s not in delisted]
+    # TI-latest-batch guarantee: push a capped slice of TI primary tickers so
+    # they appear in every cycle regardless of universe size.
+    # NOTE: do NOT override the max_fresh cap here — the original assignment above
+    # already limits to TI_PRIMARY_SCAN_BATCH_LIMIT so BEAR_SHORT_UNIVERSE has room.
     if not latest_batch:
         # Fallback: guarantee top-N newest from each tier
         TI_FRONT = 10
@@ -168,15 +167,14 @@ def get_scan_targets(excluded: Set[str] = None) -> List[str]:
     if in_bear:
         # Always seed with inverse ETFs first — they are valid longs in bear regime
         _push(_INVERSE_ETFS)
-        # Guarantee every ticker from the latest TI scrape batch
+        # Push capped TI batch (respects max_fresh so bear-universe gets slots)
         _push(latest_batch)
-        # Fill the remaining capacity from the rotating universe (majority of scan)
+        # Guarantee bear short universe symbols get into every bear cycle scan.
+        # These large/mid-cap names are what BearBreakdownStrategy fires on.
+        # Use SCAN_MAX_SYMBOLS as the ceiling so all slots up to the max are filled.
+        _push(list(BEAR_SHORT_UNIVERSE), limit=SCAN_MAX_SYMBOLS)
+        # Fill any remaining capacity from the rotating universe
         _push(rotated_base, limit=SCAN_MAX_SYMBOLS)
-
-        # Final fallback: static bear short universe
-        if len(targets) < SCAN_MAX_SYMBOLS:
-            short_cap = min(max(0, BEAR_SHORT_TARGET_RESERVE), SCAN_MAX_SYMBOLS)
-            _push(list(BEAR_SHORT_UNIVERSE), limit=short_cap)
     else:
         # Bull/neutral: latest batch guaranteed + rotating universe fills the rest
         _push(latest_batch)

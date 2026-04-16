@@ -1,47 +1,47 @@
 {
-  "generated_at": "2026-04-16T09:03:57-04:00",
+  "generated_at": "2026-04-16T11:20:30-04:00",
   "date": "2026-04-16",
   "market_regime": "bull",
   "picks": [
     {
-      "symbol": "HIMS",
+      "symbol": "RUM",
       "action": "buy",
-      "price": 24.38,
+      "price": 6.65,
       "confidence": 0.92,
       "strategy": "Sentiment",
-      "reason": "Sentiment bullish + vol x5.18 + price>20SMA"
+      "reason": "Sentiment bullish + vol x12.30 + price>20SMA"
     },
     {
-      "symbol": "NEXA",
+      "symbol": "NN",
       "action": "buy",
-      "price": 14.66,
+      "price": 20.725,
       "confidence": 0.92,
       "strategy": "Sentiment",
-      "reason": "Sentiment bullish + vol x6.31 + price>20SMA"
+      "reason": "Sentiment bullish + vol x5.31 + price>20SMA"
     },
     {
-      "symbol": "VNET",
+      "symbol": "WSHP",
       "action": "buy",
-      "price": 9.01,
-      "confidence": 0.82,
-      "strategy": "Sweepea",
-      "reason": "Daily Sweepea pullback to 20-EMA | ATR $0.49"
+      "price": 20.58,
+      "confidence": 0.92,
+      "strategy": "Sentiment",
+      "reason": "Sentiment bullish + vol x6.07 + price>20SMA"
     },
     {
-      "symbol": "MRLN",
+      "symbol": "CDNA",
       "action": "buy",
-      "price": 14.29,
-      "confidence": 0.82,
-      "strategy": "Sweepea",
-      "reason": "Daily Sweepea pullback to 8-EMA | ATR $1.98"
+      "price": 21.775,
+      "confidence": 0.9165,
+      "strategy": "Sentiment",
+      "reason": "Sentiment bullish + vol x4.66 + price>20SMA"
     },
     {
-      "symbol": "RKLX",
+      "symbol": "NUAI",
       "action": "buy",
-      "price": 33.04,
+      "price": 4.645,
       "confidence": 0.82,
       "strategy": "Sweepea",
-      "reason": "Daily Sweepea pullback to 8-EMA | ATR $4.36"
+      "reason": "Daily Sweepea pullback to 8-EMA | ATR $0.53"
     }
   ]
 }

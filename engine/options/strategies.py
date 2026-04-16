@@ -103,27 +103,27 @@ STRICT_A_PLUS_OPTION_FILTERS = False
 def get_dynamic_option_filters():
     """
     Returns a dict of filter thresholds, adapting to market regime if not in strict A+ mode.
+    All values are set for genuine liquidity: tight spreads, real OI, proper R/R.
     """
     bull = _is_bull_regime()
     if STRICT_A_PLUS_OPTION_FILTERS:
-        # Relaxed A+ values
         return {
-            "MAX_SPREAD_PCT": 15.0,
-            "MIN_OI_ATM": 250,
+            "MAX_SPREAD_PCT": 10.0,
+            "MIN_OI_ATM": 500,
             "MAX_PREMIUM_SPOT": 3.0,
-            "MIN_RR": 1.3,
+            "MIN_RR": 1.5,
             "IV_RANK_CALL_MAX": 40.0,
             "IV_RANK_PUT_MAX": 60.0,
         }
     else:
-        # Adaptive: Loosen thresholds in bull or bear regimes to increase option signal flow.
+        # Adaptive: tighten slightly in bear regime (fear premiums widen spreads)
         return {
-            "MAX_SPREAD_PCT": 25.0 if bull else 20.0,
-            "MIN_OI_ATM": 150 if bull else 200,
-            "MAX_PREMIUM_SPOT": 5.0 if bull else 4.0,
-            "MIN_RR": 1.0 if bull else 1.1,
-            "IV_RANK_CALL_MAX": 55.0 if bull else 50.0,
-            "IV_RANK_PUT_MAX": 75.0 if bull else 70.0,
+            "MAX_SPREAD_PCT": 12.0 if bull else 15.0,   # was 25/20 — now much tighter
+            "MIN_OI_ATM": 400 if bull else 500,          # was 150/200 — meaningful liquidity
+            "MAX_PREMIUM_SPOT": 4.0 if bull else 3.5,   # unchanged effective cap
+            "MIN_RR": 1.3 if bull else 1.4,             # was 1.0/1.1 — require real payoff
+            "IV_RANK_CALL_MAX": 50.0 if bull else 45.0,
+            "IV_RANK_PUT_MAX": 70.0 if bull else 65.0,
         }
 
 # Use these in all filter checks below
@@ -384,9 +384,9 @@ def _pick_strike(
 
     df = chain_df.copy()
 
-    # OI gate
+    # OI gate — use config value directly; no floor override that undermines it
     if "openinterest" in df.columns:
-        df = df[df["openinterest"] >= max(OPTIONS_MIN_OPEN_INTEREST, 50)]
+        df = df[df["openinterest"] >= OPTIONS_MIN_OPEN_INTEREST]
     if df.empty:
         return None
 
@@ -1095,11 +1095,19 @@ class IronCondorStrategy:
 
 # ------------------- Butterfly Strategy -------------------
 class ButterflyStrategy:
-    """Buy call butterfly: Buy ITM call, sell 2 ATM calls, buy OTM call (equal width). Low cost, high reward if pin.
+    """Buy call butterfly: Buy lower-wing call, sell 2 ATM calls, buy upper-wing call.
+    Profit maximised when spot pins at the short strike at expiry.
 
-    Entry requirements:
-    - Low IV (IV rank < 30)
-    - Price near resistance or expected pin
+    Entry requirements (all must pass):
+    - Neutral RSI 42–58: no strong trend, price expected to pin near ATM
+    - Flat session: |chg%| < 1.5% — breakout days hurt pinning thesis
+    - Volume not extreme: 0.7≤ RVOL ≤2.0 (avoid news-driven gap days)
+    - IV rank < 30 (buy cheap theta exposure)
+    - 2-strike-wide wings: wider profit zone than adjacent-strike butterfly
+    - Wing width >= 2% of spot (filters micro-cap / illiquid chains)
+    - Debit cap: net_debit <= 30% of wing_width (cost must be cheap relative to max payoff)
+    - R/R gate: max_profit / net_debit >= 2.0
+    - OI >= _MIN_OI_ATM on ATM short strike
     - No earnings within OPTIONS_EARNINGS_AVOID_DAYS
     """
     name = "Butterfly"
@@ -1112,6 +1120,14 @@ class ButterflyStrategy:
             if ctx is None or len(ctx.closes) < 55:
                 return None
 
+            # Butterflies need a neutral environment — strong trends kill pinning thesis
+            if abs(ctx.chg_pct) > 1.5:
+                return None
+            if ctx.rsi is None or not (42 <= ctx.rsi <= 58):
+                return None
+            if not (0.7 <= ctx.vol_ratio <= 2.0):
+                return None
+
             if not _no_earnings_soon(symbol, OPTIONS_EARNINGS_AVOID_DAYS):
                 return None
 
@@ -1121,12 +1137,20 @@ class ButterflyStrategy:
 
             strikes = sorted(chain.calls["strike"].unique())
             atm_idx = min(range(len(strikes)), key=lambda i: abs(strikes[i] - ctx.spot))
-            if atm_idx < 1 or atm_idx > len(strikes) - 2:
+            # 2-strike wide wings for a broader profit zone
+            if atm_idx < 2 or atm_idx > len(strikes) - 3:
                 return None
 
-            low_strike  = strikes[atm_idx - 1]
+            low_strike  = strikes[atm_idx - 2]
             mid_strike  = strikes[atm_idx]
-            high_strike = strikes[atm_idx + 1]
+            high_strike = strikes[atm_idx + 2]
+
+            left_width  = mid_strike - low_strike
+            right_width = high_strike - mid_strike
+            wing_width  = min(left_width, right_width)   # conservative: use narrower side
+
+            if wing_width < ctx.spot * 0.02:   # wings must span at least 2% of spot
+                return None
 
             def _leg_mid(df: pd.DataFrame, strike: float) -> float:
                 row = df[abs(df["strike"] - strike) < 0.01]
@@ -1143,10 +1167,20 @@ class ButterflyStrategy:
                 return None
 
             # Buy 1 low, sell 2 mid, buy 1 high
-            net_debit    = round(low_mid + high_mid - 2 * mid_mid, 3)
-            spread_width = high_strike - low_strike
-            max_profit   = round(spread_width - net_debit, 3)
+            # max_profit = wing_width - net_debit (at pin = mid_strike at expiry)
+            net_debit  = round(low_mid + high_mid - 2 * mid_mid, 3)
+            max_profit = round(wing_width - net_debit, 3)
+
             if net_debit <= 0 or max_profit <= 0:
+                return None
+
+            # Debit must be cheap: cost <= 30% of max payoff zone
+            if net_debit / wing_width > 0.30:
+                return None
+
+            # Butterflies need high R/R to justify the pin risk
+            rr = round(max_profit / net_debit, 2)
+            if rr < 2.0:
                 return None
 
             dte     = (chain.expiry - datetime.date.today()).days
@@ -1155,8 +1189,15 @@ class ButterflyStrategy:
             delta   = float(mid_row.iloc[0].get("delta", 0.50))          if not mid_row.empty else 0.50
             oi      = int(mid_row.iloc[0].get("openinterest", 0))         if not mid_row.empty else 0
 
-            conf  = 0.82   # butterflies are low-cost defined-risk — start at threshold
-            conf += min(0.05, (30 - chain.iv_rank) * 0.002)
+            # OI gate on the ATM short strike (must have real liquidity)
+            if oi < _MIN_OI_ATM:
+                return None
+
+            # Confidence — starts low, must earn it; max 0.92 (pin trades are speculative)
+            conf  = 0.70
+            conf += min(0.08, (30 - chain.iv_rank) * 0.004)    # bigger reward for cheaper IV
+            conf += min(0.07, (rr - 2.0) * 0.025)              # reward high R/R
+            conf += min(0.04, (1.5 - abs(ctx.chg_pct)) * 0.03) # reward flat price action
             confidence = round(min(0.92, conf), 3)
 
             return OptionSignal(
@@ -1169,14 +1210,15 @@ class ButterflyStrategy:
                 confidence=confidence,
                 reason=(
                     f"Butterfly {low_strike:.0f}/{mid_strike:.0f}/{high_strike:.0f}C "
-                    f"net=${net_debit:.2f} max=${max_profit:.2f} IVrank={chain.iv_rank:.0f} | {dte}DTE"
+                    f"net=${net_debit:.2f} max=${max_profit:.2f} R/R={rr:.1f}x "
+                    f"IVrank={chain.iv_rank:.0f} RSI={ctx.rsi:.0f} | {dte}DTE"
                 ),
                 strategy=self.name,
                 iv_pct=iv_pct,
                 iv_rank=chain.iv_rank,
                 delta=delta,
                 open_interest=oi,
-                rr_ratio=round(max_profit / net_debit, 2),
+                rr_ratio=rr,
                 breakeven=None,
                 butterfly_low_strike=low_strike,
                 butterfly_low_mid=low_mid,
