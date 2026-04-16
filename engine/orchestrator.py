@@ -26,6 +26,7 @@ from . import config as cfg
 from .utils import (
     setup_logging,
     is_market_open,
+    is_regular_hours,
     get_vix,
     clear_bar_cache,
     get_finnhub_trending_tickers,
@@ -170,7 +171,36 @@ def scan_and_trade() -> None:
 
     _session.reset_daily(client)
 
-    today = _session.daily_reset
+    if options_executor is not None and is_regular_hours():
+        try:
+            options_executor.monitor_positions()
+            _all_positions = client.get_all_positions()
+            _held_map = {
+                p.symbol: int(float(p.qty))
+                for p in _all_positions
+                if float(p.qty) > 0
+            }
+            _existing_opt_syms = {
+                pos.occ_symbol for pos in options_executor._positions.values()
+            }
+
+            opt_signals = scan_options_universe(_held_map, _existing_opt_syms)
+            if opt_signals:
+                top_opt_signals = opt_signals[:10]
+                log.info(
+                    f"[OPTIONS] {len(opt_signals)} signals found — passing top {len(top_opt_signals)} to executor; "
+                    f"top candidate: {top_opt_signals[0].symbol} {top_opt_signals[0].option_type} conf={top_opt_signals[0].confidence:.0%}"
+                )
+                for opt_sig in top_opt_signals:
+                    if options_executor.place_option_order(opt_sig):
+                        break
+            else:
+                log.info("[OPTIONS] No qualifying signals this cycle")
+
+            log.info(f"[OPTIONS] {options_executor.status_summary()}")
+        except Exception as _opt_err:
+            log.error(f"[OPTIONS] Options cycle error: {_opt_err}", exc_info=True)
+            
     if not is_market_open():
         if not cfg.FORCE_SCAN:
             log.info("[SYSTEM] Market closed - skipping scan")
@@ -214,6 +244,10 @@ def scan_and_trade() -> None:
         f"[SCAN] Scanning {len(scan_targets)} symbols (filtered by held/ordered), {cfg.SCAN_WORKERS} workers: "
         f"{', '.join(scan_targets)}"
     )
+
+    if not scan_targets:
+        log.info("[SCAN] No scan targets after filtering — skipping scan")
+        return
 
     executor._swap_cycle_closed.clear()
 
@@ -435,7 +469,7 @@ def scan_and_trade() -> None:
                     )
                 time.sleep(1)
         else:
-            top_signals = eligible[:signals_cap]
+            top_signals = sorted(eligible, key=lambda s: s.confidence, reverse=True)[:signals_cap]
             log.info(f"Executing top {len(top_signals)} signal(s) (cap={signals_cap})")
             for sig in top_signals:
                 is_short_signal = sig.action in ("sell", "short")
@@ -454,35 +488,7 @@ def scan_and_trade() -> None:
     else:
         log.info("[SCAN] No signals found this cycle")
 
-    if options_executor is not None and is_market_open():
-        try:
-            options_executor.monitor_positions()
-            _all_positions = client.get_all_positions()
-            _held_map = {
-                p.symbol: int(float(p.qty))
-                for p in _all_positions
-                if float(p.qty) > 0
-            }
-            _existing_opt_syms = {
-                pos.occ_symbol for pos in options_executor._positions.values()
-            }
-
-            opt_signals = scan_options_universe(_held_map, _existing_opt_syms)
-            if opt_signals:
-                top_opt_signals = opt_signals[:10]
-                log.info(
-                    f"[OPTIONS] {len(opt_signals)} signals found — passing top {len(top_opt_signals)} to executor; "
-                    f"top candidate: {top_opt_signals[0].symbol} {top_opt_signals[0].option_type} conf={top_opt_signals[0].confidence:.0%}"
-                )
-                for opt_sig in top_opt_signals:
-                    if options_executor.place_option_order(opt_sig):
-                        break
-            else:
-                log.info("[OPTIONS] No qualifying signals this cycle")
-
-            log.info(f"[OPTIONS] {options_executor.status_summary()}")
-        except Exception as _opt_err:
-            log.error(f"[OPTIONS] Options cycle error: {_opt_err}", exc_info=True)
+    
 
 
 def _fetch_account_and_positions(timeout_seconds: int = 30):

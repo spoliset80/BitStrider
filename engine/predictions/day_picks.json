@@ -1,40 +1,8 @@
 {
-  "generated_at": "2026-04-15T21:19:22-04:00",
-  "date": "2026-04-15",
+  "generated_at": "2026-04-16T08:19:11-04:00",
+  "date": "2026-04-16",
   "market_regime": "bull",
   "picks": [
-    {
-      "symbol": "TSHA",
-      "action": "buy",
-      "price": 5.99,
-      "confidence": 0.92,
-      "strategy": "Sentiment",
-      "reason": "Sentiment bullish + vol x7.06 + price>20SMA"
-    },
-    {
-      "symbol": "NEXA",
-      "action": "buy",
-      "price": 14.66,
-      "confidence": 0.92,
-      "strategy": "Sentiment",
-      "reason": "Sentiment bullish + vol x6.31 + price>20SMA"
-    },
-    {
-      "symbol": "DOO",
-      "action": "buy",
-      "price": 50.92,
-      "confidence": 0.92,
-      "strategy": "Sentiment",
-      "reason": "Sentiment bullish + vol x8.77 + price>20SMA"
-    },
-    {
-      "symbol": "IFS",
-      "action": "buy",
-      "price": 45.92,
-      "confidence": 0.92,
-      "strategy": "Sentiment",
-      "reason": "Sentiment bullish + vol x5.28 + price>20SMA"
-    },
     {
       "symbol": "HIMS",
       "action": "buy",
@@ -42,6 +10,30 @@
       "confidence": 0.92,
       "strategy": "Sentiment",
       "reason": "Sentiment bullish + vol x5.18 + price>20SMA"
+    },
+    {
+      "symbol": "SPIR",
+      "action": "buy",
+      "price": 20.54,
+      "confidence": 0.82,
+      "strategy": "Sweepea",
+      "reason": "Daily Sweepea pullback to 8-EMA | ATR $2.28"
+    },
+    {
+      "symbol": "SKYQ",
+      "action": "buy",
+      "price": 11.09,
+      "confidence": 0.82,
+      "strategy": "Sweepea",
+      "reason": "Daily Sweepea pullback to 8-EMA | ATR $2.73"
+    },
+    {
+      "symbol": "ORC",
+      "action": "buy",
+      "price": 7.36,
+      "confidence": 0.82,
+      "strategy": "Sweepea",
+      "reason": "Daily Sweepea pullback to 8-EMA | ATR $0.15"
     }
   ]
 }

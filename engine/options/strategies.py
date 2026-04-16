@@ -167,6 +167,12 @@ class OptionSignal:
     butterfly_high_strike: Optional[float] = None   # highest strike (buy 1)
     butterfly_high_mid:    Optional[float] = None   # cost of high strike
     # For butterfly: strike = mid_strike (sell 2x), spread_sell_strike = mid_strike (unused), mid_price = net_debit
+    
+    # Iron condor fields (sell 1 long put, sell 1 short put, sell 1 short call, sell 1 long call)
+    put_long_strike:  Optional[float] = None   # long (OTM) put strike
+    put_short_strike: Optional[float] = None   # short (ITM) put strike
+    call_short_strike: Optional[float] = None  # short (ITM) call strike
+    call_long_strike: Optional[float] = None   # long (OTM) call strike
 
 
 @dataclass
@@ -1040,6 +1046,11 @@ class IronCondorStrategy:
                 breakeven=None,
                 spread_sell_strike=short_call,
                 spread_sell_mid=short_call_mid,
+                # Iron condor legs
+                put_long_strike=long_put,
+                put_short_strike=short_put,
+                call_short_strike=short_call,
+                call_long_strike=long_call,
             )
         except Exception as e:
             log.debug(f"IronCondor {symbol}: {e}")
