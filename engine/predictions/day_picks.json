@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-04-15T17:29:10-04:00",
+  "generated_at": "2026-04-15T21:03:37-04:00",
   "date": "2026-04-15",
   "market_regime": "bull",
   "picks": [
@@ -18,6 +18,14 @@
       "confidence": 0.92,
       "strategy": "Sentiment",
       "reason": "Sentiment bullish + vol x7.06 + price>20SMA"
+    },
+    {
+      "symbol": "NEXA",
+      "action": "buy",
+      "price": 14.66,
+      "confidence": 0.92,
+      "strategy": "Sentiment",
+      "reason": "Sentiment bullish + vol x6.31 + price>20SMA"
     },
     {
       "symbol": "DOO",

@@ -273,7 +273,25 @@ class OptionsExecutor:
         
         
     # ── Position Monitoring ────────────────────────────────────────────────────
-
+    def _check_pdt_status(self) -> Tuple[bool, int]:
+        """
+        Helper to determine if the account is subject to PDT restrictions.
+        Returns: (is_small_account, day_trades_remaining)
+        """
+        try:
+            acct = self.client.get_account()
+            equity = float(acct.equity)
+            pdt_flagged = str(getattr(acct, "pattern_day_trader", False)).lower() in ("1", "true", "yes")
+            
+            # If under 25k and flagged, we are restricted
+            is_small = equity < PDT_ACCOUNT_MIN and pdt_flagged
+            trades_used = int(getattr(acct, "daytrade_count", 0))
+            remaining = max(0, PDT_MAX_TRADES - trades_used)
+            
+            return is_small, remaining
+        except Exception as e:
+            log.warning(f"PDT Status Check Failed: {e}")
+            return False, 0
     def monitor_positions(self) -> None:
         """
         Check open options (Single & MLEG) and close at target/stop.

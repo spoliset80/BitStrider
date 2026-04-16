@@ -32,7 +32,7 @@ OPTIONS_BROKER = "alpaca"                               # Only Alpaca supports o
 # covered calls on held positions. Expiry: 7–21 DTE (near-term).
 # ─────────────────────────────────────────────────────────────────
 OPTIONS_ENABLED             = os.getenv("OPTIONS_ENABLED", "true").lower() in ("1", "true", "yes")
-OPTIONS_ALLOCATION_PCT      = float(os.getenv("OPTIONS_ALLOCATION_PCT", "15.0"))  # % of equity for all options
+OPTIONS_ALLOCATION_PCT      = float(os.getenv("OPTIONS_ALLOCATION_PCT", "45.0"))  # % of equity for all options
 OPTIONS_MAX_POSITIONS       = int(os.getenv("OPTIONS_MAX_POSITIONS", "3"))        # max open options contracts
 OPTIONS_DTE_MIN             = int(os.getenv("OPTIONS_DTE_MIN", "14"))             # min days-to-expiry at entry (14 avoids forced same-day close = PDT hit)
 OPTIONS_DTE_MAX             = int(os.getenv("OPTIONS_DTE_MAX", "40"))             # max days-to-expiry at entry
