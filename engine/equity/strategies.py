@@ -307,19 +307,8 @@ class TrendBreakerStrategy:
 
         atr14 = _calc_atr14(daily)
 
-        # Small-cap gate: squeeze plays require market cap < $1B
-        _mcap = _mcap_cache.get(symbol)
-        if _mcap is None:
-            try:
-                # TODO: Replace with Alpaca or other API for market cap
-                _mcap = None
-                # _mcap = get_market_cap(symbol)  # Implement in utils.py if needed
-                _mcap_cache[symbol] = float(_mcap) if _mcap else 0.0
-                _mcap = _mcap_cache[symbol]
-            except Exception:
-                _mcap = 0.0
-        if _mcap and _mcap > 1_000_000_000:
-            return None
+        # Small-cap gate: disabled until a market-cap data source is wired into utils.
+        # Wire in get_market_cap(symbol) here when available; check < $1B for squeeze plays.
 
         # Confidence: base 0.78, scales with volume gift (3×→5× = 0.78→0.83)
         confidence = 0.78 + min((vol_ratio - 3.0) * 0.025, 0.12)
@@ -737,6 +726,21 @@ class VWAPReclaimStrategy:
 _float_info_cache: dict = {}
 _mcap_cache:        dict = {}  # {symbol: market_cap_float}
 
+def _get_float_shares(symbol: str) -> Optional[float]:
+    """Cached float share count for low-float strategies.
+    Returns None until a float data provider (Finviz, Alpaca, etc.) is wired in."""
+    if symbol in _float_info_cache:
+        return _float_info_cache[symbol]
+    # Wire in a float data provider here when available:
+    # try:
+    #     shares = get_float_shares(symbol)
+    #     if shares and shares > 0:
+    #         _float_info_cache[symbol] = float(shares)
+    #         return float(shares)
+    # except Exception:
+    #     pass
+    return None
+
 
 class FloatRotationStrategy:
     """Low-float stock with volume > X% of float = stock is 'in play'.
@@ -750,18 +754,7 @@ class FloatRotationStrategy:
     """
 
     def _get_float(self, symbol: str) -> Optional[float]:
-        if symbol in _float_info_cache:
-            return _float_info_cache[symbol]
-        try:
-            # TODO: Replace with Alpaca or other API for float shares
-            shares_float = None
-            # shares_float = get_float_shares(symbol)  # Implement in utils.py if needed
-            if shares_float and shares_float > 0:
-                _float_info_cache[symbol] = float(shares_float)
-                return float(shares_float)
-        except Exception:
-            pass
-        return None
+        return _get_float_shares(symbol)
 
     def scan(self, symbol: str) -> Optional[Signal]:
         shares_float = self._get_float(symbol)
@@ -983,18 +976,7 @@ class EarlySqueezeDetector:
     """
 
     def _get_float(self, symbol: str) -> Optional[float]:
-        if symbol in _float_info_cache:
-            return _float_info_cache[symbol]
-        try:
-            # TODO: Replace with Alpaca or other API for float shares
-            sf = None
-            # sf = get_float_shares(symbol)  # Implement in utils.py if needed
-            if sf and sf > 0:
-                _float_info_cache[symbol] = float(sf)
-                return float(sf)
-        except Exception:
-            pass
-        return None
+        return _get_float_shares(symbol)
 
     def scan(self, symbol: str) -> Optional[Signal]:
         now_et      = datetime.datetime.now(ET)
@@ -1238,8 +1220,8 @@ class PowerOf3Strategy:
         )
 
 
-def get_strategy_instances(bear_regime: bool = True):
-    """Return instantiated strategy objects for current market regime."""
+def get_strategy_instances(bull_regime: bool = True):
+    """Return instantiated strategy objects for the current market regime."""
     strategies = [
         GapBreakoutStrategy(),
         ORBStrategy(),
@@ -1257,6 +1239,8 @@ def get_strategy_instances(bear_regime: bool = True):
         PowerOf3Strategy(),
     ]
 
-    strategies.append(BearBreakdownStrategy())
+    # Only add bear-regime strategies when we are actually in a bear regime
+    if not bull_regime:
+        strategies.append(BearBreakdownStrategy())
     return strategies
 

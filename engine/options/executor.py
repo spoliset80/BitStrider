@@ -37,6 +37,7 @@ from engine.config import (
     OPTIONS_STOP_LOSS_PCT,
     OPTIONS_DTE_MIN,
     PDT_ACCOUNT_MIN, PDT_MAX_TRADES, PDT_OPTIONS_DAY_TRADE_RESERVE,
+    OPTIONS_THETA_EXIT_DTE,
     API_KEY, API_SECRET, PAPER,
 )
 from .strategies import OptionSignal, CONTRACT_SIZE, record_stop_cooldown
@@ -84,7 +85,7 @@ class OptionsExecutor:
         self.client = client
         self._positions: Dict[str, OptionsPosition] = {}   # occ_symbol -> OptionsPosition
         self._last_monitor_ts: float = 0.0
-        self._MONITOR_INTERVAL = 60   # seconds between P&L checks
+        self._MONITOR_INTERVAL = 20   # seconds between P&L checks (fast enough to catch intraday moves)
 
     # ── Allocation / Budget ────────────────────────────────────────────────────
 
@@ -161,16 +162,21 @@ class OptionsExecutor:
             return False
 
         # 2. PDT & Account Guard
-        try:
-            acct = self.client.get_account()
-            equity = float(acct.equity)
-            # Small account check (PDT Rule: $25k)
-            if equity < 25000 and self._count_open_options() >= 1:
-                log.info(f"[OPTIONS] Small account (${equity:,.0f}) position limit reached.")
-                return True
-        except Exception as e:
-            log.warning(f"[OPTIONS] Account check failed: {e}")
-            return False
+        is_small_account, dt_remaining = self._check_pdt_status()
+        if is_small_account:
+            # Reserve day trades only matter for same-day closes.
+            # Options entered with DTE >= OPTIONS_DTE_MIN are swing trades by design
+            # and will NOT create a day trade on entry. Only block if we literally have
+            # no day trades left (would be unable to emergency-exit any position today).
+            if dt_remaining == 0:
+                log.info(
+                    f"[OPTIONS] PDT reserve: 0 day trades remaining — skipping {signal.symbol} entry"
+                )
+                return False
+            # Cap to 1 open option position on small accounts to conserve capital
+            if self._count_open_options() >= 1:
+                log.info(f"[OPTIONS] Small account 1-position cap reached — skipping {signal.symbol}")
+                return False
 
         # 3. Budget & Contract Calculation
         _, remaining = self._get_options_budget()
@@ -322,9 +328,9 @@ class OptionsExecutor:
         for occ_sym, pos in list(self._positions.items()):
             dte = (pos.expiry - today).days
 
-            # 1. Expiry risk
-            if dte <= 1:
-                log.warning(f"OPTIONS: {occ_sym} expiring in {dte}d — closing strategy")
+            # 1. Theta guard: exit within OPTIONS_THETA_EXIT_DTE days to avoid accelerating decay
+            if dte <= OPTIONS_THETA_EXIT_DTE:
+                log.warning(f"OPTIONS: {occ_sym} within {OPTIONS_THETA_EXIT_DTE}d of expiry (DTE={dte}) — closing")
                 to_close.append(occ_sym)
                 continue
 

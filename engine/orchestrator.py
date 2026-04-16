@@ -27,6 +27,7 @@ from .utils import (
     setup_logging,
     is_market_open,
     is_regular_hours,
+    is_options_lull_hours,
     get_vix,
     clear_bar_cache,
     get_finnhub_trending_tickers,
@@ -67,7 +68,6 @@ options_executor = OptionsExecutor(client) if cfg.OPTIONS_ENABLED else None
 if cfg.OPTIONS_ENABLED:
     log.info("Options trading ENABLED (Level 3, 15% allocation, 7-21 DTE)")
 
-_session.load_quarterly_state()
 _last_market_regime: str = "bull"
 _short_fail_cooldown: dict = {}
 
@@ -174,28 +174,32 @@ def scan_and_trade() -> None:
     if options_executor is not None and is_regular_hours():
         try:
             options_executor.monitor_positions()
-            _all_positions = client.get_all_positions()
-            _held_map = {
-                p.symbol: int(float(p.qty))
-                for p in _all_positions
-                if float(p.qty) > 0
-            }
-            _existing_opt_syms = {
-                pos.occ_symbol for pos in options_executor._positions.values()
-            }
 
-            opt_signals = scan_options_universe(_held_map, _existing_opt_syms)
-            if opt_signals:
-                top_opt_signals = opt_signals[:10]
-                log.info(
-                    f"[OPTIONS] {len(opt_signals)} signals found — passing top {len(top_opt_signals)} to executor; "
-                    f"top candidate: {top_opt_signals[0].symbol} {top_opt_signals[0].option_type} conf={top_opt_signals[0].confidence:.0%}"
-                )
-                for opt_sig in top_opt_signals:
-                    if options_executor.place_option_order(opt_sig):
-                        break
+            if is_options_lull_hours():
+                log.info("[OPTIONS] Lull period (open auction or midday) — monitoring only, no new entries")
             else:
-                log.info("[OPTIONS] No qualifying signals this cycle")
+                _all_positions = client.get_all_positions()
+                _held_map = {
+                    p.symbol: int(float(p.qty))
+                    for p in _all_positions
+                    if float(p.qty) > 0
+                }
+                _existing_opt_syms = {
+                    pos.occ_symbol for pos in options_executor._positions.values()
+                }
+
+                opt_signals = scan_options_universe(_held_map, _existing_opt_syms)
+                if opt_signals:
+                    top_opt_signals = opt_signals[:10]
+                    log.info(
+                        f"[OPTIONS] {len(opt_signals)} signals found — passing top {len(top_opt_signals)} to executor; "
+                        f"top candidate: {top_opt_signals[0].symbol} {top_opt_signals[0].option_type} conf={top_opt_signals[0].confidence:.0%}"
+                    )
+                    for opt_sig in top_opt_signals:
+                        if options_executor.place_option_order(opt_sig):
+                            break
+                else:
+                    log.info("[OPTIONS] No qualifying signals this cycle")
 
             log.info(f"[OPTIONS] {options_executor.status_summary()}")
         except Exception as _opt_err:
@@ -574,7 +578,24 @@ def get_adaptive_interval() -> int:
     return interval
 
 
+def _prune_universe_job() -> None:
+    """Remove expired universe tickers. Scheduled every 30 min by start()."""
+    try:
+        from .equity.universe import prune as _prune
+        removed = _prune()
+        if removed:
+            log.info(
+                f"Universe pruned: removed {len(removed)} expired ticker(s): "
+                f"{removed[:10]}{'\u2026' if len(removed) > 10 else ''}"
+            )
+        else:
+            log.info("Universe pruned: no expired tickers")
+    except Exception as e:
+        log.warning(f"Universe prune job failed: {e}")
+
+
 def start() -> None:
+    _session.load_quarterly_state()
     log.info("=" * 70)
     log.info("APEXTRADER - Priority-Based Momentum Trading")
     log.info("=" * 70)
@@ -617,8 +638,7 @@ def start() -> None:
                     )
                 except Exception as _e:
                     log.warning(f"Startup TI capture failed: {_e}")
-                finally:
-                    scan_tradeideas_universe()
+
             else:
                 log.info("Startup TI capture complete — proceeding with current universe")
         except Exception as _e:
@@ -633,19 +653,6 @@ def start() -> None:
     current_interval = get_adaptive_interval()
     last_scan = time.time()
 
-    def _prune_universe_job() -> None:
-        try:
-            from .equity.universe import prune as _prune
-            removed = _prune()
-            if removed:
-                log.info(
-                    f"Universe pruned: removed {len(removed)} expired ticker(s): "
-                    f"{removed[:10]}{'…' if len(removed) > 10 else ''}"
-                )
-            else:
-                log.info("Universe pruned: no expired tickers")
-        except Exception as e:
-            log.warning(f"Universe prune job failed: {e}")
 
     schedule.every(30).minutes.do(log_status)
     schedule.every(30).minutes.do(_prune_universe_job)

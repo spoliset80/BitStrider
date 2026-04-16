@@ -198,7 +198,6 @@ class EnhancedExecutor:
             return None, 1.0
 
     def _get_positions(self, force_refresh: bool = False) -> PositionInfo:
-        import time
         now = time.time()
         if force_refresh or self._position_cache is None or (now - self._cache_timestamp) > self._cache_ttl:
             raw = self.client.get_all_positions()
@@ -211,7 +210,6 @@ class EnhancedExecutor:
 
     # -- Account Cache -----------------------------------------------------
     def _get_account(self, force_refresh: bool = False) -> AccountSnapshot:
-        import time
         now = time.time()
         if force_refresh or self._account_cache is None or (now - self._account_cache.timestamp) > self._account_ttl:
             raw = self.client.get_account()

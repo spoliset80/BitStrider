@@ -30,7 +30,7 @@ from .universe import get_tier as _get_tier_live, get_latest_batch as _get_lates
 
 _ET  = pytz.timezone("America/New_York")
 _log = logging.getLogger("ApexTrader")
-from .strategies import get_strategy_instances, MomentumStrategy, TechnicalStrategy, SentimentStrategy, _is_bull_regime
+from .strategies import get_strategy_instances, MomentumStrategy, TechnicalStrategy, SentimentStrategy, _is_bull_regime, _INVERSE_ETFS
 
 # Rotating scan offset — advances by SCAN_MAX_SYMBOLS each call so different
 # slices of the universe are covered across consecutive cycles.
@@ -123,9 +123,6 @@ def get_scan_targets(excluded: Set[str] = None) -> List[str]:
     ]
     latest_batch = list(dict.fromkeys(latest_batch))[:max_fresh]
 
-    # Rotate only a bounded section of the TI universe to keep scan selection focused.
-    combined_base = (p2[:SCAN_MAX_SYMBOLS * 2] + p1[:SCAN_MAX_SYMBOLS * 2])
-
     # Rotate through the combined universe so every cycle scans a different slice.
     # TI-promoted tickers sit at the front and always make it in regardless of offset.
     combined_base = p2 + p1   # tier-2 first in bear, then tier-1
@@ -147,7 +144,6 @@ def get_scan_targets(excluded: Set[str] = None) -> List[str]:
 
     # Inverse ETFs guaranteed first in bear — they profit from market decline
     # and are valid LONG buys with LONG_ONLY_MODE=True.
-    _INVERSE_ETFS = ["SQQQ", "SPXU", "UVXY", "TZA", "FAZ", "SOXS", "LABD", "DUST"]
 
     def _push(symbols: List[str], limit: int = None) -> None:
         for s in symbols:
@@ -253,14 +249,7 @@ def filter_signals(signals, long_only: bool = False, min_conf: float = 0.0, cap:
     if long_only:
         signals = [s for s in signals if s.action == "buy"]
 
-    original_signals = signals
     signals = [s for s in signals if s.confidence >= min_conf]
-
-    # If all signals got filtered out, optionally retain the top candidate for manual testing.
-    # This is a deliberate dev/test behavior: set min_conf low in production or remove this block.
-    if not signals and original_signals:
-        best = max(original_signals, key=lambda s: s.confidence)
-        signals = [best]
 
     if cap is not None:
         signals = signals[:cap]

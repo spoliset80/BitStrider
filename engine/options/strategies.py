@@ -303,6 +303,7 @@ def _snapshots_to_df(snapshots: dict, opt_type: str) -> pd.DataFrame:
             "impliedvolatility": iv,
             "iv_pct": iv * 100,
             "delta": delta,
+            "openinterest": oi,
             "expiry": expiry,
         })
 
@@ -460,6 +461,53 @@ def _three_day_trend(closes: pd.Series, direction: str) -> bool:
         return (c[-1] < c[-2]) or (c[-2] < c[-3])
 
 
+# -- Shared Bar Context --------------------------------------------------------
+
+@dataclass
+class _BarCtx:
+    """Pre-computed bar data and indicators, shared across all strategy scan() calls."""
+    daily:     pd.DataFrame
+    closes:    pd.Series
+    spot:      float
+    prev:      float
+    chg_pct:   float        # % change from previous close
+    avg_vol20: float
+    cur_vol:   float
+    vol_ratio: float        # cur_vol / avg_vol20
+    rsi:       Optional[float]
+    ema20:     float
+    ema50:     float
+    atr14:     float
+
+
+def _fetch_bar_context(symbol: str) -> Optional[_BarCtx]:
+    """Fetch 80-day daily bars and compute common indicators for all strategies.
+
+    Returns None if data is insufficient or spot is below OPTIONS_MIN_STOCK_PRICE.
+    All strategies should call this instead of independently fetching bars.
+    """
+    daily = get_bars(symbol, "80d", "1d")
+    if daily.empty or len(daily) < 25:
+        return None
+    closes = daily["close"]
+    spot   = float(closes.iloc[-1])
+    if spot < OPTIONS_MIN_STOCK_PRICE:
+        return None
+    prev    = float(closes.iloc[-2])
+    chg_pct = (spot - prev) / prev * 100
+    avg_vol20 = float(daily["volume"].iloc[-21:-1].mean())
+    cur_vol   = float(daily["volume"].iloc[-1])
+    vol_ratio = cur_vol / max(avg_vol20, 1.0)
+    rsi       = _calc_rsi_scalar(closes)
+    ema20     = float(closes.ewm(span=20, adjust=False).mean().iloc[-1])
+    ema50     = float(closes.ewm(span=50, adjust=False).mean().iloc[-1])
+    hi = daily["high"]; lo = daily["low"]; pc = daily["close"].shift(1)
+    tr    = pd.concat([(hi - lo), (hi - pc).abs(), (lo - pc).abs()], axis=1).max(axis=1)
+    atr14 = float(tr.rolling(14).mean().iloc[-1])
+    return _BarCtx(daily, closes, spot, prev, chg_pct, avg_vol20, cur_vol, vol_ratio,
+                   rsi, ema20, ema50, atr14)
+
+
 # -- Strategy Implementations --------------------------------------------------
 
 class MomentumCallStrategy:
@@ -490,41 +538,30 @@ class MomentumCallStrategy:
             return None
 
         try:
-            daily = get_bars(symbol, "65d", "1d")
-            if daily.empty or len(daily) < 25:
+            ctx = _fetch_bar_context(symbol)
+            if ctx is None or len(ctx.closes) < 25:
                 return None
 
-            closes = daily["close"]
-            spot   = float(closes.iloc[-1])
-            if spot < OPTIONS_MIN_STOCK_PRICE:
-                return None  # sub-$5 options are illiquid with wide spreads
-            prev   = float(closes.iloc[-2])
-            chg    = (spot - prev) / prev * 100
-            if chg < OPTIONS_MIN_MOVE_PCT:
+            if ctx.chg_pct < OPTIONS_MIN_MOVE_PCT:
+                return None
+            if ctx.vol_ratio < OPTIONS_MIN_RVOL:
                 return None
 
-            avg_vol20 = float(daily["volume"].iloc[-21:-1].mean())
-            cur_vol   = float(daily["volume"].iloc[-1])
-            vol_ratio = cur_vol / max(avg_vol20, 1)
-            if vol_ratio < OPTIONS_MIN_RVOL:
-                return None
-
-            rsi = _calc_rsi_scalar(closes)
-            if rsi is None or not (50 <= rsi <= 72):
+            if ctx.rsi is None or not (50 <= ctx.rsi <= 72):
                 return None
 
             # A+ Filter 1: EMA-20 trend alignment
-            trend_ok, ema20 = _trend_aligned(closes, "up")
+            trend_ok, ema20 = _trend_aligned(ctx.closes, "up")
             if not trend_ok:
                 return None
 
             # A+ Filter 2: 3-day momentum confirmation
-            if not _three_day_trend(closes, "up"):
+            if not _three_day_trend(ctx.closes, "up"):
                 return None
 
             # A+ Filter 3: breakout above prior 5-day high
-            prior_5d_high = float(daily["high"].iloc[-7:-2].max())
-            if spot < prior_5d_high * 0.995:
+            prior_5d_high = float(ctx.daily["high"].iloc[-7:-2].max())
+            if ctx.spot < prior_5d_high * 0.995:
                 return None
 
             chain = _get_options_chain(symbol)
@@ -536,7 +573,7 @@ class MomentumCallStrategy:
                 log.debug(f"MomentumCall {symbol}: IV rank {chain.iv_rank:.0f} > {_IV_RANK_CALL_MAX} (dynamic) -- skip")
                 return None
 
-            strike_row = _pick_strike(chain.calls, spot, OPTIONS_DELTA_TARGET)
+            strike_row = _pick_strike(chain.calls, ctx.spot, OPTIONS_DELTA_TARGET)
             if strike_row is None:
                 return None
 
@@ -551,7 +588,7 @@ class MomentumCallStrategy:
                 return None
 
             # A+ Filter 5: Premium/spot cap
-            if mid / spot * 100 > _MAX_PREMIUM_SPOT:
+            if mid / ctx.spot * 100 > _MAX_PREMIUM_SPOT:
                 return None
 
             # A+ Filter 6: R/R gate
@@ -561,17 +598,17 @@ class MomentumCallStrategy:
 
             # A+ OI gate at ATM
             if "openinterest" in chain.calls.columns:
-                atm = chain.calls[(chain.calls["strike"] >= spot * 0.90) & (chain.calls["strike"] <= spot * 1.10)]
+                atm = chain.calls[(chain.calls["strike"] >= ctx.spot * 0.90) & (chain.calls["strike"] <= ctx.spot * 1.10)]
                 if int(atm["openinterest"].sum()) < _MIN_OI_ATM:
                     return None
 
             # A+ Confidence formula
             conf  = 0.72
-            conf += min(0.06, (chg - 3.0) * 0.015)
-            conf += min(0.05, (vol_ratio - 1.5) * 0.025)
+            conf += min(0.06, (ctx.chg_pct - 3.0) * 0.015)
+            conf += min(0.05, (ctx.vol_ratio - 1.5) * 0.025)
             conf += min(0.04, (_IV_RANK_CALL_MAX - chain.iv_rank) * 0.001)
             conf += min(0.04, (rr - _MIN_RR) * 0.02)
-            if spot > prior_5d_high:
+            if ctx.spot > prior_5d_high:
                 conf += 0.03   # genuine breakout bonus
             confidence = round(min(0.97, conf), 3)
 
@@ -584,7 +621,7 @@ class MomentumCallStrategy:
                 mid_price=mid,
                 confidence=confidence,
                 reason=(
-                    f"Breakout +{chg:.1f}% vol={vol_ratio:.1f}x RSI={rsi:.0f} "
+                    f"Breakout +{ctx.chg_pct:.1f}% vol={ctx.vol_ratio:.1f}x RSI={ctx.rsi:.0f} "
                     f"EMA20=${ema20:.2f}^ IVrank={chain.iv_rank:.0f} R/R={rr:.1f}x "
                     f"| {dte}DTE ${strike:.0f}C d={delta:.2f} IV={iv_pct:.0f}%"
                 ),
@@ -633,45 +670,36 @@ class BearPutStrategy:
             return None
 
         try:
-            daily = get_bars(symbol, "65d", "1d")
-            if daily.empty or len(daily) < 25:
+            ctx = _fetch_bar_context(symbol)
+            if ctx is None or len(ctx.closes) < 25:
                 return None
 
-            closes = daily["close"]
-            spot   = float(closes.iloc[-1])
-            prev   = float(closes.iloc[-2])
-            chg    = (spot - prev) / prev * 100
-
-            rsi = _calc_rsi_scalar(closes)
-            if rsi is None:
+            if ctx.rsi is None:
                 return None
 
             chg_thresh = -4.0 if bull else -2.0
-            if chg > chg_thresh:
+            if ctx.chg_pct > chg_thresh:
                 return None
 
-            avg_vol20 = float(daily["volume"].iloc[-21:-1].mean())
-            cur_vol   = float(daily["volume"].iloc[-1])
-            vol_ratio = cur_vol / max(avg_vol20, 1)
             min_rvol = 1.1 if bull and not STRICT_A_PLUS_OPTION_FILTERS else 1.2
-            if vol_ratio < min_rvol:
+            if ctx.vol_ratio < min_rvol:
                 return None
 
             # A+ Filter 1: EMA-20 trend alignment
-            trend_ok, ema20 = _trend_aligned(closes, "down")
+            trend_ok, ema20 = _trend_aligned(ctx.closes, "down")
             if bull and not trend_ok:
                 return None   # strict in bull regime; bear regime EMA used for confidence
 
             # A+ Filter 2: 3-day momentum confirmation
-            if not _three_day_trend(closes, "down"):
+            if not _three_day_trend(ctx.closes, "down"):
                 return None
 
             # A+ Filter 3: breakdown below prior 5-day low
             # In bear regime with a crash-day drop >= 3%, the trend gates above are
             # sufficient; waive the 5d-low requirement so we don't sit out the move.
-            prior_5d_low = float(daily["low"].iloc[-7:-2].min())
-            crash_day    = chg <= -3.0
-            if spot > prior_5d_low * 1.005 and not (not bull and crash_day):
+            prior_5d_low = float(ctx.daily["low"].iloc[-7:-2].min())
+            crash_day    = ctx.chg_pct <= -3.0
+            if ctx.spot > prior_5d_low * 1.005 and not (not bull and crash_day):
                 return None
 
             chain = _get_options_chain(symbol)
@@ -683,7 +711,7 @@ class BearPutStrategy:
                 log.debug(f"BearPut {symbol}: IV rank {chain.iv_rank:.0f} > {_IV_RANK_PUT_MAX} -- skip")
                 return None
 
-            strike_row = _pick_strike(chain.puts, spot, 0.40)
+            strike_row = _pick_strike(chain.puts, ctx.spot, 0.40)
             if strike_row is None:
                 return None
 
@@ -698,7 +726,7 @@ class BearPutStrategy:
                 return None
 
             # A+ Filter 5: Premium/spot cap
-            if mid / spot * 100 > _MAX_PREMIUM_SPOT:
+            if mid / ctx.spot * 100 > _MAX_PREMIUM_SPOT:
                 return None
 
             # A+ Filter 6: R/R gate
@@ -708,19 +736,19 @@ class BearPutStrategy:
 
             # A+ OI gate at ATM
             if "openinterest" in chain.puts.columns:
-                atm = chain.puts[(chain.puts["strike"] >= spot * 0.90) & (chain.puts["strike"] <= spot * 1.10)]
+                atm = chain.puts[(chain.puts["strike"] >= ctx.spot * 0.90) & (chain.puts["strike"] <= ctx.spot * 1.10)]
                 if int(atm["openinterest"].sum()) < _MIN_OI_ATM:
                     return None
 
             # A+ Confidence formula
             conf  = 0.72
-            conf += min(0.07, abs(chg - abs(chg_thresh)) * 0.015)
-            conf += min(0.05, (vol_ratio - 1.2) * 0.025)
+            conf += min(0.07, abs(ctx.chg_pct - abs(chg_thresh)) * 0.015)
+            conf += min(0.05, (ctx.vol_ratio - 1.2) * 0.025)
             conf += min(0.04, (_IV_RANK_PUT_MAX - chain.iv_rank) * 0.001)
             conf += min(0.04, (rr - _MIN_RR) * 0.02)
             if not bull:
                 conf += 0.04   # bear regime confirmation bonus
-            if spot < prior_5d_low:
+            if ctx.spot < prior_5d_low:
                 conf += 0.03   # genuine breakdown bonus
             confidence = round(min(0.97, conf), 3)
 
@@ -733,7 +761,7 @@ class BearPutStrategy:
                 mid_price=mid,
                 confidence=confidence,
                 reason=(
-                    f"Breakdown {chg:.1f}% vol={vol_ratio:.1f}x RSI={rsi:.0f} "
+                    f"Breakdown {ctx.chg_pct:.1f}% vol={ctx.vol_ratio:.1f}x RSI={ctx.rsi:.0f} "
                     f"EMA20=${ema20:.2f}v IVrank={chain.iv_rank:.0f} R/R={rr:.1f}x "
                     f"| {dte}DTE ${strike:.0f}P d={delta:.2f} IV={iv_pct:.0f}%"
                 ),
@@ -968,68 +996,78 @@ class IronCondorStrategy:
         if not OPTIONS_ENABLED:
             return None
         try:
-            daily = get_bars(symbol, "80d", "1d")
-            if daily.empty or len(daily) < 55:
+            ctx = _fetch_bar_context(symbol)
+            if ctx is None or len(ctx.closes) < 55:
                 return None
-            closes = daily["close"]
-            spot = float(closes.iloc[-1])
-            if spot < OPTIONS_MIN_STOCK_PRICE:
+
+            # Neutral regime: RSI between 35–65, no strong one-day directional move
+            if ctx.rsi is None or not (35 <= ctx.rsi <= 65):
                 return None
-            ema20 = float(closes.ewm(span=20, adjust=False).mean().iloc[-1])
-            ema50 = float(closes.ewm(span=50, adjust=False).mean().iloc[-1])
-            # Neutral: price between 20 and 50 EMA
-            if not (min(ema20, ema50) <= spot <= max(ema20, ema50)):
+            if abs(ctx.chg_pct) > 1.5:
                 return None
+
             if not _no_earnings_soon(symbol, OPTIONS_EARNINGS_AVOID_DAYS):
                 return None
+
             chain = _get_options_chain(symbol)
             if chain is None or chain.iv_rank < 40:
                 return None
-            # Find OTM put/call strikes (delta ~0.20)
-            short_put_row = _pick_strike(chain.puts, spot, 0.20, direction="put")
-            short_call_row = _pick_strike(chain.calls, spot, 0.20, direction="call")
+
+            # Short strikes: ~0.20 delta OTM (no direction kwarg — _pick_strike uses abs(delta))
+            short_put_row  = _pick_strike(chain.puts,  ctx.spot, 0.20)
+            short_call_row = _pick_strike(chain.calls, ctx.spot, 0.20)
             if short_put_row is None or short_call_row is None:
                 return None
-            short_put = float(short_put_row["strike"])
+
+            short_put  = float(short_put_row["strike"])
             short_call = float(short_call_row["strike"])
-            # Buy wings 2 strikes further OTM
-            strikes_put = sorted(chain.puts["strike"].unique())
+
+            # Long wings: 2 strikes further OTM
+            strikes_put  = sorted(chain.puts["strike"].unique())
             strikes_call = sorted(chain.calls["strike"].unique())
             try:
-                put_idx = next(i for i, s in enumerate(strikes_put) if abs(s - short_put) < 0.01)
+                put_idx  = next(i for i, s in enumerate(strikes_put)  if abs(s - short_put)  < 0.01)
                 call_idx = next(i for i, s in enumerate(strikes_call) if abs(s - short_call) < 0.01)
             except StopIteration:
                 return None
-            long_put_idx = max(put_idx - 2, 0)
+
+            long_put_idx  = max(put_idx  - 2, 0)
             long_call_idx = min(call_idx + 2, len(strikes_call) - 1)
-            long_put = strikes_put[long_put_idx]
+            long_put  = strikes_put[long_put_idx]
             long_call = strikes_call[long_call_idx]
-            # Prices
-            def _mid(row):
-                return (float(row.get("bid", 0)) + float(row.get("ask", 0))) / 2.0
-            short_put_mid = _mid(short_put_row)
-            short_call_mid = _mid(short_call_row)
-            long_put_row = chain.puts[abs(chain.puts["strike"] - long_put) < 0.01]
-            long_call_row = chain.calls[abs(chain.calls["strike"] - long_call) < 0.01]
-            if long_put_row.empty or long_call_row.empty:
+
+            def _leg_mid(df: pd.DataFrame, strike: float) -> float:
+                row = df[abs(df["strike"] - strike) < 0.01]
+                if row.empty:
+                    return 0.0
+                r = row.iloc[0]
+                return (float(r.get("bid", 0)) + float(r.get("ask", 0))) / 2.0
+
+            short_put_mid  = _leg_mid(chain.puts,  short_put)
+            short_call_mid = _leg_mid(chain.calls, short_call)
+            long_put_mid   = _leg_mid(chain.puts,  long_put)
+            long_call_mid  = _leg_mid(chain.calls, long_call)
+
+            if any(m <= 0 for m in (short_put_mid, short_call_mid, long_put_mid, long_call_mid)):
                 return None
-            long_put_mid = _mid(long_put_row.iloc[0])
-            long_call_mid = _mid(long_call_row.iloc[0])
-            # Credit received
-            net_credit = round(short_put_mid + short_call_mid - long_put_mid - long_call_mid, 3)
+
+            net_credit   = round(short_put_mid + short_call_mid - long_put_mid - long_call_mid, 3)
             spread_width = min(abs(short_call - long_call), abs(short_put - long_put))
-            max_loss = round(spread_width - net_credit, 3)
+            max_loss     = round(spread_width - net_credit, 3)
             if net_credit <= 0 or max_loss <= 0:
                 return None
-            dte = (chain.expiry - datetime.date.today()).days
-            conf = 0.70
+
+            dte  = (chain.expiry - datetime.date.today()).days
+            conf = 0.82   # iron condors have defined risk — start at threshold
             conf += min(0.05, (chain.iv_rank - 40) * 0.002)
+            conf += min(0.04, (net_credit / spread_width) * 0.2)   # credit/width ratio bonus
             confidence = round(min(0.93, conf), 3)
+
             return OptionSignal(
                 symbol=symbol,
                 option_type="iron_condor",
                 action="sell_to_open",
-                strike=spot,
+                strike=ctx.spot,
                 expiry=chain.expiry,
                 mid_price=net_credit,
                 confidence=confidence,
@@ -1046,7 +1084,6 @@ class IronCondorStrategy:
                 breakeven=None,
                 spread_sell_strike=short_call,
                 spread_sell_mid=short_call_mid,
-                # Iron condor legs
                 put_long_strike=long_put,
                 put_short_strike=short_put,
                 call_short_strike=short_call,
@@ -1071,47 +1108,57 @@ class ButterflyStrategy:
         if not OPTIONS_ENABLED:
             return None
         try:
-            daily = get_bars(symbol, "80d", "1d")
-            if daily.empty or len(daily) < 55:
+            ctx = _fetch_bar_context(symbol)
+            if ctx is None or len(ctx.closes) < 55:
                 return None
-            closes = daily["close"]
-            spot = float(closes.iloc[-1])
-            if spot < OPTIONS_MIN_STOCK_PRICE:
-                return None
+
             if not _no_earnings_soon(symbol, OPTIONS_EARNINGS_AVOID_DAYS):
                 return None
+
             chain = _get_options_chain(symbol)
             if chain is None or chain.iv_rank > 30:
                 return None
-            # ATM strike
+
             strikes = sorted(chain.calls["strike"].unique())
-            atm_idx = min(range(len(strikes)), key=lambda i: abs(strikes[i] - spot))
+            atm_idx = min(range(len(strikes)), key=lambda i: abs(strikes[i] - ctx.spot))
             if atm_idx < 1 or atm_idx > len(strikes) - 2:
                 return None
-            low_strike = strikes[atm_idx - 1]
-            mid_strike = strikes[atm_idx]
+
+            low_strike  = strikes[atm_idx - 1]
+            mid_strike  = strikes[atm_idx]
             high_strike = strikes[atm_idx + 1]
-            # Prices
-            def _mid(row):
-                return (float(row.get("bid", 0)) + float(row.get("ask", 0))) / 2.0
-            low_row = chain.calls[abs(chain.calls["strike"] - low_strike) < 0.01]
-            mid_row = chain.calls[abs(chain.calls["strike"] - mid_strike) < 0.01]
-            high_row = chain.calls[abs(chain.calls["strike"] - high_strike) < 0.01]
-            if low_row.empty or mid_row.empty or high_row.empty:
+
+            def _leg_mid(df: pd.DataFrame, strike: float) -> float:
+                row = df[abs(df["strike"] - strike) < 0.01]
+                if row.empty:
+                    return 0.0
+                r = row.iloc[0]
+                return (float(r.get("bid", 0)) + float(r.get("ask", 0))) / 2.0
+
+            low_mid  = _leg_mid(chain.calls, low_strike)
+            mid_mid  = _leg_mid(chain.calls, mid_strike)
+            high_mid = _leg_mid(chain.calls, high_strike)
+
+            if any(m <= 0 for m in (low_mid, mid_mid, high_mid)):
                 return None
-            low_mid = _mid(low_row.iloc[0])
-            mid_mid = _mid(mid_row.iloc[0])
-            high_mid = _mid(high_row.iloc[0])
+
             # Buy 1 low, sell 2 mid, buy 1 high
-            net_debit = round(low_mid + high_mid - 2 * mid_mid, 3)
+            net_debit    = round(low_mid + high_mid - 2 * mid_mid, 3)
             spread_width = high_strike - low_strike
-            max_profit = round(spread_width - net_debit, 3)
+            max_profit   = round(spread_width - net_debit, 3)
             if net_debit <= 0 or max_profit <= 0:
                 return None
-            dte = (chain.expiry - datetime.date.today()).days
-            conf = 0.68
+
+            dte     = (chain.expiry - datetime.date.today()).days
+            mid_row = chain.calls[abs(chain.calls["strike"] - mid_strike) < 0.01]
+            iv_pct  = float(mid_row.iloc[0].get("iv_pct", chain.hv_30)) if not mid_row.empty else chain.hv_30
+            delta   = float(mid_row.iloc[0].get("delta", 0.50))          if not mid_row.empty else 0.50
+            oi      = int(mid_row.iloc[0].get("openinterest", 0))         if not mid_row.empty else 0
+
+            conf  = 0.82   # butterflies are low-cost defined-risk — start at threshold
             conf += min(0.05, (30 - chain.iv_rank) * 0.002)
             confidence = round(min(0.92, conf), 3)
+
             return OptionSignal(
                 symbol=symbol,
                 option_type="call_butterfly",
@@ -1125,18 +1172,16 @@ class ButterflyStrategy:
                     f"net=${net_debit:.2f} max=${max_profit:.2f} IVrank={chain.iv_rank:.0f} | {dte}DTE"
                 ),
                 strategy=self.name,
-                iv_pct=float(mid_row.iloc[0].get("iv_pct", chain.hv_30)),
+                iv_pct=iv_pct,
                 iv_rank=chain.iv_rank,
-                delta=float(mid_row.iloc[0].get("delta", 0.50)),
-                open_interest=int(mid_row.iloc[0].get("openinterest", 0)),
+                delta=delta,
+                open_interest=oi,
                 rr_ratio=round(max_profit / net_debit, 2),
                 breakeven=None,
-                # Butterfly: 4 legs (buy low, sell 2 mid, buy high)
                 butterfly_low_strike=low_strike,
                 butterfly_low_mid=low_mid,
                 butterfly_high_strike=high_strike,
                 butterfly_high_mid=high_mid,
-                # Legacy spread fields (not used for butterfly but kept for compatibility)
                 spread_sell_strike=mid_strike,
                 spread_sell_mid=mid_mid,
             )
@@ -1158,27 +1203,18 @@ class BreakoutRetestCallStrategy:
             return None
 
         try:
-            daily = get_bars(symbol, "80d", "1d")
-            if daily.empty or len(daily) < 38:
+            ctx = _fetch_bar_context(symbol)
+            if ctx is None or len(ctx.closes) < 38:
                 return None
 
-            closes = daily["close"]
-            spot   = float(closes.iloc[-1])
-            if spot < OPTIONS_MIN_STOCK_PRICE:
-                return None
-
-            retest_ok, resistance = _resistance_breakout_retest(daily)
+            retest_ok, resistance = _resistance_breakout_retest(ctx.daily)
             if not retest_ok:
                 return None
 
-            rsi = _calc_rsi_scalar(closes)
-            if rsi is None or not (48 <= rsi <= 62):
+            if ctx.rsi is None or not (48 <= ctx.rsi <= 62):
                 return None
 
-            avg_vol20 = float(daily["volume"].iloc[-21:-1].mean())
-            cur_vol   = float(daily["volume"].iloc[-1])
-            vol_ratio = cur_vol / max(avg_vol20, 1.0)
-            if vol_ratio < 1.2:
+            if ctx.vol_ratio < 1.2:
                 return None
 
             if not _no_earnings_soon(symbol, OPTIONS_EARNINGS_AVOID_DAYS):
@@ -1192,7 +1228,7 @@ class BreakoutRetestCallStrategy:
                 return None
 
             # ATM call (delta ~0.50)
-            strike_row = _pick_strike(chain.calls, spot, 0.50)
+            strike_row = _pick_strike(chain.calls, ctx.spot, 0.50)
             if strike_row is None:
                 return None
 
@@ -1203,7 +1239,7 @@ class BreakoutRetestCallStrategy:
             oi     = int(strike_row.get("openinterest", 0))
             dte    = (chain.expiry - datetime.date.today()).days
 
-            if mid <= 0 or mid / spot * 100 > _MAX_PREMIUM_SPOT:
+            if mid <= 0 or mid / ctx.spot * 100 > _MAX_PREMIUM_SPOT:
                 return None
 
             rr = _calc_rr(chain.atr14, dte, mid)
@@ -1211,7 +1247,7 @@ class BreakoutRetestCallStrategy:
                 return None
 
             conf  = 0.75
-            conf += min(0.06, (vol_ratio - 1.2) * 0.04)
+            conf += min(0.06, (ctx.vol_ratio - 1.2) * 0.04)
             conf += min(0.04, (_IV_RANK_CALL_MAX - chain.iv_rank) * 0.001)
             conf += min(0.04, (rr - _MIN_RR) * 0.02)
             confidence = round(min(0.95, conf), 3)
@@ -1225,7 +1261,7 @@ class BreakoutRetestCallStrategy:
                 mid_price=mid,
                 confidence=confidence,
                 reason=(
-                    f"Retest lvl=${resistance:.2f} vol={vol_ratio:.1f}x RSI={rsi:.0f} "
+                    f"Retest lvl=${resistance:.2f} vol={ctx.vol_ratio:.1f}x RSI={ctx.rsi:.0f} "
                     f"IVrank={chain.iv_rank:.0f} R/R={rr:.1f}x "
                     f"| {dte}DTE ${strike:.0f}C d={delta:.2f}"
                 ),
@@ -1268,25 +1304,19 @@ class TrendPullbackSpreadStrategy:
             return None
 
         try:
-            daily = get_bars(symbol, "80d", "1d")
-            if daily.empty or len(daily) < 55:
+            ctx = _fetch_bar_context(symbol)
+            if ctx is None or len(ctx.closes) < 55:
                 return None
 
-            closes = daily["close"]
-            spot   = float(closes.iloc[-1])
-            if spot < OPTIONS_MIN_STOCK_PRICE:
+            if ctx.spot <= ctx.ema50:
+                return None
+            if not _at_ema20_pullback(ctx.closes):
                 return None
 
-            if not _ema50_above(closes):
-                return None
-            if not _at_ema20_pullback(closes):
+            if ctx.rsi is None or not (35 <= ctx.rsi <= 52):
                 return None
 
-            rsi = _calc_rsi_scalar(closes)
-            if rsi is None or not (35 <= rsi <= 52):
-                return None
-
-            if not _is_bullish_reversal(daily):
+            if not _is_bullish_reversal(ctx.daily):
                 return None
 
             if not _no_earnings_soon(symbol, OPTIONS_EARNINGS_AVOID_DAYS):
@@ -1300,7 +1330,7 @@ class TrendPullbackSpreadStrategy:
                 return None
 
             # Long leg: ITM call delta 0.65
-            long_row = _pick_strike(chain.calls, spot, 0.65)
+            long_row = _pick_strike(chain.calls, ctx.spot, 0.65)
             if long_row is None:
                 return None
 
@@ -1332,9 +1362,9 @@ class TrendPullbackSpreadStrategy:
             if short_mid <= 0 or short_mid >= long_mid:
                 return None
 
-            net_debit  = round(long_mid - short_mid, 3)
+            net_debit    = round(long_mid - short_mid, 3)
             spread_width = short_strike - long_strike
-            max_profit = round(spread_width - net_debit, 3)
+            max_profit   = round(spread_width - net_debit, 3)
             if max_profit <= 0 or net_debit <= 0:
                 return None
 
@@ -1346,10 +1376,9 @@ class TrendPullbackSpreadStrategy:
             iv_pct = float(long_row.get("iv_pct", chain.hv_30))
             delta  = float(long_row.get("delta", 0.65))
             oi     = int(long_row.get("openinterest", 0))
-            ema20  = float(closes.ewm(span=20, adjust=False).mean().iloc[-1])
 
             conf  = 0.73
-            conf += min(0.05, (52 - rsi) * 0.002)
+            conf += min(0.05, (52 - ctx.rsi) * 0.002)
             conf += min(0.04, (_IV_RANK_CALL_MAX - chain.iv_rank) * 0.001)
             conf += min(0.05, spread_rr * 0.02)
             confidence = round(min(0.95, conf), 3)
@@ -1363,7 +1392,7 @@ class TrendPullbackSpreadStrategy:
                 mid_price=net_debit,        # net debit = effective cost of spread
                 confidence=confidence,
                 reason=(
-                    f"EMA20 pullback RSI={rsi:.0f} EMA20=${ema20:.2f} "
+                    f"EMA20 pullback RSI={ctx.rsi:.0f} EMA20=${ctx.ema20:.2f} "
                     f"spread ${long_strike:.0f}/{short_strike:.0f}C "
                     f"net=${net_debit:.2f} max=${max_profit:.2f} R/R={spread_rr:.1f}x "
                     f"| {dte}DTE IVrank={chain.iv_rank:.0f}"
@@ -1404,29 +1433,23 @@ class MeanReversionCallStrategy:
             return None
 
         try:
-            daily = get_bars(symbol, "80d", "1d")
-            if daily.empty or len(daily) < 30:
+            ctx = _fetch_bar_context(symbol)
+            if ctx is None or len(ctx.closes) < 30:
                 return None
 
-            closes = daily["close"]
-            spot   = float(closes.iloc[-1])
-            if spot < OPTIONS_MIN_STOCK_PRICE:
+            if ctx.rsi is None or ctx.rsi >= 35:   # oversold gate
                 return None
 
-            rsi = _calc_rsi_scalar(closes)
-            if rsi is None or rsi >= 33:
+            if not _lower_bollinger_touch(ctx.closes, tolerance=0.005):
                 return None
 
-            if not _lower_bollinger_touch(closes, tolerance=0.005):
-                return None
-
-            if not _is_bullish_reversal(daily):
+            if not _is_bullish_reversal(ctx.daily):
                 return None
 
             # Don't buy calls in a structural collapse (> 15% below 200 SMA)
-            if len(closes) >= 200:
-                sma200 = float(closes.rolling(200).mean().iloc[-1])
-                if spot < sma200 * 0.85:
+            if len(ctx.closes) >= 200:
+                sma200 = float(ctx.closes.rolling(200).mean().iloc[-1])
+                if ctx.spot < sma200 * 0.85:
                     return None
 
             if not _no_earnings_soon(symbol, OPTIONS_EARNINGS_AVOID_DAYS):
@@ -1439,7 +1462,7 @@ class MeanReversionCallStrategy:
             # IV may be elevated (fear) — don't filter on IV rank for mean reversion
 
             # ITM call for higher delta exposure
-            strike_row = _pick_strike(chain.calls, spot, 0.65)
+            strike_row = _pick_strike(chain.calls, ctx.spot, 0.65)
             if strike_row is None:
                 return None
 
@@ -1450,19 +1473,19 @@ class MeanReversionCallStrategy:
             oi     = int(strike_row.get("openinterest", 0))
             dte    = (chain.expiry - datetime.date.today()).days
 
-            if mid <= 0 or mid / spot * 100 > 2.5:   # tighter premium cap for higher probability entries
+            if mid <= 0 or mid / ctx.spot * 100 > 2.5:   # tighter premium cap for higher probability entries
                 return None
 
             rr = _calc_rr(chain.atr14, dte, mid)
             if rr < _MIN_RR:
                 return None
 
-            sma20      = float(closes.rolling(20).mean().iloc[-1])
-            std20      = float(closes.rolling(20).std().iloc[-1])
-            lower_bb   = sma20 - 2 * std20
+            sma20    = float(ctx.closes.rolling(20).mean().iloc[-1])
+            std20    = float(ctx.closes.rolling(20).std().iloc[-1])
+            lower_bb = sma20 - 2 * std20
 
             conf  = 0.70
-            conf += min(0.08, (35 - rsi) * 0.003)
+            conf += min(0.08, (35 - ctx.rsi) * 0.003)
             conf += min(0.04, (rr - _MIN_RR) * 0.02)
             confidence = round(min(0.94, conf), 3)
 
@@ -1475,7 +1498,7 @@ class MeanReversionCallStrategy:
                 mid_price=mid,
                 confidence=confidence,
                 reason=(
-                    f"Oversold RSI={rsi:.0f} BB_lower=${lower_bb:.2f} spot=${spot:.2f} "
+                    f"Oversold RSI={ctx.rsi:.0f} BB_lower=${lower_bb:.2f} spot=${ctx.spot:.2f} "
                     f"IVrank={chain.iv_rank:.0f} R/R={rr:.1f}x "
                     f"| {dte}DTE ${strike:.0f}C d={delta:.2f}"
                 ),
@@ -1501,11 +1524,14 @@ def scan_options_universe(
 ) -> List[OptionSignal]:
     """Scan the options-eligible universe and return A+ ranked signals.
 
-    Active strategies (applied to each TI ticker):
-    - MomentumCallStrategy     : breakout +5% day, RVOL 2x, bull regime
+    Active strategies (applied to each TI ticker, in priority order):
+    - MomentumCallStrategy       : breakout +% day, RVOL surge, bull regime, cheap IV
+    - BearPutStrategy            : breakdown, bear regime or individual collapse
+    - MeanReversionCallStrategy  : RSI<35 + lower BB touch, ITM call
     - BreakoutRetestCallStrategy : breakout-and-retest pattern, ATM call
     - TrendPullbackSpreadStrategy: EMA20 pullback in 50-EMA uptrend, debit spread
-    - MeanReversionCallStrategy  : RSI<32 + lower BB touch, ITM call
+    - IronCondorStrategy         : neutral RSI + high IV rank, defined-risk condor
+    - ButterflyStrategy          : low IV rank, price near expected pin
 
     Args:
         held_positions:          {symbol: qty} of current stock holdings.
@@ -1517,12 +1543,24 @@ def scan_options_universe(
     if not OPTIONS_ENABLED:
         return []
 
+    # Refresh regime-adaptive filter globals so they reflect current market conditions
+    global _MAX_SPREAD_PCT, _MIN_OI_ATM, _MAX_PREMIUM_SPOT, _MIN_RR, _IV_RANK_CALL_MAX, _IV_RANK_PUT_MAX
+    _f = get_dynamic_option_filters()
+    _MAX_SPREAD_PCT   = _f["MAX_SPREAD_PCT"]
+    _MIN_OI_ATM       = _f["MIN_OI_ATM"]
+    _MAX_PREMIUM_SPOT = _f["MAX_PREMIUM_SPOT"]
+    _MIN_RR           = _f["MIN_RR"]
+    _IV_RANK_CALL_MAX = _f["IV_RANK_CALL_MAX"]
+    _IV_RANK_PUT_MAX  = _f["IV_RANK_PUT_MAX"]
+
     ti_universe = get_options_universe()
     if not ti_universe:
         log.warning("Options scan: no eligible options universe tickers available — skipping")
         return []
 
     signals: List[OptionSignal] = []
+    momentum_strat      = MomentumCallStrategy()
+    bear_put_strat      = BearPutStrategy()
     retest_strat        = BreakoutRetestCallStrategy()
     mean_rev_strat      = MeanReversionCallStrategy()
     trend_spread_strat  = TrendPullbackSpreadStrategy()
@@ -1557,8 +1595,9 @@ def scan_options_universe(
                 continue
 
         symbol_got_signal = False
-        # Try all strategies in order, including new multi-leg strategies
-        for strat in (mean_rev_strat, retest_strat, trend_spread_strat, iron_condor_strat, butterfly_strat):
+        # Try all strategies in priority order; one signal per symbol per cycle
+        for strat in (momentum_strat, bear_put_strat, mean_rev_strat, retest_strat,
+                      trend_spread_strat, iron_condor_strat, butterfly_strat):
             sig = strat.scan(symbol)
             if sig and sig.confidence >= OPTIONS_MIN_SIGNAL_CONFIDENCE:
                 signals.append(sig)

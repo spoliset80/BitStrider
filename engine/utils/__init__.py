@@ -217,6 +217,22 @@ def is_regular_hours() -> bool:
     t = now.strftime("%H:%M")
     return "09:30" <= t <= "16:00"
 
+def is_options_lull_hours() -> bool:
+    """True during low-liquidity windows when options spreads are typically wide.
+
+    Blocks new option *entries* during:
+      - Open auction (9:30–9:35 AM ET): spreads widest, price discovery unstable
+      - Midday lull  (11:30 AM–1:45 PM ET): low volume, inflated spreads
+
+    Monitoring and exits are NOT blocked by this gate.
+    """
+    now = datetime.datetime.now(ET)
+    if now.weekday() >= 5:
+        return False
+    h = now.hour + now.minute / 60.0
+    open_auction = 9.5 <= h < (9.5 + 5 / 60.0)   # 9:30–9:35
+    midday_lull  = 11.5 <= h < 13.75              # 11:30–13:45
+    return open_auction or midday_lull
 
 # ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 # VIX
