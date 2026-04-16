@@ -363,8 +363,8 @@ class EnhancedExecutor:
         # ── Max positions gate (secondary; optional swap if at limit) ─────
         if positions.total_count >= effective_max:
             if not (SWAP_ON_FULL and signal.confidence >= SWAP_MIN_CONFIDENCE):
-                # At max but BP available — log and allow (no swap needed)
-                log.info(
+                # At max but BP available — allow entry (no swap needed)
+                log.debug(
                     f"At max positions {positions.total_count}/{effective_max} but allowing entry "
                     f"due to available BP ${acct.buying_power:,.0f}"
                 )
@@ -402,7 +402,7 @@ class EnhancedExecutor:
                             return False, f"Swap close failed: {e}"
                 else:
                     # No position to swap, but BP available — allow entry anyway
-                    log.info(
+                    log.debug(
                         f"No swappable position found, but allowing entry due to available BP ${acct.buying_power:,.0f}"
                     )
 

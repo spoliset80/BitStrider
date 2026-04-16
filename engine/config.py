@@ -105,10 +105,13 @@ def _load_options_universe() -> list:
 def get_options_universe(require_ti_file: bool = False) -> list:
     """Return the live options universe, applying override rules.
 
-    Primary source: latest TI capture tickers from data/ti_primary.json.
-    Fallback source: active TI tickers from data/universe.json (tier 1 + tier 2).
-    If OPTIONS_UNIVERSE_OVERRIDE is set, those tickers take precedence.
-    If no primary or fallback universe is available, return the static fallback universe.
+    Core liquid names (SPY, QQQ, mega-caps, sector ETFs) are ALWAYS prepended so
+    the options scanner always evaluates names with deep chains, regardless of what
+    the TI equity universe contains (which is often micro-cap momentum names that
+    have thin or no options chains).
+
+    Primary TI source appended after the core set: latest ti_primary.json.
+    Fallback: universe.json tier 1+2, then static _OPTIONS_FALLBACK_UNIVERSE.
     """
     if OPTIONS_UNIVERSE_OVERRIDE:
         import re as _re
@@ -121,29 +124,31 @@ def get_options_universe(require_ti_file: bool = False) -> list:
         if _override_symbols:
             return list(dict.fromkeys(_override_symbols))
 
-    universe = []
+    # Core liquid options names — always included first regardless of TI data.
+    # These have the tightest spreads, deepest chains, and highest OI.
+    _core = list(dict.fromkeys(_OPTIONS_FALLBACK_UNIVERSE))
+
+    ti_universe = []
     try:
         from engine.equity.universe import get_ti_primary as _get_ti_primary
-        universe = list(dict.fromkeys(_get_ti_primary()))
+        ti_universe = list(dict.fromkeys(_get_ti_primary()))
     except Exception:
-        universe = []
+        pass
 
-    if universe:
-        return universe
+    if not ti_universe:
+        try:
+            from engine.equity.universe import get_tier as _get_tier
+            ti_universe = list(dict.fromkeys(_get_tier(1) + _get_tier(2)))
+        except Exception:
+            pass
 
-    try:
-        from engine.equity.universe import get_tier as _get_tier
-        universe = list(dict.fromkeys(_get_tier(1) + _get_tier(2)))
-    except Exception:
-        universe = []
-
-    if universe:
-        return universe
-
-    if require_ti_file:
+    if not ti_universe and require_ti_file:
         raise FileNotFoundError("Primary TI universe (data/ti_primary.json or data/universe.json tiers 1+2) is missing or empty")
 
-    return _OPTIONS_FALLBACK_UNIVERSE
+    # Merge: core first, then TI names not already in core
+    core_set = set(_core)
+    combined = _core + [s for s in ti_universe if s not in core_set]
+    return combined
 
 
 OPTIONS_ELIGIBLE_UNIVERSE = get_options_universe()

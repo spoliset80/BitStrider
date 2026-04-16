@@ -17,6 +17,7 @@ import time
 from typing import List, Dict, Tuple
 from dataclasses import dataclass, field
 import json
+import re
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import (
     LimitOrderRequest,
@@ -24,6 +25,11 @@ from alpaca.trading.requests import (
     GetOrdersRequest,
 )
 from alpaca.trading.enums import OrderClass, OrderSide, TimeInForce, QueryOrderStatus
+
+# Set to True when Alpaca returns 40310000 (liquidation-only restriction).
+# Prevents repeated failed order attempts until the bot is restarted or the
+# restriction is cleared (checked fresh each cycle via _is_account_tradeable).
+_ACCOUNT_RESTRICTED = False
 
 from engine.config import (
     OPTIONS_ENABLED,
@@ -148,6 +154,31 @@ class OptionsExecutor:
 
     # ── Order Placement ────────────────────────────────────────────────────────
     
+    def _is_account_tradeable(self) -> bool:
+        """Return False if the account is in liquidation-only / trading-blocked state."""
+        global _ACCOUNT_RESTRICTED
+        # Short-circuit: if we already caught a 40310000 this session, don't retry.
+        # The restriction is a regulatory/PDT hold — it won't clear mid-session.
+        if _ACCOUNT_RESTRICTED:
+            return False
+        try:
+            acct = self.client.get_account()
+            blocked = (
+                getattr(acct, "trading_blocked", False)
+                or getattr(acct, "account_blocked", False)
+            )
+            if blocked:
+                log.error(
+                    "[OPTIONS] Account is trading-blocked (liquidation-only) — "
+                    "halting all new option entries until restriction is cleared"
+                )
+                _ACCOUNT_RESTRICTED = True
+                return False
+            return True
+        except Exception as e:
+            log.warning(f"[OPTIONS] Could not verify account tradeable status: {e}")
+            return True  # allow attempt; the order itself will catch any restriction
+
     def place_option_order(self, signal: OptionSignal) -> bool:
         """
         Production-ready order placement for ApexTrader.
@@ -155,6 +186,10 @@ class OptionsExecutor:
         """
         # 1. Global Enable Check
         if not getattr(self, "OPTIONS_ENABLED", True):
+            return False
+
+        # 1b. Account restriction check (liquidation-only = code 40310000)
+        if not self._is_account_tradeable():
             return False
 
         # 2. PDT & Account Guard
@@ -217,9 +252,14 @@ class OptionsExecutor:
                         {"symbol": _alpaca_option_symbol(signal.symbol, signal.expiry, cp_type, signal.butterfly_high_strike), "side": OrderSide.BUY, "ratio_qty": 1}
                     ]
                 else: # Vertical Spread
+                    # For debit spreads (buy_to_open): buy primary, sell secondary
+                    # For credit spreads (sell_to_open): sell primary, buy secondary
+                    is_credit = "sell" in signal.action
+                    primary_side   = OrderSide.SELL if is_credit else OrderSide.BUY
+                    secondary_side = OrderSide.BUY  if is_credit else OrderSide.SELL
                     legs_list = [
-                        {"symbol": _alpaca_option_symbol(signal.symbol, signal.expiry, cp_type, signal.strike), "side": OrderSide.BUY, "ratio_qty": 1},
-                        {"symbol": _alpaca_option_symbol(signal.symbol, signal.expiry, cp_type, signal.spread_sell_strike), "side": OrderSide.SELL, "ratio_qty": 1}
+                        {"symbol": _alpaca_option_symbol(signal.symbol, signal.expiry, cp_type, signal.strike), "side": primary_side, "ratio_qty": 1},
+                        {"symbol": _alpaca_option_symbol(signal.symbol, signal.expiry, cp_type, signal.spread_sell_strike), "side": secondary_side, "ratio_qty": 1}
                     ]
 
                 # Construct Payload
@@ -287,7 +327,16 @@ class OptionsExecutor:
             return True
 
         except Exception as e:
-            log.error(f"[OPTIONS] CRITICAL FAILURE for {signal.symbol}: {e}", exc_info=True)
+            # Detect account restriction (40310000) and suppress further order attempts
+            if re.search(r'40310000', str(e)):
+                global _ACCOUNT_RESTRICTED
+                _ACCOUNT_RESTRICTED = True
+                log.error(
+                    f"[OPTIONS] Account restricted to liquidation-only (40310000) — "
+                    f"halting new entries. Resolve via Alpaca dashboard."
+                )
+            else:
+                log.error(f"[OPTIONS] CRITICAL FAILURE for {signal.symbol}: {e}", exc_info=True)
             return False
         
         

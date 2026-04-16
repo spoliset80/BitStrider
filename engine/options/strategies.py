@@ -21,6 +21,7 @@ Allocation: 15% of portfolio across max 3 concurrent option positions.
 Expiry preference: 7-21 DTE near-term.
 """
 
+import concurrent.futures
 import datetime
 import logging
 import math
@@ -195,6 +196,10 @@ class OptionsChainInfo:
 _chain_cache: Dict[str, tuple] = {}   # symbol -> (timestamp, OptionsChainInfo)
 _CHAIN_TTL   = 300  # 5-minute cache
 _CHAIN_MAX   = OPTIONS_CHAIN_CACHE_MAX  # configurable cache size
+# OI is published once per day by the OCC — cache it per trading day, not per chain TTL
+_oi_cache: Dict[str, tuple] = {}      # symbol -> (date, oi_map)
+# Per-scan-cycle bar-context cache — populated by parallel prefetch, cleared each scan
+_bar_ctx_cache: Dict[str, Optional["_BarCtx"]] = {}
 
 # Memory usage monitor
 def _check_memory():
@@ -312,12 +317,65 @@ def _snapshots_to_df(snapshots: dict, opt_type: str) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def _fetch_oi_from_contracts(symbol: str, exp_gte: datetime.date, exp_lte: datetime.date) -> Dict[str, int]:
+    """Fetch real Open Interest from /v2/options/contracts (OCC-published daily OI).
+
+    OI is calculated once per day by the OCC — cached per trading day so it is
+    fetched only once regardless of how many times the 5-min chain cache expires.
+    """
+    today = datetime.date.today()
+    cached = _oi_cache.get(symbol)
+    if cached and cached[0] == today:
+        return cached[1]
+
+    try:
+        from alpaca.trading.requests import GetOptionContractsRequest
+        from engine.broker.broker_factory import BrokerFactory
+        tc = BrokerFactory.create_stock_client("alpaca")
+        oi_map: Dict[str, int] = {}
+        page_token = None
+        while True:
+            kwargs: dict = dict(
+                underlying_symbols=[symbol],
+                expiration_date_gte=exp_gte,
+                expiration_date_lte=exp_lte,
+                limit=1000,
+            )
+            if page_token:
+                kwargs["page_token"] = page_token
+            resp = tc.get_option_contracts(GetOptionContractsRequest(**kwargs))
+            for c in resp.option_contracts:
+                oi_map[c.symbol] = int(c.open_interest or 0)
+            page_token = getattr(resp, "next_page_token", None)
+            if not page_token:
+                break
+        _oi_cache[symbol] = (today, oi_map)
+        log.debug(f"{symbol}: fetched OI for {len(oi_map)} contracts from /v2/options/contracts")
+        return oi_map
+    except Exception as e:
+        log.debug(f"{symbol}: OI contracts fetch failed ({e}) — OI gates will be skipped")
+        return {}
+
+
+def _apply_oi_to_df(df: pd.DataFrame, oi_map: Dict[str, int]) -> pd.DataFrame:
+    """Merge OCC-sourced OI into a chain DataFrame by contractsymbol column."""
+    if df.empty or not oi_map or "contractsymbol" not in df.columns:
+        return df
+    df = df.copy()
+    df["openinterest"] = df["contractsymbol"].map(oi_map).fillna(0).astype(int)
+    return df
+
+
 def _get_chain_alpaca(
     symbol: str, spot: float,
     exp_gte: datetime.date, exp_lte: datetime.date,
     hv30: float, atr14: float, hist: pd.DataFrame,
 ) -> Optional[OptionsChainInfo]:
-    """Fetch option chain via Alpaca OptionHistoricalDataClient."""
+    """Fetch option chain via Alpaca OptionHistoricalDataClient.
+
+    Bid/ask/greeks come from the snapshots endpoint (real-time intraday).
+    Open Interest comes from the contracts endpoint (OCC daily settlement data).
+    """
     from alpaca.data.requests import OptionChainRequest
 
     client = get_option_data_client()
@@ -349,6 +407,12 @@ def _get_chain_alpaca(
         calls = calls[calls["expiry"] == target_expiry].drop(columns=["expiry"])
     if not puts.empty:
         puts = puts[puts["expiry"] == target_expiry].drop(columns=["expiry"])
+
+    # Merge real OI from /v2/options/contracts (snapshots always return 0)
+    oi_map = _fetch_oi_from_contracts(symbol, exp_gte, exp_lte)
+    if oi_map:
+        calls = _apply_oi_to_df(calls, oi_map)
+        puts  = _apply_oi_to_df(puts,  oi_map)
 
     # IV rank from ATM call IV
     mid_c = calls[(calls["strike"] >= spot * 0.95) & (calls["strike"] <= spot * 1.05)]
@@ -384,8 +448,8 @@ def _pick_strike(
 
     df = chain_df.copy()
 
-    # OI gate — use config value directly; no floor override that undermines it
-    if "openinterest" in df.columns:
+    # OI gate — skip entirely when Alpaca returns all-zero OI (data unavailable)
+    if "openinterest" in df.columns and df["openinterest"].max() > 0:
         df = df[df["openinterest"] >= OPTIONS_MIN_OPEN_INTEREST]
     if df.empty:
         return None
@@ -485,7 +549,10 @@ def _fetch_bar_context(symbol: str) -> Optional[_BarCtx]:
 
     Returns None if data is insufficient or spot is below OPTIONS_MIN_STOCK_PRICE.
     All strategies should call this instead of independently fetching bars.
+    Results are cached in _bar_ctx_cache for the duration of the scan cycle.
     """
+    if symbol in _bar_ctx_cache:
+        return _bar_ctx_cache[symbol]
     daily = get_bars(symbol, "80d", "1d")
     if daily.empty or len(daily) < 25:
         return None
@@ -504,8 +571,10 @@ def _fetch_bar_context(symbol: str) -> Optional[_BarCtx]:
     hi = daily["high"]; lo = daily["low"]; pc = daily["close"].shift(1)
     tr    = pd.concat([(hi - lo), (hi - pc).abs(), (lo - pc).abs()], axis=1).max(axis=1)
     atr14 = float(tr.rolling(14).mean().iloc[-1])
-    return _BarCtx(daily, closes, spot, prev, chg_pct, avg_vol20, cur_vol, vol_ratio,
-                   rsi, ema20, ema50, atr14)
+    result = _BarCtx(daily, closes, spot, prev, chg_pct, avg_vol20, cur_vol, vol_ratio,
+                     rsi, ema20, ema50, atr14)
+    _bar_ctx_cache[symbol] = result
+    return result
 
 
 # -- Strategy Implementations --------------------------------------------------
@@ -596,8 +665,8 @@ class MomentumCallStrategy:
             if rr < _MIN_RR:
                 return None
 
-            # A+ OI gate at ATM
-            if "openinterest" in chain.calls.columns:
+            # A+ OI gate at ATM — skip if Alpaca returns no OI data (all zeros)
+            if "openinterest" in chain.calls.columns and chain.calls["openinterest"].max() > 0:
                 atm = chain.calls[(chain.calls["strike"] >= ctx.spot * 0.90) & (chain.calls["strike"] <= ctx.spot * 1.10)]
                 if int(atm["openinterest"].sum()) < _MIN_OI_ATM:
                     return None
@@ -640,18 +709,22 @@ class MomentumCallStrategy:
 
 
 class BearPutStrategy:
-    """Buy near-term puts on confirmed breakdowns with A+ filters.
+    """Bear put debit spread on confirmed breakdowns.
+
+    Structure: Buy put (δ0.40 ATM/slight ITM) + Sell put 2 strikes further OTM.
+    The short leg offsets 30-40% of the premium cost, dramatically improving R/R
+    vs a naked put — critical when IV is elevated (crash/fear environment).
 
     Entry requirements:
     - Bear regime (SPY < 200-SMA) OR severe individual breakdown (>= -4%)
-    - Today <= -2% (bear) / <= -4% (bull), volume >= 1.2x
-    - 20-EMA declining AND price below EMA
-    - 3-day downside momentum confirms
-    - Price broke below prior 5-day low (real breakdown)
-    - IV rank < 55 (don't buy puts after fear already priced in)
-    - Premium <= 3% of spot
-    - R/R >= 1.5
-    - ATM OI >= 500, spread <= 15%
+    - Today <= -1% (bear) / <= -4% (bull)
+    - Volume >= 1.2x avg
+    - 20-EMA declining AND price below EMA (bull strict; bear waived if macro downtrend)
+    - 3-day downside momentum OR 5-consecutive-day 50-EMA downtrend (bear)
+    - Price broke below prior 5-day low (waived on crash days in bear)
+    - IV rank < _IV_RANK_PUT_MAX (buy spreads even in elevated IV — short leg hedges)
+    - Spread R/R (max_profit / net_debit) >= 1.0
+    - ATM OI >= _MIN_OI_ATM
     """
 
     name = "BearPut"
@@ -664,8 +737,7 @@ class BearPutStrategy:
 
         bull = _is_bull_regime()
 
-        # Inverse ETFs (SQQQ, SPXU…) go UP when market falls.
-        # Buying puts on them in bear regime = betting market rallies — wrong direction.
+        # Inverse ETFs go UP in bear — buying puts on them bets on a market rally.
         if symbol in _INVERSE_ETFS and not bull:
             return None
 
@@ -677,7 +749,7 @@ class BearPutStrategy:
             if ctx.rsi is None:
                 return None
 
-            chg_thresh = -4.0 if bull else -1.0  # bear: allow entries on moderate-decline days, not just crash days
+            chg_thresh = -4.0 if bull else -1.0
             if ctx.chg_pct > chg_thresh:
                 return None
 
@@ -688,11 +760,9 @@ class BearPutStrategy:
             # A+ Filter 1: EMA-20 trend alignment
             trend_ok, ema20 = _trend_aligned(ctx.closes, "down")
             if bull and not trend_ok:
-                return None   # strict in bull regime; bear regime EMA used for confidence
+                return None
 
-            # A+ Filter 2: 3-day momentum confirmation
-            # In bear regime, waive if price has been below its 50-EMA for 5+ consecutive
-            # days — the macro downtrend is already confirmed, a bounce day is an entry.
+            # A+ Filter 2: 3-day momentum OR established macro downtrend (bear only)
             if not bull:
                 ema50 = ctx.closes.ewm(span=50, adjust=False).mean()
                 below_ema50_streak = int((ctx.closes.iloc[-6:-1] < ema50.iloc[-6:-1]).sum())
@@ -702,9 +772,7 @@ class BearPutStrategy:
             if not in_macro_downtrend and not _three_day_trend(ctx.closes, "down"):
                 return None
 
-            # A+ Filter 3: breakdown below prior 5-day low
-            # In bear regime with a crash-day drop >= 3%, the trend gates above are
-            # sufficient; waive the 5d-low requirement so we don't sit out the move.
+            # A+ Filter 3: breakdown below prior 5-day low (waived on crash days in bear)
             prior_5d_low = float(ctx.daily["low"].iloc[-7:-2].min())
             crash_day    = ctx.chg_pct <= -3.0
             if ctx.spot > prior_5d_low * 1.005 and not (not bull and crash_day):
@@ -714,72 +782,99 @@ class BearPutStrategy:
             if chain is None:
                 return None
 
-            # A+ Filter 4: IV rank -- don't buy when fear already spiked
+            # IV gate — spreads tolerate higher IV since short leg hedges premium cost
             if chain.iv_rank > _IV_RANK_PUT_MAX:
-                log.debug(f"BearPut {symbol}: IV rank {chain.iv_rank:.0f} > {_IV_RANK_PUT_MAX} -- skip")
+                log.debug(f"BearPut {symbol}: IV rank {chain.iv_rank:.0f} > {_IV_RANK_PUT_MAX} — skip")
                 return None
 
-            strike_row = _pick_strike(chain.puts, ctx.spot, 0.40)
-            if strike_row is None:
+            # Long leg: δ0.40 (ATM/slight ITM)
+            long_row = _pick_strike(chain.puts, ctx.spot, 0.40)
+            if long_row is None:
                 return None
 
-            strike = float(strike_row["strike"])
-            mid    = float(strike_row.get("mid", strike_row.get("lastprice", 0)))
-            iv_pct = float(strike_row.get("iv_pct", chain.hv_30))
-            delta  = float(strike_row.get("delta", -0.40))
-            oi     = int(strike_row.get("openinterest", 0))
-            dte    = (chain.expiry - datetime.date.today()).days
+            long_strike = float(long_row["strike"])
+            long_mid    = float(long_row.get("mid", long_row.get("lastprice", 0)))
+            iv_pct      = float(long_row.get("iv_pct", chain.hv_30))
+            delta       = float(long_row.get("delta", -0.40))
+            oi          = int(long_row.get("openinterest", 0))
+            dte         = (chain.expiry - datetime.date.today()).days
 
-            if mid <= 0:
+            if long_mid <= 0:
                 return None
 
-            # A+ Filter 5: Premium/spot cap
-            if mid / ctx.spot * 100 > _MAX_PREMIUM_SPOT:
+            # Short leg: 2 strikes further OTM (lower strike for puts)
+            strikes_sorted = sorted(chain.puts["strike"].unique(), reverse=True)  # puts: high → low
+            try:
+                long_idx = next(i for i, s in enumerate(strikes_sorted) if abs(s - long_strike) < 0.01)
+            except StopIteration:
+                return None
+            short_idx = min(long_idx + 2, len(strikes_sorted) - 1)
+            short_strike = strikes_sorted[short_idx]
+            if short_strike >= long_strike:
+                return None  # must be lower than long
+
+            short_rows = chain.puts[abs(chain.puts["strike"] - short_strike) < 0.01]
+            if short_rows.empty:
+                return None
+            sr = short_rows.iloc[0]
+            if "bid" in sr.index and "ask" in sr.index:
+                short_mid = (float(sr["bid"]) + float(sr["ask"])) / 2.0
+            else:
+                short_mid = float(sr.get("lastprice", 0))
+
+            if short_mid <= 0 or short_mid >= long_mid:
                 return None
 
-            # A+ Filter 6: R/R gate
-            rr = _calc_rr(chain.atr14, dte, mid)
-            if rr < _MIN_RR:
+            net_debit    = round(long_mid - short_mid, 3)
+            spread_width = long_strike - short_strike
+            max_profit   = round(spread_width - net_debit, 3)
+
+            if net_debit <= 0 or max_profit <= 0:
                 return None
 
-            # A+ OI gate at ATM
-            if "openinterest" in chain.puts.columns:
+            spread_rr = round(max_profit / net_debit, 2)
+            if spread_rr < 1.0:
+                return None
+
+            # A+ OI gate at ATM — skip if Alpaca returns no OI data (all zeros)
+            if "openinterest" in chain.puts.columns and chain.puts["openinterest"].max() > 0:
                 atm = chain.puts[(chain.puts["strike"] >= ctx.spot * 0.90) & (chain.puts["strike"] <= ctx.spot * 1.10)]
                 if int(atm["openinterest"].sum()) < _MIN_OI_ATM:
                     return None
 
-            # A+ Confidence formula
             conf  = 0.72
             conf += min(0.07, abs(ctx.chg_pct - abs(chg_thresh)) * 0.015)
             conf += min(0.05, (ctx.vol_ratio - 1.2) * 0.025)
             conf += min(0.04, (_IV_RANK_PUT_MAX - chain.iv_rank) * 0.001)
-            conf += min(0.04, (rr - _MIN_RR) * 0.02)
+            conf += min(0.05, (spread_rr - 1.0) * 0.025)
             if not bull:
-                conf += 0.04   # bear regime confirmation bonus
+                conf += 0.04
             if ctx.spot < prior_5d_low:
-                conf += 0.03   # genuine breakdown bonus
+                conf += 0.03
             confidence = round(min(0.97, conf), 3)
 
             return OptionSignal(
                 symbol=symbol,
                 option_type="put",
                 action="buy_to_open",
-                strike=strike,
+                strike=long_strike,
                 expiry=chain.expiry,
-                mid_price=mid,
+                mid_price=net_debit,
                 confidence=confidence,
                 reason=(
-                    f"Breakdown {ctx.chg_pct:.1f}% vol={ctx.vol_ratio:.1f}x RSI={ctx.rsi:.0f} "
-                    f"EMA20=${ema20:.2f}v IVrank={chain.iv_rank:.0f} R/R={rr:.1f}x "
-                    f"| {dte}DTE ${strike:.0f}P d={delta:.2f} IV={iv_pct:.0f}%"
+                    f"BearPutSpread {ctx.chg_pct:.1f}% vol={ctx.vol_ratio:.1f}x RSI={ctx.rsi:.0f} "
+                    f"${long_strike:.0f}/{short_strike:.0f}P net=${net_debit:.2f} max=${max_profit:.2f} "
+                    f"R/R={spread_rr:.1f}x IVrank={chain.iv_rank:.0f} | {dte}DTE"
                 ),
                 strategy=self.name,
                 iv_pct=iv_pct,
                 iv_rank=chain.iv_rank,
                 delta=delta,
                 open_interest=oi,
-                rr_ratio=rr,
-                breakeven=round(strike - mid, 2),
+                rr_ratio=spread_rr,
+                breakeven=round(long_strike - net_debit, 2),
+                spread_sell_strike=short_strike,
+                spread_sell_mid=short_mid,
             )
 
         except Exception as e:
@@ -986,6 +1081,172 @@ def _resistance_breakout_retest(daily: pd.DataFrame) -> Tuple[bool, float]:
 
 
 # -- New Strategy Classes -------------------------------------------------------
+
+# ------------------- Bear Call Spread Strategy -------------------
+class BearCallSpreadStrategy:
+    """Bear call credit spread: Sell OTM call + Buy further OTM call for defined-risk credit.
+
+    Structure: Sell call (δ0.35 slight OTM) + Buy call 2 strikes further OTM.
+    Net credit collected upfront. Max profit = full credit if both calls expire worthless.
+    Max loss = spread_width - credit (capped, defined risk — no margin blow-up risk).
+
+    Ideal in bear regime: stock stays flat or falls → both calls expire → keep full credit.
+    Also works on individual overbought names in bull regime.
+
+    Entry requirements:
+    - Bear regime (primary) OR RSI > 68 overbought individual name in bull
+    - IV rank >= 45 (sell rich premium — the whole point of a credit spread)
+    - Stock price flat/declining: chg% between -4% and +1% (not crashing OR surging today)
+    - 3-day trend flat/down: not in a genuine breakout
+    - No earnings within OPTIONS_EARNINGS_AVOID_DAYS
+    - Spread R/R (credit / max_loss) >= 0.35 (collect at least 35% of width)
+    - ATM OI >= _MIN_OI_ATM, spread <= _MAX_SPREAD_PCT
+    """
+
+    name = "BearCallSpread"
+
+    def scan(self, symbol: str) -> Optional[OptionSignal]:
+        if not OPTIONS_ENABLED:
+            return None
+        # Inverse ETFs go UP in bear — selling calls on them is wrong direction
+        if symbol in _INVERSE_ETFS:
+            return None
+
+        bull = _is_bull_regime()
+
+        try:
+            ctx = _fetch_bar_context(symbol)
+            if ctx is None or len(ctx.closes) < 25:
+                return None
+
+            if ctx.rsi is None:
+                return None
+
+            # In bear: accept flat-to-down days. In bull: require overbought RSI.
+            if bull:
+                if ctx.rsi < 68:
+                    return None
+            else:
+                # Bear regime: stock should be in downtrend context, not crashing today
+                if ctx.chg_pct < -4.0 or ctx.chg_pct > 1.0:
+                    return None
+
+            # Don't sell calls into a genuine upside breakout (we'd get run over)
+            if not _three_day_trend(ctx.closes, "down") and not bull:
+                # Waive in bear if price has been below 50-EMA for 5+ days
+                ema50 = ctx.closes.ewm(span=50, adjust=False).mean()
+                below_streak = int((ctx.closes.iloc[-6:-1] < ema50.iloc[-6:-1]).sum())
+                if below_streak < 5:
+                    return None
+
+            if not _no_earnings_soon(symbol, OPTIONS_EARNINGS_AVOID_DAYS):
+                log.debug(f"BearCallSpread {symbol}: earnings soon — skip")
+                return None
+
+            chain = _get_options_chain(symbol)
+            if chain is None:
+                return None
+
+            # Require elevated IV to collect meaningful credit
+            if chain.iv_rank < 45:
+                log.debug(f"BearCallSpread {symbol}: IV rank {chain.iv_rank:.0f} < 45 — skip")
+                return None
+
+            # Short leg: slight OTM call (δ0.35)
+            short_row = _pick_strike(chain.calls, ctx.spot, 0.35)
+            if short_row is None:
+                return None
+
+            short_strike = float(short_row["strike"])
+            if short_strike <= ctx.spot:
+                return None  # must be OTM
+
+            if "bid" in short_row.index and "ask" in short_row.index:
+                short_mid = (float(short_row["bid"]) + float(short_row["ask"])) / 2.0
+            else:
+                short_mid = float(short_row.get("lastprice", 0))
+            if short_mid <= 0:
+                return None
+
+            # Long leg (hedge): 2 strikes further OTM
+            strikes_sorted = sorted(chain.calls["strike"].unique())
+            try:
+                short_idx = next(i for i, s in enumerate(strikes_sorted) if abs(s - short_strike) < 0.01)
+            except StopIteration:
+                return None
+            long_idx   = min(short_idx + 2, len(strikes_sorted) - 1)
+            long_strike = strikes_sorted[long_idx]
+            if long_strike <= short_strike:
+                return None
+
+            long_rows = chain.calls[abs(chain.calls["strike"] - long_strike) < 0.01]
+            if long_rows.empty:
+                return None
+            lr = long_rows.iloc[0]
+            if "bid" in lr.index and "ask" in lr.index:
+                long_mid = (float(lr["bid"]) + float(lr["ask"])) / 2.0
+            else:
+                long_mid = float(lr.get("lastprice", 0))
+            if long_mid <= 0 or long_mid >= short_mid:
+                return None
+
+            net_credit   = round(short_mid - long_mid, 3)
+            spread_width = long_strike - short_strike
+            max_loss     = round(spread_width - net_credit, 3)
+
+            if net_credit <= 0 or max_loss <= 0:
+                return None
+
+            credit_rr = round(net_credit / spread_width, 2)  # fraction of width collected
+            if credit_rr < 0.35:
+                return None  # collect at least 35% of width
+
+            # OI gate — skip if Alpaca returns no OI data (all zeros)
+            if "openinterest" in chain.calls.columns and chain.calls["openinterest"].max() > 0:
+                atm = chain.calls[(chain.calls["strike"] >= ctx.spot * 0.90) & (chain.calls["strike"] <= ctx.spot * 1.10)]
+                if int(atm["openinterest"].sum()) < _MIN_OI_ATM:
+                    return None
+
+            dte    = (chain.expiry - datetime.date.today()).days
+            iv_pct = float(short_row.get("iv_pct", chain.hv_30))
+            delta  = float(short_row.get("delta", 0.35))
+            oi     = int(short_row.get("openinterest", 0))
+
+            conf  = 0.80  # credit spreads have defined risk — start at threshold
+            conf += min(0.05, (chain.iv_rank - 45) * 0.002)
+            conf += min(0.05, (credit_rr - 0.35) * 0.3)
+            if not bull:
+                conf += 0.04   # bear regime confirmation bonus
+            confidence = round(min(0.95, conf), 3)
+
+            return OptionSignal(
+                symbol=symbol,
+                option_type="call",
+                action="sell_to_open",
+                strike=short_strike,
+                expiry=chain.expiry,
+                mid_price=net_credit,
+                confidence=confidence,
+                reason=(
+                    f"BearCallSpread ${short_strike:.0f}/{long_strike:.0f}C "
+                    f"credit=${net_credit:.2f} max_loss=${max_loss:.2f} "
+                    f"({credit_rr:.0%} width) IVrank={chain.iv_rank:.0f} | {dte}DTE"
+                ),
+                strategy=self.name,
+                iv_pct=iv_pct,
+                iv_rank=chain.iv_rank,
+                delta=delta,
+                open_interest=oi,
+                rr_ratio=round(net_credit / max_loss, 2),
+                breakeven=round(short_strike + net_credit, 2),
+                spread_sell_strike=long_strike,
+                spread_sell_mid=long_mid,
+            )
+
+        except Exception as e:
+            log.debug(f"BearCallSpread {symbol}: {e}")
+            return None
+
 
 # ------------------- Iron Condor Strategy -------------------
 class IronCondorStrategy:
@@ -1197,8 +1458,8 @@ class ButterflyStrategy:
             delta   = float(mid_row.iloc[0].get("delta", 0.50))          if not mid_row.empty else 0.50
             oi      = int(mid_row.iloc[0].get("openinterest", 0))         if not mid_row.empty else 0
 
-            # OI gate on the ATM short strike (must have real liquidity)
-            if oi < _MIN_OI_ATM:
+            # OI gate on the ATM short strike — skip if Alpaca returns no OI data (all zeros)
+            if oi > 0 and oi < _MIN_OI_ATM:
                 return None
 
             # Confidence — starts low, must earn it; max 0.92 (pin trades are speculative)
@@ -1611,6 +1872,7 @@ def scan_options_universe(
     signals: List[OptionSignal] = []
     momentum_strat      = MomentumCallStrategy()
     bear_put_strat      = BearPutStrategy()
+    bear_call_strat     = BearCallSpreadStrategy()
     retest_strat        = BreakoutRetestCallStrategy()
     mean_rev_strat      = MeanReversionCallStrategy()
     trend_spread_strat  = TrendPullbackSpreadStrategy()
@@ -1626,7 +1888,35 @@ def scan_options_universe(
             fail_examples.setdefault(key, []).append(symbol)
 
     today = datetime.date.today()
-    for symbol in ti_universe:
+    _n_total = len(ti_universe)
+    log.info(f"Options scan: starting — {_n_total} ticker(s) in universe")
+
+    # ── Parallel prefetch: bars + OI ──────────────────────────────────────────
+    # Warm _bar_ctx_cache and _oi_cache concurrently before the serial strategy loop.
+    # Each ticker needs: (1) 80d bars → _bar_ctx_cache, (2) OI → _oi_cache.
+    # Chain snapshots (bid/ask/greeks) are fetched lazily inside each strategy's
+    # _get_options_chain() call which already has its own 5-min cache.
+    _bar_ctx_cache.clear()
+    exp_gte = today + datetime.timedelta(days=OPTIONS_DTE_MIN)
+    exp_lte = today + datetime.timedelta(days=OPTIONS_DTE_MAX)
+
+    def _prefetch(sym: str) -> None:
+        try:
+            _fetch_bar_context(sym)          # populates _bar_ctx_cache[sym]
+        except Exception:
+            _bar_ctx_cache.setdefault(sym, None)
+        try:
+            _fetch_oi_from_contracts(sym, exp_gte, exp_lte)  # populates _oi_cache[sym]
+        except Exception:
+            pass
+
+    _PREFETCH_WORKERS = min(12, _n_total)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=_PREFETCH_WORKERS) as pool:
+        list(pool.map(_prefetch, ti_universe))
+    log.info(f"Options scan: prefetch complete — starting strategy evaluation")
+    # ─────────────────────────────────────────────────────────────────────────
+
+    for _scan_idx, symbol in enumerate(ti_universe, 1):
         # Dollar volume quality gate: skip thinly-traded names
         daily = get_bars(symbol, "25d", "1d")
         if not daily.empty and len(daily) >= 5:
@@ -1646,13 +1936,15 @@ def scan_options_universe(
 
         symbol_got_signal = False
         # Try all strategies in priority order; one signal per symbol per cycle
-        for strat in (momentum_strat, bear_put_strat, mean_rev_strat, retest_strat,
-                      trend_spread_strat, iron_condor_strat, butterfly_strat):
+        for strat in (momentum_strat, bear_put_strat, bear_call_strat, mean_rev_strat,
+                      retest_strat, trend_spread_strat, iron_condor_strat, butterfly_strat):
             sig = strat.scan(symbol)
             if sig and sig.confidence >= OPTIONS_MIN_SIGNAL_CONFIDENCE:
                 signals.append(sig)
                 symbol_got_signal = True
                 break   # one signal per symbol per scan cycle
+            else:
+                _record_fail(f"no_{strat.name}", symbol)
         if not symbol_got_signal:
             _record_fail("no_signal", symbol)
 
