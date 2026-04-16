@@ -1,47 +1,39 @@
 {
-  "generated_at": "2026-04-16T11:20:30-04:00",
+  "generated_at": "2026-04-16T12:25:54-04:00",
   "date": "2026-04-16",
   "market_regime": "bull",
   "picks": [
     {
-      "symbol": "RUM",
+      "symbol": "CMPX",
       "action": "buy",
-      "price": 6.65,
-      "confidence": 0.92,
+      "price": 6.705,
+      "confidence": 0.8485,
       "strategy": "Sentiment",
-      "reason": "Sentiment bullish + vol x12.30 + price>20SMA"
+      "reason": "Sentiment bullish + vol x3.99 + price>20SMA"
+    },
+    {
+      "symbol": "NVTS",
+      "action": "buy",
+      "price": 11.44,
+      "confidence": 0.8245,
+      "strategy": "Sentiment",
+      "reason": "Sentiment bullish + vol x3.74 + price>20SMA"
+    },
+    {
+      "symbol": "AXTI",
+      "action": "buy",
+      "price": 75.8,
+      "confidence": 0.82,
+      "strategy": "Sweepea",
+      "reason": "Daily Sweepea pullback to 8-EMA | ATR $10.75"
     },
     {
       "symbol": "NN",
       "action": "buy",
-      "price": 20.725,
-      "confidence": 0.92,
+      "price": 20.21,
+      "confidence": 0.7684,
       "strategy": "Sentiment",
-      "reason": "Sentiment bullish + vol x5.31 + price>20SMA"
-    },
-    {
-      "symbol": "WSHP",
-      "action": "buy",
-      "price": 20.58,
-      "confidence": 0.92,
-      "strategy": "Sentiment",
-      "reason": "Sentiment bullish + vol x6.07 + price>20SMA"
-    },
-    {
-      "symbol": "CDNA",
-      "action": "buy",
-      "price": 21.775,
-      "confidence": 0.9165,
-      "strategy": "Sentiment",
-      "reason": "Sentiment bullish + vol x4.66 + price>20SMA"
-    },
-    {
-      "symbol": "NUAI",
-      "action": "buy",
-      "price": 4.645,
-      "confidence": 0.82,
-      "strategy": "Sweepea",
-      "reason": "Daily Sweepea pullback to 8-EMA | ATR $0.53"
+      "reason": "Sentiment bullish + vol x3.18 + price>20SMA"
     }
   ]
 }

@@ -225,7 +225,11 @@ def is_options_lull_hours() -> bool:
       - Midday lull  (11:30 AM–1:45 PM ET): low volume, inflated spreads
 
     Monitoring and exits are NOT blocked by this gate.
+    In paper/simulation mode this always returns False (trade all market hours).
     """
+    from engine.config import PAPER
+    if PAPER:
+        return False  # paper mode: no lull restriction — trade all regular hours
     now = datetime.datetime.now(ET)
     if now.weekday() >= 5:
         return False

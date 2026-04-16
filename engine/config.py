@@ -49,7 +49,7 @@ OPTIONS_MIN_SIGNAL_CONFIDENCE = float(os.getenv("OPTIONS_MIN_SIGNAL_CONFIDENCE",
 OPTIONS_MIN_STOCK_PRICE     = float(os.getenv("OPTIONS_MIN_STOCK_PRICE", "8.0"))   # sub-$8 stocks have wide spreads and thin option chains
 OPTIONS_MIN_MOVE_PCT        = float(os.getenv("OPTIONS_MIN_MOVE_PCT", "1.5"))      # min % daily move to qualify
 OPTIONS_MIN_RVOL            = float(os.getenv("OPTIONS_MIN_RVOL", "1.5"))          # min relative volume — need genuine conviction surge
-OPTIONS_MIN_ADV             = float(os.getenv("OPTIONS_MIN_ADV", "1_000_000"))    # min avg dollar volume — avoid thinly-traded names
+OPTIONS_MIN_ADV             = float(os.getenv("OPTIONS_MIN_ADV", "500_000"))     # min avg dollar volume — avoid thinly-traded names
 OPTIONS_UNIVERSE_OVERRIDE   = os.getenv("OPTIONS_UNIVERSE_OVERRIDE", "").strip()  # comma-separated tickers to force a smaller options universe
 OPTIONS_STOP_COOLDOWN_DAYS  = int(os.getenv("OPTIONS_STOP_COOLDOWN_DAYS", "2"))   # no re-entry within N days after a stop on same symbol
 OPTIONS_EARNINGS_AVOID_DAYS = int(os.getenv("OPTIONS_EARNINGS_AVOID_DAYS", "15")) # skip entries if earnings within N calendar days
@@ -58,14 +58,23 @@ OPTIONS_EARNINGS_AVOID_DAYS = int(os.getenv("OPTIONS_EARNINGS_AVOID_DAYS", "15")
 # every time the TI unusualoptionsvolume scan is scraped).  Falls back to the
 # hardcoded list below if the file doesn't exist or is empty.
 _OPTIONS_FALLBACK_UNIVERSE = [
+    # SPX/NDX liquid proxies — tightest spreads, deepest chains
+    "SPY", "QQQ", "IWM", "DIA",
+    "SPXL", "SPXS", "TQQQ", "SQQQ", "SPXU", "UVXY", "VXX",
+    # Sector ETFs with liquid options
+    "XLF", "XLE", "XLK", "XLV", "XLU", "XLP", "SMH", "ARKK",
     # Mega-cap tech — always liquid options
-    "AAPL", "MSFT", "NVDA", "AMD", "GOOGL", "META", "TSLA", "AMZN", "NFLX",
-    # High-beta momentum favourites
-    "MARA", "COIN", "PLTR", "SMCI", "CRWD", "NET", "SNOW",
-    # ETFs with liquid options chains
-    "SPY", "QQQ", "IWM", "SQQQ", "SPXU", "UVXY",
+    "AAPL", "MSFT", "NVDA", "AMD", "GOOGL", "GOOG", "META", "TSLA", "AMZN", "NFLX",
+    "ORCL", "CRM", "ADBE", "INTC", "QCOM",
+    # High-beta momentum / high-OI
+    "MARA", "COIN", "PLTR", "SMCI", "CRWD", "NET", "SNOW", "MSTR",
+    "SOFI", "RIVN", "LCID", "NIO", "BABA", "JD",
+    # Financials with deep chains
+    "JPM", "BAC", "GS", "MS", "C",
+    # Energy
+    "XOM", "CVX", "OXY",
     # Biotech / speculative with options
-    "MRNA", "BCRX",
+    "MRNA", "BNTX", "BCRX",
 ]
 
 def _load_options_universe() -> list:
@@ -448,7 +457,7 @@ LONG_ONLY_MODE        = False  # False = allow shorts (paper); True = long-only 
 MIN_SIGNAL_CONFIDENCE = 0.72   # Execute signals with confidence >= this (lowered from 0.78 for bear regime coverage)
 MIN_SHORT_CONFIDENCE_BEAR = 0.65  # In bear regime, allow Technical short setups at current confidence scale
 SHORT_FAIL_COOLDOWN_MIN = 5    # Re-try failed short symbols immediately
-MAX_SIGNALS_PER_CYCLE = 5      # Execute at most this many signals per scan cycle
+MAX_SIGNALS_PER_CYCLE = 3      # Execute at most this many signals per scan cycle
 
 # Parallel Scanning
 SCAN_WORKERS        = 8    # Threads scanning symbols concurrently (kept below Alpaca pool defaults)

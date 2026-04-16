@@ -123,7 +123,7 @@ def get_dynamic_option_filters():
             "MAX_PREMIUM_SPOT": 4.0 if bull else 3.5,   # unchanged effective cap
             "MIN_RR": 1.3 if bull else 1.4,             # was 1.0/1.1 — require real payoff
             "IV_RANK_CALL_MAX": 50.0 if bull else 45.0,
-            "IV_RANK_PUT_MAX": 70.0 if bull else 65.0,
+            "IV_RANK_PUT_MAX": 70.0 if bull else 80.0,  # bear crash = elevated IV is the environment, not a reason to skip puts
         }
 
 # Use these in all filter checks below
@@ -677,7 +677,7 @@ class BearPutStrategy:
             if ctx.rsi is None:
                 return None
 
-            chg_thresh = -4.0 if bull else -2.0
+            chg_thresh = -4.0 if bull else -1.0  # bear: allow entries on moderate-decline days, not just crash days
             if ctx.chg_pct > chg_thresh:
                 return None
 
@@ -691,7 +691,15 @@ class BearPutStrategy:
                 return None   # strict in bull regime; bear regime EMA used for confidence
 
             # A+ Filter 2: 3-day momentum confirmation
-            if not _three_day_trend(ctx.closes, "down"):
+            # In bear regime, waive if price has been below its 50-EMA for 5+ consecutive
+            # days — the macro downtrend is already confirmed, a bounce day is an entry.
+            if not bull:
+                ema50 = ctx.closes.ewm(span=50, adjust=False).mean()
+                below_ema50_streak = int((ctx.closes.iloc[-6:-1] < ema50.iloc[-6:-1]).sum())
+                in_macro_downtrend = below_ema50_streak >= 5
+            else:
+                in_macro_downtrend = False
+            if not in_macro_downtrend and not _three_day_trend(ctx.closes, "down"):
                 return None
 
             # A+ Filter 3: breakdown below prior 5-day low
