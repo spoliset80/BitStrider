@@ -31,6 +31,11 @@ from typing import Optional, List, Dict, Tuple
 
 import pandas as pd
 import psutil
+try:
+    import yfinance as _yf
+    _YF_AVAILABLE = True
+except ImportError:
+    _YF_AVAILABLE = False
 import pytz
 from engine.options._options_today import _calc_iv_rank
 from engine.utils import get_bars, calc_rsi, get_option_data_client, ALPACA_AVAILABLE
@@ -1248,6 +1253,323 @@ class BearCallSpreadStrategy:
             return None
 
 
+# ------------------- Short Squeeze Strategy -------------------
+# Per-symbol daily cache: symbol -> (date, {shortPercentOfFloat, grossMargins, revenueGrowth})
+_squeeze_yf_cache: Dict[str, tuple] = {}
+# Per-symbol daily cache: symbol -> (date, rs_13w_pct)
+_squeeze_rs_cache: Dict[str, tuple] = {}
+
+
+def _fetch_squeeze_fundamentals(symbol: str) -> Optional[Dict]:
+    """Fetch short float %, gross margins, and revenue growth via yfinance (daily-cached)."""
+    if not _YF_AVAILABLE:
+        return None
+    today = datetime.date.today()
+    if symbol in _squeeze_yf_cache:
+        cached_date, data = _squeeze_yf_cache[symbol]
+        if cached_date == today:
+            return data
+    try:
+        info = _yf.Ticker(symbol).info
+        data = {
+            "short_pct_float": info.get("shortPercentOfFloat") or 0.0,
+            "gross_margins":   info.get("grossMargins") or 0.0,
+            "rev_growth":      info.get("revenueGrowth") or 0.0,
+        }
+        _squeeze_yf_cache[symbol] = (today, data)
+        return data
+    except Exception:
+        return None
+
+
+def _fetch_squeeze_rs(symbol: str) -> Optional[float]:
+    """Fetch 13-week price return relative to S&P 500 via Finnhub (daily-cached)."""
+    today = datetime.date.today()
+    if symbol in _squeeze_rs_cache:
+        cached_date, rs = _squeeze_rs_cache[symbol]
+        if cached_date == today:
+            return rs
+    try:
+        from engine.config import FINNHUB_API_KEY
+        import requests as _req
+        r = _req.get(
+            "https://finnhub.io/api/v1/stock/metric",
+            params={"symbol": symbol, "metric": "all", "token": FINNHUB_API_KEY},
+            timeout=5,
+        )
+        metric = r.json().get("metric", {})
+        rs = metric.get("priceRelativeToS&P50013Week")
+        if rs is None:
+            return None
+        rs = float(rs)
+        _squeeze_rs_cache[symbol] = (today, rs)
+        return rs
+    except Exception:
+        return None
+
+
+class ShortSqueezeStrategy:
+    """Directional call / bull-call-spread on high short-float stocks with confirmed momentum.
+
+    Two squeeze modes, both requiring: short_float >= 12%, gross_margin > 0%, rev_growth > 8%.
+
+    CONFIRMED squeeze (RS 13W > +10%):
+      - Buys a naked OTM call (δ ~0.32) when IV rank <= 50.
+      - When IV rank > 50 (squeeze partially priced in), falls through to spread mode.
+
+    EARLY squeeze (5d RS > +15% vs SPY, even if 13W RS is still negative):
+      - The stock is outperforming over the most recent week, shorts are bleeding.
+      - Uses a bull call debit spread (buy lower-strike call, sell higher-strike call)
+        which halves vega exposure — appropriate when IV rank > 50.
+      - Requires tighter EMA stack and stricter RSI (38–65) to offset lower signal history.
+
+    Both modes:
+    - RSI 38–70, EMA8 > EMA21, vol ratio >= 1.1, no earnings soon.
+    """
+
+    name = "ShortSqueeze"
+
+    def scan(self, symbol: str) -> Optional[OptionSignal]:
+        if not OPTIONS_ENABLED:
+            return None
+        if not _YF_AVAILABLE:
+            return None
+        if symbol in _INVERSE_ETFS:
+            return None
+
+        try:
+            # -- Gate 1: Fundamental squeeze fuel (both modes) ----------------
+            fund = _fetch_squeeze_fundamentals(symbol)
+            if fund is None:
+                return None
+            short_pct  = fund["short_pct_float"]
+            gross_mgn  = fund["gross_margins"]
+            rev_growth = fund["rev_growth"]
+
+            if short_pct < 0.12:
+                log.debug(f"ShortSqueeze {symbol}: short_float={short_pct:.1%} < 12% — skip")
+                return None
+            if gross_mgn <= 0:
+                log.debug(f"ShortSqueeze {symbol}: gross_margin={gross_mgn:.1%} <= 0 — skip")
+                return None
+            if rev_growth < 0.08:
+                log.debug(f"ShortSqueeze {symbol}: rev_growth={rev_growth:.1%} < 8% — skip")
+                return None
+
+            # -- Gate 2: RS check — 13W (confirmed) or 5d (early) ------------
+            rs_13w = _fetch_squeeze_rs(symbol)
+            ctx    = _fetch_bar_context(symbol)
+            if ctx is None or len(ctx.closes) < 25:
+                return None
+
+            # 5-day return of stock vs SPY (early-squeeze RS proxy)
+            spy_bars  = get_bars("SPY", "10d", "1d")
+            spy_ret5d = 0.0
+            if not spy_bars.empty and len(spy_bars) >= 6:
+                spy_ret5d = float(
+                    (spy_bars["close"].iloc[-1] - spy_bars["close"].iloc[-6])
+                    / spy_bars["close"].iloc[-6] * 100
+                )
+            stk_ret5d = 0.0
+            if len(ctx.closes) >= 6:
+                stk_ret5d = float(
+                    (ctx.closes.iloc[-1] - ctx.closes.iloc[-6])
+                    / ctx.closes.iloc[-6] * 100
+                )
+            rs_5d = stk_ret5d - spy_ret5d  # positive = outperforming SPY this week
+
+            confirmed_rs = rs_13w is not None and rs_13w >= 10.0
+            early_rs     = rs_5d >= 15.0   # stock beat SPY by +15pp this week
+
+            if not confirmed_rs and not early_rs:
+                log.debug(
+                    f"ShortSqueeze {symbol}: RS_13w={rs_13w} RS_5d={rs_5d:.1f}% "
+                    f"— neither confirmed (>10%) nor early (>15%) — skip"
+                )
+                return None
+
+            # -- Gate 3: Price / momentum (both modes) -----------------------
+            rsi_max = 65 if (not confirmed_rs and early_rs) else 70  # tighter for early
+            if ctx.rsi is None or not (38 <= ctx.rsi <= rsi_max):
+                log.debug(f"ShortSqueeze {symbol}: RSI={ctx.rsi} not in 38-{rsi_max} — skip")
+                return None
+
+            if ctx.vol_ratio < 1.1:
+                log.debug(f"ShortSqueeze {symbol}: vol_ratio={ctx.vol_ratio:.2f} < 1.1 — skip")
+                return None
+
+            ema8  = float(ctx.closes.ewm(span=8,  adjust=False).mean().iloc[-1])
+            ema21 = float(ctx.closes.ewm(span=21, adjust=False).mean().iloc[-1])
+            if ema8 <= ema21:
+                log.debug(f"ShortSqueeze {symbol}: EMA8 {ema8:.2f} <= EMA21 {ema21:.2f} — skip")
+                return None
+
+            if not _no_earnings_soon(symbol, OPTIONS_EARNINGS_AVOID_DAYS):
+                log.debug(f"ShortSqueeze {symbol}: earnings soon — skip")
+                return None
+
+            # -- Gate 4: Options chain ---------------------------------------
+            chain = _get_options_chain(symbol)
+            if chain is None:
+                return None
+
+            dte = (chain.expiry - datetime.date.today()).days
+
+            # OI gate
+            if "openinterest" in chain.calls.columns and chain.calls["openinterest"].max() > 0:
+                atm = chain.calls[
+                    (chain.calls["strike"] >= ctx.spot * 0.90) &
+                    (chain.calls["strike"] <= ctx.spot * 1.10)
+                ]
+                if int(atm["openinterest"].sum()) < _MIN_OI_ATM:
+                    return None
+
+            # -- Mode decision: naked call vs bull call spread ----------------
+            use_spread = chain.iv_rank > 50 or (not confirmed_rs and early_rs)
+
+            # Long leg (both modes): δ ~0.32 OTM call
+            long_row = _pick_strike(chain.calls, ctx.spot, 0.32)
+            if long_row is None:
+                return None
+            long_strike = float(long_row["strike"])
+            if long_strike <= ctx.spot:
+                return None
+            if "bid" in long_row.index and "ask" in long_row.index:
+                long_mid = (float(long_row["bid"]) + float(long_row["ask"])) / 2.0
+            else:
+                long_mid = float(long_row.get("lastprice", 0))
+            if long_mid <= 0:
+                return None
+            iv_pct = float(long_row.get("iv_pct", chain.hv_30))
+            delta  = float(long_row.get("delta", 0.32))
+            oi     = int(long_row.get("openinterest", 0))
+
+            if use_spread:
+                # Bull call debit spread: buy lower strike, sell 2 strikes higher
+                # Cuts vega in half — correct structure when IV is already elevated
+                strikes_sorted = sorted(chain.calls["strike"].unique())
+                try:
+                    long_idx  = next(i for i, s in enumerate(strikes_sorted) if abs(s - long_strike) < 0.01)
+                except StopIteration:
+                    return None
+                short_idx   = min(long_idx + 2, len(strikes_sorted) - 1)
+                short_strike = strikes_sorted[short_idx]
+                if short_strike <= long_strike:
+                    return None
+
+                short_rows = chain.calls[abs(chain.calls["strike"] - short_strike) < 0.01]
+                if short_rows.empty:
+                    return None
+                sr = short_rows.iloc[0]
+                if "bid" in sr.index and "ask" in sr.index:
+                    short_mid = (float(sr["bid"]) + float(sr["ask"])) / 2.0
+                else:
+                    short_mid = float(sr.get("lastprice", 0))
+                if short_mid <= 0 or short_mid >= long_mid:
+                    return None
+
+                net_debit    = round(long_mid - short_mid, 3)
+                spread_width = short_strike - long_strike
+                max_profit   = round(spread_width - net_debit, 3)
+
+                if net_debit <= 0 or max_profit <= 0:
+                    return None
+                # Net debit must be <= 60% of spread width (decent R/R)
+                if net_debit / spread_width > 0.60:
+                    log.debug(f"ShortSqueeze {symbol}: spread debit {net_debit:.2f} > 60% width — skip")
+                    return None
+                if net_debit / ctx.spot * 100 > 5.0:
+                    return None
+
+                rr = round(max_profit / net_debit, 2)
+                if rr < 0.8:
+                    return None
+
+                # Confidence — spread mode is lower starting point (more uncertainty)
+                conf = 0.68
+                conf += min(0.07, (short_pct - 0.12) * 0.55)
+                conf += min(0.04, rev_growth * 0.12)
+                if confirmed_rs and rs_13w is not None:
+                    conf += min(0.04, rs_13w * 0.001)
+                if early_rs:
+                    conf += min(0.03, (rs_5d - 15) * 0.003)
+                conf += min(0.02, (ctx.vol_ratio - 1.1) * 0.02)
+                confidence = round(min(0.93, conf), 3)
+
+                mode_str = "EarlySpread" if (not confirmed_rs) else "Spread"
+                rs_str   = (
+                    f" RS13W={rs_13w:+.0f}%"
+                    if rs_13w is not None else f" RS5d={rs_5d:+.0f}%"
+                )
+                return OptionSignal(
+                    symbol=symbol,
+                    option_type="call",
+                    action="buy_to_open",
+                    strike=long_strike,
+                    expiry=chain.expiry,
+                    mid_price=net_debit,
+                    confidence=confidence,
+                    reason=(
+                        f"ShortSqueeze({mode_str}) ${long_strike:.0f}/{short_strike:.0f}C "
+                        f"debit={net_debit:.2f} maxP={max_profit:.2f} ({rr:.1f}x) "
+                        f"short={short_pct:.0%} IVrank={chain.iv_rank:.0f}{rs_str} | {dte}DTE"
+                    ),
+                    strategy=self.name,
+                    iv_pct=iv_pct,
+                    iv_rank=chain.iv_rank,
+                    delta=delta,
+                    open_interest=oi,
+                    rr_ratio=rr,
+                    breakeven=round(long_strike + net_debit, 2),
+                    spread_sell_strike=short_strike,
+                    spread_sell_mid=short_mid,
+                )
+
+            else:
+                # Confirmed squeeze, cheap IV — naked call
+                if long_mid / ctx.spot * 100 > 4.0:
+                    return None
+                rr = _calc_rr(chain.atr14, dte, long_mid)
+                if rr < _MIN_RR:
+                    return None
+
+                conf = 0.70
+                conf += min(0.08, (short_pct - 0.12) * 0.6)
+                conf += min(0.04, rev_growth * 0.15)
+                if rs_13w is not None:
+                    conf += min(0.04, rs_13w * 0.001)
+                conf += min(0.03, (rr - _MIN_RR) * 0.015)
+                conf += min(0.03, (ctx.vol_ratio - 1.1) * 0.03)
+                confidence = round(min(0.95, conf), 3)
+
+                rs_str = f" RS13W={rs_13w:+.0f}%" if rs_13w is not None else ""
+                return OptionSignal(
+                    symbol=symbol,
+                    option_type="call",
+                    action="buy_to_open",
+                    strike=long_strike,
+                    expiry=chain.expiry,
+                    mid_price=long_mid,
+                    confidence=confidence,
+                    reason=(
+                        f"ShortSqueeze ${long_strike:.0f}C short={short_pct:.0%} "
+                        f"gm={gross_mgn:.0%} revg={rev_growth:.0%}{rs_str} "
+                        f"RSI={ctx.rsi:.0f} IVrank={chain.iv_rank:.0f} | {dte}DTE"
+                    ),
+                    strategy=self.name,
+                    iv_pct=iv_pct,
+                    iv_rank=chain.iv_rank,
+                    delta=delta,
+                    open_interest=oi,
+                    rr_ratio=round(rr, 2),
+                    breakeven=round(long_strike + long_mid, 2),
+                )
+
+        except Exception as e:
+            log.debug(f"ShortSqueeze {symbol}: {e}")
+            return None
+
+
 # ------------------- Iron Condor Strategy -------------------
 class IronCondorStrategy:
     """Sell iron condor: Sell OTM call and put, buy further OTM call and put for defined risk.
@@ -1873,6 +2195,7 @@ def scan_options_universe(
     momentum_strat      = MomentumCallStrategy()
     bear_put_strat      = BearPutStrategy()
     bear_call_strat     = BearCallSpreadStrategy()
+    squeeze_strat       = ShortSqueezeStrategy()
     retest_strat        = BreakoutRetestCallStrategy()
     mean_rev_strat      = MeanReversionCallStrategy()
     trend_spread_strat  = TrendPullbackSpreadStrategy()
@@ -1936,7 +2259,7 @@ def scan_options_universe(
 
         symbol_got_signal = False
         # Try all strategies in priority order; one signal per symbol per cycle
-        for strat in (momentum_strat, bear_put_strat, bear_call_strat, mean_rev_strat,
+        for strat in (momentum_strat, bear_put_strat, bear_call_strat, squeeze_strat, mean_rev_strat,
                       retest_strat, trend_spread_strat, iron_condor_strat, butterfly_strat):
             sig = strat.scan(symbol)
             if sig and sig.confidence >= OPTIONS_MIN_SIGNAL_CONFIDENCE:

@@ -40,6 +40,8 @@ from engine.config import (
     OPTIONS_DTE_MIN,
     PDT_ACCOUNT_MIN, PDT_MAX_TRADES, PDT_OPTIONS_DAY_TRADE_RESERVE,
     OPTIONS_THETA_EXIT_DTE,
+    OPTIONS_TRAIL_ACTIVATE_PCT,
+    OPTIONS_TRAIL_DRAWDOWN_PCT,
     API_KEY, API_SECRET, PAPER,
 )
 from .strategies import OptionSignal, CONTRACT_SIZE, record_stop_cooldown
@@ -457,6 +459,23 @@ class OptionsExecutor:
                         log.warning(f"OPTIONS: {pos.symbol} stop hit ({pnl_pct:.1f}%) — closing")
                         to_close.append(occ_sym)
                         stop_symbols.append(pos.symbol)
+
+                # 5. Trailing stop — arms once peak >= OPTIONS_TRAIL_ACTIVATE_PCT
+                # Fires when pnl drops OPTIONS_TRAIL_DRAWDOWN_PCT pp below the peak.
+                # Only evaluated when the fixed stop and target haven't already triggered.
+                # Skipped on entry day (same logic as fixed stop) to avoid noise.
+                elif (
+                    not same_day_entry
+                    and not pdt_block
+                    and pos.peak_pnl_pct >= OPTIONS_TRAIL_ACTIVATE_PCT
+                    and pnl_pct <= pos.peak_pnl_pct - OPTIONS_TRAIL_DRAWDOWN_PCT
+                ):
+                    log.info(
+                        f"OPTIONS: {pos.symbol} trailing stop — peak={pos.peak_pnl_pct:.1f}% "
+                        f"current={pnl_pct:.1f}% (drawdown {pos.peak_pnl_pct - pnl_pct:.1f}pp "
+                        f"> {OPTIONS_TRAIL_DRAWDOWN_PCT:.0f}pp threshold) — closing"
+                    )
+                    to_close.append(occ_sym)
 
             except Exception as e:
                 log.error(f"Error monitoring {occ_sym}: {e}")

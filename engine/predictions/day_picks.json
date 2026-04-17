@@ -1,47 +1,47 @@
 {
-  "generated_at": "2026-04-16T15:56:48-04:00",
+  "generated_at": "2026-04-16T22:47:52-04:00",
   "date": "2026-04-16",
   "market_regime": "bull",
   "picks": [
     {
-      "symbol": "QDEL",
+      "symbol": "LUNR",
       "action": "buy",
-      "price": 12.52,
-      "confidence": 0.92,
-      "strategy": "Sentiment",
-      "reason": "Sentiment bullish + vol x6.37 + price>20SMA"
-    },
-    {
-      "symbol": "NN",
-      "action": "buy",
-      "price": 21.555,
-      "confidence": 0.8769,
-      "strategy": "Sentiment",
-      "reason": "Sentiment bullish + vol x4.27 + price>20SMA"
-    },
-    {
-      "symbol": "ACHV",
-      "action": "buy",
-      "price": 4.785,
-      "confidence": 0.8405,
-      "strategy": "Sentiment",
-      "reason": "Sentiment bullish + vol x3.91 + price>20SMA"
-    },
-    {
-      "symbol": "NVTS",
-      "action": "buy",
-      "price": 12.345,
+      "price": 27.28,
       "confidence": 0.82,
       "strategy": "Sweepea",
-      "reason": "Daily Sweepea pullback to 8-EMA | ATR $0.90"
+      "reason": "Daily Sweepea pullback to 8-EMA | ATR $2.52"
     },
     {
-      "symbol": "EVTL",
+      "symbol": "BKSY",
       "action": "buy",
-      "price": 3.3501,
-      "confidence": 0.7478,
-      "strategy": "Sentiment",
-      "reason": "Sentiment bullish + vol x2.98 + price>20SMA"
+      "price": 39.0,
+      "confidence": 0.82,
+      "strategy": "Sweepea",
+      "reason": "Daily Sweepea pullback to 8-EMA | ATR $4.06"
+    },
+    {
+      "symbol": "RDW",
+      "action": "buy",
+      "price": 11.22,
+      "confidence": 0.82,
+      "strategy": "Sweepea",
+      "reason": "Daily Sweepea pullback to 8-EMA | ATR $0.92"
+    },
+    {
+      "symbol": "NUTX",
+      "action": "buy",
+      "price": 101.76,
+      "confidence": 0.82,
+      "strategy": "Sweepea",
+      "reason": "Daily Sweepea pullback to 20-EMA | ATR $6.41"
+    },
+    {
+      "symbol": "SIDU",
+      "action": "buy",
+      "price": 5.95,
+      "confidence": 0.82,
+      "strategy": "Sweepea",
+      "reason": "Daily Sweepea pullback to 8-EMA | ATR $0.79"
     }
   ]
 }

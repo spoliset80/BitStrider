@@ -53,6 +53,8 @@ OPTIONS_MIN_ADV             = float(os.getenv("OPTIONS_MIN_ADV", "500_000"))    
 OPTIONS_UNIVERSE_OVERRIDE   = os.getenv("OPTIONS_UNIVERSE_OVERRIDE", "").strip()  # comma-separated tickers to force a smaller options universe
 OPTIONS_STOP_COOLDOWN_DAYS  = int(os.getenv("OPTIONS_STOP_COOLDOWN_DAYS", "2"))   # no re-entry within N days after a stop on same symbol
 OPTIONS_EARNINGS_AVOID_DAYS = int(os.getenv("OPTIONS_EARNINGS_AVOID_DAYS", "15")) # skip entries if earnings within N calendar days
+OPTIONS_TRAIL_ACTIVATE_PCT  = float(os.getenv("OPTIONS_TRAIL_ACTIVATE_PCT", "20.0"))  # trailing stop arms once P&L exceeds this %
+OPTIONS_TRAIL_DRAWDOWN_PCT  = float(os.getenv("OPTIONS_TRAIL_DRAWDOWN_PCT", "15.0"))  # close if pnl drops this many pp from peak
 # Tickers that actively trade liquid options.
 # Loaded dynamically from data/ti_unusual_options.json (written by capture_tradeideas.py
 # every time the TI unusualoptionsvolume scan is scraped).  Falls back to the
@@ -75,6 +77,8 @@ _OPTIONS_FALLBACK_UNIVERSE = [
     "XOM", "CVX", "OXY",
     # Biotech / speculative with options
     "MRNA", "BNTX", "BCRX",
+    # Short squeeze candidates — high short float + improving fundamentals
+    "LITE", "AAOI",
 ]
 
 def _load_options_universe() -> list:
