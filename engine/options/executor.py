@@ -14,7 +14,7 @@ Responsibilities:
 import logging
 import datetime
 import time
-from typing import List, Dict, Tuple
+from typing import List, Dict, Tuple, Optional
 from dataclasses import dataclass, field
 import json
 import re
@@ -51,6 +51,30 @@ log = logging.getLogger("ApexTrader.Options")
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
+import math as _math
+
+def _bs_option_price(spot: float, strike: float, dte: int, iv: float, call: bool = True) -> float:
+    """Thin Black-Scholes pricer used to estimate short-leg credit on auto-derived spreads."""
+    T = dte / 365.0
+    if T <= 0 or iv <= 0 or spot <= 0 or strike <= 0:
+        return max(0.0, (spot - strike) if call else (strike - spot))
+    try:
+        d1 = (_math.log(spot / strike) + (0.05 + 0.5 * iv * iv) * T) / (iv * _math.sqrt(T))
+        d2 = d1 - iv * _math.sqrt(T)
+        def _n(x):
+            a = abs(x)
+            t = 1.0 / (1.0 + 0.2316419 * a)
+            p = t * (0.319381530 + t * (-0.356563782 + t * (1.781477937 + t * (-1.821255978 + t * 1.330274429))))
+            r = 1.0 - (1 / _math.sqrt(2 * _math.pi)) * _math.exp(-0.5 * a * a) * p
+            return r if x >= 0 else 1.0 - r
+        if call:
+            return max(0.0, spot * _n(d1) - strike * _math.exp(-0.05 * T) * _n(d2))
+        else:
+            return max(0.0, strike * _math.exp(-0.05 * T) * _n(-d2) - spot * _n(-d1))
+    except Exception:
+        return 0.0
+
+
 def _alpaca_option_symbol(symbol: str, expiry: datetime.date, option_type: str, strike: float) -> str:
     """Build the OCC option symbol used by Alpaca.
     Format: <underlying><YYMMDD><C|P><8-digit-strike-in-thousandths>
@@ -80,6 +104,10 @@ class OptionsPosition:
     # All legs stored at entry — enables strategy-agnostic close and P&L calculation.
     # Each entry: {"occ_symbol": str, "side": "buy"|"sell", "ratio_qty": int}
     legs: list = field(default_factory=list)
+    # Open-window / IV-gate fields
+    entry_iv:      float = 0.0   # IV% at entry (0-1 scale from yfinance/Alpaca)
+    is_naked:      bool  = False  # True = single naked leg, eligible for spread conversion
+    open_stop_pct: float = 0.0   # Per-position hard stop override (25% open window, 0 = use global)
 
 
 class OptionsExecutor:
@@ -90,6 +118,8 @@ class OptionsExecutor:
         self._positions: Dict[str, OptionsPosition] = {}   # occ_symbol -> OptionsPosition
         self._last_monitor_ts: float = 0.0
         self._MONITOR_INTERVAL = 20   # seconds between P&L checks (fast enough to catch intraday moves)
+        self._last_iv_convert_ts: float = 0.0
+        self._IV_CONVERT_INTERVAL = 600.0  # check spread-conversion every 10 min max
 
     # ── Allocation / Budget ────────────────────────────────────────────────────
 
@@ -167,8 +197,118 @@ class OptionsExecutor:
         return max(0, min(contracts, 10))  # hard cap: never more than 10 contracts
 
     # ── Order Placement ────────────────────────────────────────────────────────
-    
-    def _is_account_tradeable(self) -> bool:
+
+    def _get_premarket_gap(self, symbol: str) -> float:
+        """Returns today's open vs yesterday's close as a signed fraction.
+        e.g. +0.04 = gapped up 4%.  Uses Alpaca daily bars (already cached by get_bars).
+        """
+        try:
+            from engine.utils import get_bars
+            bars = get_bars(symbol, "2d", "1d")
+            if len(bars) < 2:
+                return 0.0
+            prev_close = float(bars["close"].iloc[-2])
+            today_open = float(bars["open"].iloc[-1])
+            return (today_open - prev_close) / prev_close
+        except Exception:
+            return 0.0
+
+    def _fetch_current_iv(self, pos: "OptionsPosition") -> Optional[float]:
+        """Fetch current implied volatility for a tracked naked position via yfinance.
+        Returns 0-1 float (e.g. 0.65 = 65% IV) or None on failure.
+        Only called for open naked positions (max 3), every 10 minutes.
+        """
+        try:
+            import yfinance as yf
+            ticker = yf.Ticker(pos.symbol)
+            exp_str = pos.expiry.strftime("%Y-%m-%d")
+            chain = ticker.option_chain(exp_str)
+            df = chain.calls if "call" in pos.option_type.lower() else chain.puts
+            closest = (df["strike"] - pos.strike).abs()
+            if closest.empty:
+                return None
+            row = df.loc[[closest.idxmin()]]
+            iv = float(row["impliedVolatility"].iloc[0])
+            return iv if iv > 0 else None
+        except Exception:
+            return None
+
+    def _maybe_convert_to_spread(self) -> None:
+        """For each open naked position: if IV has dropped >=30% from entry AND
+        the position is profitable, sell a further-OTM leg to convert to a spread.
+
+        This is called from monitor_positions() but rate-limited to every
+        _IV_CONVERT_INTERVAL seconds to avoid excess API calls.
+        """
+        now_t = time.monotonic()
+        if now_t - self._last_iv_convert_ts < self._IV_CONVERT_INTERVAL:
+            return
+        self._last_iv_convert_ts = now_t
+
+        try:
+            all_pos = {p.symbol: p for p in self.client.get_all_positions()}
+        except Exception as e:
+            log.warning(f"[OPTIONS] IV convert: could not fetch positions: {e}")
+            return
+
+        for occ_sym, pos in list(self._positions.items()):
+            if not pos.is_naked or pos.entry_iv <= 0:
+                continue
+            try:
+                # Gate 1: current IV must be >=30% below entry IV
+                cur_iv = self._fetch_current_iv(pos)
+                if cur_iv is None:
+                    continue
+                drop_pct = (pos.entry_iv - cur_iv) / pos.entry_iv
+                if drop_pct < 0.30:
+                    log.debug(
+                        f"[OPTIONS] IV convert {pos.symbol}: IV {pos.entry_iv:.2f}→{cur_iv:.2f} "
+                        f"(drop={drop_pct:.0%} < 30%) — waiting"
+                    )
+                    continue
+
+                # Gate 2: position must be profitable
+                leg_pos = all_pos.get(occ_sym)
+                if leg_pos is None:
+                    continue
+                cur_price = float(leg_pos.current_price)
+                pnl_pct = (cur_price - pos.entry_price) / abs(pos.entry_price) * 100
+                if pnl_pct <= 0:
+                    log.debug(
+                        f"[OPTIONS] IV convert {pos.symbol}: not profitable ({pnl_pct:+.1f}%) — holding naked"
+                    )
+                    continue
+
+                # Compute short leg: 10% further OTM, rounded to nearest $0.50
+                cp_type = "call" if "call" in pos.option_type.lower() else "put"
+                if cp_type == "put":
+                    short_strike = round(pos.strike * 0.90 / 0.5) * 0.5   # 10% below
+                else:
+                    short_strike = round(pos.strike * 1.10 / 0.5) * 0.5   # 10% above
+
+                short_occ = _alpaca_option_symbol(pos.symbol, pos.expiry, cp_type, short_strike)
+
+                # Submit sell_to_open for the short leg (market order — speed matters)
+                order_req = MarketOrderRequest(
+                    symbol=short_occ,
+                    qty=pos.contracts,
+                    side=OrderSide.SELL,
+                    time_in_force=TimeInForce.DAY,
+                )
+                self.client.submit_order(order_req)
+                log.info(
+                    f"[OPTIONS] IV CONVERT {pos.symbol}: added short leg {short_occ} "
+                    f"(IV drop={drop_pct:.0%}, P&L={pnl_pct:+.1f}%) — position is now a spread"
+                )
+
+                # Update tracking: add short leg, mark as no longer naked
+                pos.legs.append({"occ_symbol": short_occ, "side": "sell", "ratio_qty": 1})
+                pos.is_naked = False
+
+            except Exception as e:
+                log.error(f"[OPTIONS] IV convert failed for {occ_sym}: {e}", exc_info=True)
+
+
         """Return False if the account is in liquidation-only / trading-blocked state."""
         global _ACCOUNT_RESTRICTED
         # Short-circuit: if we already caught a 40310000 this session, don't retry.
@@ -241,17 +381,107 @@ class OptionsExecutor:
         is_condor = "condor" in strat
         is_spread = signal.spread_sell_strike is not None and not is_butterfly and not is_condor
         is_mleg = is_butterfly or is_spread or is_condor
-        
+
         cp_type = "call" if "call" in signal.option_type.lower() else "put"
+
+        # ── 4b. Open Window / IV Gate ─────────────────────────────────────────
+        # Decides naked vs spread AFTER type detection so butterflies/condors are untouched.
+        from engine.utils import is_open_window
+        _in_open_window = is_open_window()
+        _eff_spread_sell_strike = signal.spread_sell_strike  # may be overridden below
+        _entry_iv      = signal.iv_pct   # IV% at scan time (stored on position)
+        _is_naked_entry = False
+        _open_stop_pct  = 0.0            # 0 = use global OPTIONS_STOP_LOSS_PCT
+        _net_entry_price = signal.mid_price   # overridden below if auto-spread net debit is computed
+
+        if not is_butterfly and not is_condor:
+            if _in_open_window:
+                # Higher confidence bar — only cleanest signals at the open
+                if signal.confidence < 0.90:
+                    log.info(
+                        f"[OPTIONS] Open window: {signal.symbol} conf={signal.confidence:.0%} < 90% — skip"
+                    )
+                    return False
+                # 1 naked position max during the open window
+                if self._count_open_options() >= 1:
+                    log.info(
+                        f"[OPTIONS] Open window: already 1 open position — skip {signal.symbol}"
+                    )
+                    return False
+                # 50% contract count (premium is peak at open)
+                contracts = max(1, contracts // 2)
+                _open_stop_pct = 25.0
+                # Gap gate: large pre-market gap means IV already inflated → spread
+                gap = self._get_premarket_gap(signal.symbol)
+                _force_spread = abs(gap) > 0.03 or signal.iv_rank > 50
+                if abs(gap) > 0.03:
+                    log.info(
+                        f"[OPTIONS] Open window: {signal.symbol} gap={gap:+.1%} > 3% → spread"
+                    )
+                elif signal.iv_rank > 50:
+                    log.info(
+                        f"[OPTIONS] Open window: {signal.symbol} IV rank={signal.iv_rank:.0f} > 50 → spread"
+                    )
+            else:
+                # Normal session: IV rank decides naked vs spread
+                _force_spread = signal.iv_rank > 35
+
+            if not _force_spread:
+                # Trade as pure naked single-leg — ignore any spread_sell_strike from strategy
+                is_spread  = False
+                is_mleg    = False
+                _is_naked_entry = True
+                if _in_open_window:
+                    log.info(
+                        f"[OPTIONS] Open window NAKED: {signal.symbol} {cp_type} "
+                        f"@{signal.strike} ×{contracts}c | IV={_entry_iv:.0%} | stop=25%"
+                    )
+            else:
+                # Need a spread.  If strategy didn't provide a short leg, derive one.
+                if _eff_spread_sell_strike is None:
+                    if cp_type == "put":
+                        _eff_spread_sell_strike = round(signal.strike * 0.90 / 0.5) * 0.5
+                    else:
+                        _eff_spread_sell_strike = round(signal.strike * 1.10 / 0.5) * 0.5
+                    log.info(
+                        f"[OPTIONS] IV gate forced spread for {signal.symbol}: "
+                        f"derived short leg @{_eff_spread_sell_strike}"
+                    )
+                is_spread = True
+                is_mleg   = True
+        # ── End 4b ───────────────────────────────────────────────────────────
 
         try:
             # Price improvement: for debits (buy) bid 1% below mid to lower cost;
             # for credits (sell) offer 1% above mid to collect more.
-            # Avoid the prior mistake of always paying 2% over mid on debit orders.
+            # For auto-derived spreads (IV gate): signal.mid_price is the long-leg premium
+            # only, so we must subtract the estimated short-leg credit to get the true
+            # net debit — otherwise Alpaca reserves 2× the buying power needed.
+            _spread_mid_price = signal.mid_price
+            if is_mleg and signal.spread_sell_mid is None and _eff_spread_sell_strike is not None:
+                # Estimate short-leg credit via Black-Scholes
+                _dte = max(1, (signal.expiry - datetime.date.today()).days)
+                _iv  = signal.iv_pct if signal.iv_pct > 0 else 0.30
+                # Spot ≈ signal.strike (entry is at-the-money by convention)
+                _short_credit = _bs_option_price(
+                    spot=signal.strike,
+                    strike=_eff_spread_sell_strike,
+                    dte=_dte,
+                    iv=_iv,
+                    call=(cp_type == "call"),
+                )
+                _spread_mid_price = max(0.01, signal.mid_price - _short_credit)
+                log.info(
+                    f"[OPTIONS] Auto-spread net debit: long=${signal.mid_price:.2f} "
+                    f"- short_est=${_short_credit:.2f} = net=${_spread_mid_price:.2f} "
+                    f"(was sending ${signal.mid_price:.2f} -- overstating BP)"
+                )
+                _net_entry_price = _spread_mid_price  # use net debit as position entry_price
+
             if "buy" in signal.action:
-                limit_price = round(signal.mid_price * 0.99, 2)   # bid below mid
+                limit_price = round(_spread_mid_price * 0.99, 2)   # bid below mid
             else:
-                limit_price = round(signal.mid_price * 1.01, 2)   # offer above mid
+                limit_price = round(_spread_mid_price * 1.01, 2)   # offer above mid
 
             # ── CASE A: MULTI-LEG (Spreads, Butterflies, Condors) ────────────────
             if is_mleg:
@@ -278,7 +508,7 @@ class OptionsExecutor:
                     secondary_side = OrderSide.BUY  if is_credit else OrderSide.SELL
                     legs_list = [
                         {"symbol": _alpaca_option_symbol(signal.symbol, signal.expiry, cp_type, signal.strike), "side": primary_side, "ratio_qty": 1},
-                        {"symbol": _alpaca_option_symbol(signal.symbol, signal.expiry, cp_type, signal.spread_sell_strike), "side": secondary_side, "ratio_qty": 1}
+                        {"symbol": _alpaca_option_symbol(signal.symbol, signal.expiry, cp_type, _eff_spread_sell_strike), "side": secondary_side, "ratio_qty": 1}
                     ]
 
                 # Construct Payload
@@ -334,9 +564,12 @@ class OptionsExecutor:
                 strike=signal.strike,
                 expiry=signal.expiry,
                 contracts=contracts,
-                entry_price=signal.mid_price,
+                entry_price=_net_entry_price,
                 strategy=signal.strategy,
                 legs=entry_legs,
+                entry_iv=_entry_iv,
+                is_naked=_is_naked_entry,
+                open_stop_pct=_open_stop_pct,
             )
 
             leg_summary = ", ".join(
@@ -459,19 +692,32 @@ class OptionsExecutor:
 
                 # 4. Exit decision  (same_day_entry / pdt_block computed at top of loop)
 
+                # Per-position stop: tighter for open-window entries (25%) vs global (30%)
+                # Must be computed BEFORE the outer check so tighter stops are reachable.
+                _eff_stop = pos.open_stop_pct if pos.open_stop_pct > 0 else OPTIONS_STOP_LOSS_PCT
+
                 if pnl_pct >= OPTIONS_PROFIT_TARGET_PCT:
                     if pdt_block:
                         log.info(f"OPTIONS: {pos.symbol} at target {pnl_pct:.1f}% but PDT blocked")
                     else:
-                        log.info(f"OPTIONS: {pos.symbol} target hit ({pnl_pct:.1f}%) — closing")
+                        log.info(f"OPTIONS: {pos.symbol} target hit ({pnl_pct:.1f}%) -- closing")
                         to_close.append(occ_sym)
 
-                elif pnl_pct <= -OPTIONS_STOP_LOSS_PCT:
+                elif pnl_pct <= -_eff_stop:
                     if same_day_entry:
                         # Never stop out on entry day — let the position breathe overnight
-                        log.debug(
-                            f"OPTIONS: {pos.symbol} at stop ({pnl_pct:.1f}%) but entered today — holding"
-                        )
+                        # Exception: open-window entries have tighter 25% same-day stop
+                        if pos.open_stop_pct > 0:
+                            log.warning(
+                                f"OPTIONS: {pos.symbol} open-window stop {_eff_stop:.0f}% hit "
+                                f"({pnl_pct:.1f}%) same-day — closing"
+                            )
+                            to_close.append(occ_sym)
+                            stop_symbols.append(pos.symbol)
+                        else:
+                            log.debug(
+                                f"OPTIONS: {pos.symbol} at stop ({pnl_pct:.1f}%) but entered today — holding"
+                            )
                     elif not pdt_block:
                         log.warning(f"OPTIONS: {pos.symbol} stop hit ({pnl_pct:.1f}%) — closing")
                         to_close.append(occ_sym)
@@ -500,6 +746,9 @@ class OptionsExecutor:
         # Execute closes
         for occ_sym in to_close:
             self._close_option(occ_sym)
+
+        # IV conversion check (rate-limited to every 10 min, touches only open naked positions)
+        self._maybe_convert_to_spread()
 
     def _close_option(self, occ_sym: str) -> None:
         """Close an options position by reversing all stored legs atomically.

@@ -238,6 +238,21 @@ def is_options_lull_hours() -> bool:
     midday_lull  = 11.5 <= h < 13.75              # 11:30–13:45
     return open_auction or midday_lull
 
+def is_open_window() -> bool:
+    """True during the 9:35–9:45 AM ET open window for regime-side naked options.
+
+    This window is post-auction (spreads have normalised) but before the market
+    settles into its intraday trend.  Only active in live mode.
+    """
+    from engine.config import PAPER
+    if PAPER:
+        return False
+    now = datetime.datetime.now(ET)
+    if now.weekday() >= 5:
+        return False
+    h = now.hour + now.minute / 60.0
+    return (9.5 + 5 / 60.0) <= h < (9.5 + 15 / 60.0)   # 9:35–9:45
+
 # ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 # VIX
 # ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
