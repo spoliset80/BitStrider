@@ -1,47 +1,47 @@
 {
-  "generated_at": "2026-04-16T22:47:52-04:00",
-  "date": "2026-04-16",
+  "generated_at": "2026-04-18T17:25:32-04:00",
+  "date": "2026-04-18",
   "market_regime": "bull",
   "picks": [
     {
-      "symbol": "LUNR",
+      "symbol": "CADL",
       "action": "buy",
-      "price": 27.28,
+      "price": 6.37,
       "confidence": 0.82,
       "strategy": "Sweepea",
-      "reason": "Daily Sweepea pullback to 8-EMA | ATR $2.52"
+      "reason": "Daily Sweepea pullback to 8-EMA | ATR $0.31"
     },
     {
-      "symbol": "BKSY",
+      "symbol": "BETR",
       "action": "buy",
-      "price": 39.0,
+      "price": 41.23,
       "confidence": 0.82,
       "strategy": "Sweepea",
-      "reason": "Daily Sweepea pullback to 8-EMA | ATR $4.06"
+      "reason": "Daily Sweepea pullback to 8-EMA | ATR $4.19"
     },
     {
-      "symbol": "RDW",
+      "symbol": "BOBS",
       "action": "buy",
-      "price": 11.22,
+      "price": 13.02,
       "confidence": 0.82,
       "strategy": "Sweepea",
-      "reason": "Daily Sweepea pullback to 8-EMA | ATR $0.92"
+      "reason": "Daily Sweepea pullback to 20-EMA | ATR $0.89"
     },
     {
-      "symbol": "NUTX",
+      "symbol": "NUAI",
       "action": "buy",
-      "price": 101.76,
+      "price": 4.61,
       "confidence": 0.82,
       "strategy": "Sweepea",
-      "reason": "Daily Sweepea pullback to 20-EMA | ATR $6.41"
+      "reason": "Daily Sweepea pullback to 8-EMA | ATR $0.55"
     },
     {
-      "symbol": "SIDU",
+      "symbol": "ANL",
       "action": "buy",
-      "price": 5.95,
+      "price": 16.01,
       "confidence": 0.82,
       "strategy": "Sweepea",
-      "reason": "Daily Sweepea pullback to 8-EMA | ATR $0.79"
+      "reason": "Daily Sweepea pullback to 8-EMA | ATR $2.32"
     }
   ]
 }

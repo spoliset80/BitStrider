@@ -94,36 +94,48 @@ class OptionsExecutor:
     # ── Allocation / Budget ────────────────────────────────────────────────────
 
     def _get_options_budget(self) -> Tuple[float, float]:
-        """Returns (total_options_budget $, remaining_budget $) based on current equity and Alpaca's options_buying_power.
-        
-        Uses the stricter of:
-        - Configured allocation (15% of equity)
-        - Alpaca's actual options_buying_power (accounts for margin, positions, etc.)
+        """Returns (total_options_budget $, remaining_budget $) using real-time API values.
+
+        Priority order (all sourced from /v2/account — real-time, not dashboard):
+          1. options_buying_power  — options-specific BP (may be None on some account tiers)
+          2. buying_power          — general real-time BP (always present; used as fallback)
+          3. equity * pct          — configured allocation cap (always applied as an upper bound)
+
+        Note: Alpaca dashboard charts show 15-min delayed data. The API fields used here
+        (equity, buying_power, options_buying_power) are all real-time SIP data regardless
+        of whether the account is live or paper.
         """
         try:
-            acct          = self.client.get_account()
-            equity        = float(acct.equity)
-            # Get Alpaca's actual options buying power (most important constraint)
-            alpaca_options_bp = float(getattr(acct, "options_buying_power", 0.0))
-            
-            # Configured allocation as secondary constraint
+            acct              = self.client.get_account()
+            equity            = float(acct.equity)
             configured_budget = equity * (OPTIONS_ALLOCATION_PCT / 100.0)
-            
-            # Deduct current open option premium cost
-            used = self._current_options_cost()
-            
-            # Use the stricter of the two
-            total_budget = min(configured_budget, alpaca_options_bp)
-            remaining = max(0.0, total_budget - used)
-            
-            # Debug: log when Alpaca constraint is binding
-            if alpaca_options_bp < configured_budget:
+
+            # --- Determine the actual available buying power from the API ---
+            # options_buying_power: options-specific; may be None on some live tiers.
+            _raw_obp = getattr(acct, "options_buying_power", None)
+            if _raw_obp is not None and float(_raw_obp) > 0:
+                available_bp = float(_raw_obp)
+                log.debug(f"[OPTIONS] options_buying_power=${available_bp:.2f} (real-time)")
+            else:
+                # Fall back to general buying_power — always present and real-time.
+                available_bp = float(acct.buying_power)
                 log.debug(
-                    f"[OPTIONS] Alpaca OBP ${alpaca_options_bp:.2f} < configured ${configured_budget:.2f} "
-                    f"(limiting budget to ${total_budget:.2f})"
+                    f"[OPTIONS] options_buying_power unavailable — "
+                    f"using buying_power=${available_bp:.2f} (real-time)"
                 )
-            
+
+            # Apply configured allocation as an upper cap so we never over-deploy.
+            total_budget = min(configured_budget, available_bp)
+            if available_bp < configured_budget:
+                log.debug(
+                    f"[OPTIONS] Available BP ${available_bp:.2f} < configured allocation "
+                    f"${configured_budget:.2f} — budget capped at ${total_budget:.2f}"
+                )
+
+            used      = self._current_options_cost()
+            remaining = max(0.0, total_budget - used)
             return total_budget, remaining
+
         except Exception as e:
             log.warning(f"[OPTIONS] Could not fetch account budget: {e}", exc_info=True)
             return 0.0, 0.0
@@ -212,10 +224,15 @@ class OptionsExecutor:
                 return False
 
         # 3. Budget & Contract Calculation
-        _, remaining = self._get_options_budget()
+        total_budget, remaining = self._get_options_budget()
         contracts = self._calc_contracts(signal, remaining)
         if contracts <= 0:
-            log.info(f"[OPTIONS] Insufficient budget for {signal.symbol}")
+            per_contract = signal.mid_price * CONTRACT_SIZE
+            log.info(
+                f"[OPTIONS] Insufficient budget for {signal.symbol} "
+                f"(remaining=${remaining:.2f}, total=${total_budget:.2f}, "
+                f"per_contract=${per_contract:.2f})"
+            )
             return False
 
         # 4. Determine Strategy Type

@@ -34,6 +34,9 @@ import psutil
 try:
     import yfinance as _yf
     _YF_AVAILABLE = True
+    # yfinance logs Yahoo Finance HTTP errors (429, 500) at ERROR level internally.
+    # These are transient API failures we already handle via try/except — suppress the noise.
+    logging.getLogger("yfinance").setLevel(logging.CRITICAL)
 except ImportError:
     _YF_AVAILABLE = False
 import pytz
@@ -1279,6 +1282,8 @@ def _fetch_squeeze_fundamentals(symbol: str) -> Optional[Dict]:
         _squeeze_yf_cache[symbol] = (today, data)
         return data
     except Exception:
+        # Cache the failure for today so we don't hammer Yahoo Finance on every scan cycle.
+        _squeeze_yf_cache[symbol] = (today, None)
         return None
 
 
@@ -2233,7 +2238,9 @@ def scan_options_universe(
         except Exception:
             pass
 
-    _PREFETCH_WORKERS = min(12, _n_total)
+    # Keep workers <= 8 to stay within urllib3's default connection pool size (10)
+    # and avoid "Connection pool is full" discards when scanning large universes.
+    _PREFETCH_WORKERS = min(8, _n_total)
     with concurrent.futures.ThreadPoolExecutor(max_workers=_PREFETCH_WORKERS) as pool:
         list(pool.map(_prefetch, ti_universe))
     log.info(f"Options scan: prefetch complete — starting strategy evaluation")
