@@ -202,7 +202,7 @@ class OptionsChainInfo:
 # -- Chain Fetch & Quality Helpers ---------------------------------------------
 
 _chain_cache: Dict[str, tuple] = {}   # symbol -> (timestamp, OptionsChainInfo)
-_CHAIN_TTL   = 300  # 5-minute cache
+_CHAIN_TTL   = 600  # 10-minute cache — longer than scan cycle so warm entries survive
 _CHAIN_MAX   = OPTIONS_CHAIN_CACHE_MAX  # configurable cache size
 # OI is published once per day by the OCC — cache it per trading day, not per chain TTL
 _oi_cache: Dict[str, tuple] = {}      # symbol -> (date, oi_map)
@@ -2219,11 +2219,14 @@ def scan_options_universe(
     _n_total = len(ti_universe)
     log.info(f"Options scan: starting — {_n_total} ticker(s) in universe")
 
-    # ── Parallel prefetch: bars + OI ──────────────────────────────────────────
-    # Warm _bar_ctx_cache and _oi_cache concurrently before the serial strategy loop.
-    # Each ticker needs: (1) 80d bars → _bar_ctx_cache, (2) OI → _oi_cache.
-    # Chain snapshots (bid/ask/greeks) are fetched lazily inside each strategy's
-    # _get_options_chain() call which already has its own 5-min cache.
+    # ── Parallel prefetch: bars + OI + option chains ────────────────────────
+    # All three data sources are fetched concurrently before the serial strategy loop.
+    # This converts the dominant serial I/O cost (N×3–5s per chain) into parallel I/O
+    # that runs in ~max(single_fetch) time regardless of universe size.
+    #
+    #  (1) 80d bars      → _bar_ctx_cache  (used by every strategy, ADV gate reuses too)
+    #  (2) OI contracts  → _oi_cache       (OCC daily, already cached per trading day)
+    #  (3) option chain  → _chain_cache    (snapshots + greeks, 10-min TTL)
     _bar_ctx_cache.clear()
     exp_gte = today + datetime.timedelta(days=OPTIONS_DTE_MIN)
     exp_lte = today + datetime.timedelta(days=OPTIONS_DTE_MAX)
@@ -2237,20 +2240,26 @@ def scan_options_universe(
             _fetch_oi_from_contracts(sym, exp_gte, exp_lte)  # populates _oi_cache[sym]
         except Exception:
             pass
+        try:
+            _get_options_chain(sym)          # populates _chain_cache[sym]
+        except Exception:
+            pass
 
-    # Keep workers <= 8 to stay within urllib3's default connection pool size (10)
-    # and avoid "Connection pool is full" discards when scanning large universes.
-    _PREFETCH_WORKERS = min(8, _n_total)
+    # Up to 12 workers: chain snapshots are the bottleneck (network I/O bound).
+    # urllib3 default pool size is 10; we stay at 12 because chains and bars
+    # use separate clients (OptionHistoricalDataClient vs StockHistoricalDataClient)
+    # so they don't share the same pool.
+    _PREFETCH_WORKERS = min(12, _n_total)
     with concurrent.futures.ThreadPoolExecutor(max_workers=_PREFETCH_WORKERS) as pool:
         list(pool.map(_prefetch, ti_universe))
     log.info(f"Options scan: prefetch complete — starting strategy evaluation")
     # ─────────────────────────────────────────────────────────────────────────
 
     for _scan_idx, symbol in enumerate(ti_universe, 1):
-        # Dollar volume quality gate: skip thinly-traded names
-        daily = get_bars(symbol, "25d", "1d")
-        if not daily.empty and len(daily) >= 5:
-            adv = float((daily["close"] * daily["volume"].iloc[-20:]).mean())
+        # Dollar volume quality gate — reuse already-prefetched bar context (no extra fetch)
+        _ctx_for_adv = _bar_ctx_cache.get(symbol)
+        if _ctx_for_adv is not None:
+            adv = float((_ctx_for_adv.daily["close"] * _ctx_for_adv.daily["volume"]).iloc[-20:].mean())
             if adv < OPTIONS_MIN_ADV:
                 log.debug(f"Options scan: {symbol} ADV ${adv:,.0f} < ${OPTIONS_MIN_ADV:,.0f} — skip")
                 _record_fail("adv", symbol)
