@@ -120,6 +120,63 @@ class OptionsExecutor:
         self._MONITOR_INTERVAL = 20   # seconds between P&L checks (fast enough to catch intraday moves)
         self._last_iv_convert_ts: float = 0.0
         self._IV_CONVERT_INTERVAL = 600.0  # check spread-conversion every 10 min max
+        self._reconcile_positions()
+
+    def _reconcile_positions(self) -> None:
+        """On startup, re-hydrate _positions from any open options already held in the account.
+        Uses avg_entry_price from Alpaca and conservative defaults (global stop/target, no
+        open-window flag).  This allows monitor_positions() to manage positions entered in a
+        previous session or in paper mode without having to track them from entry.
+        """
+        try:
+            open_pos = [p for p in self.client.get_all_positions()
+                        if getattr(p, "asset_class", "") == "us_option"]
+        except Exception as e:
+            log.warning(f"[OPTIONS] Reconcile: could not fetch positions: {e}")
+            return
+
+        if not open_pos:
+            return
+
+        today = datetime.date.today()
+        for p in open_pos:
+            occ = p.symbol  # full OCC symbol e.g. AAPL260418C00185000
+            if occ in self._positions:
+                continue  # already tracked from this session
+
+            # Parse OCC symbol: <TICKER><YYMMDD><C|P><8-digit-strike>
+            m = re.match(r"^([A-Z]+)(\d{6})([CP])(\d{8})$", occ)
+            if not m:
+                continue
+            ticker, exp_str, cp_char, strike_str = m.groups()
+            try:
+                expiry     = datetime.datetime.strptime(exp_str, "%y%m%d").date()
+                strike     = int(strike_str) / 1000.0
+                opt_type   = "call" if cp_char == "C" else "put"
+                qty        = abs(int(float(p.qty)))
+                side       = "buy" if float(p.qty) > 0 else "sell"
+                action     = "buy_to_open" if side == "buy" else "sell_to_open"
+                entry_px   = float(p.avg_entry_price)
+            except Exception:
+                continue
+
+            self._positions[occ] = OptionsPosition(
+                occ_symbol  = occ,
+                symbol      = ticker,
+                option_type = opt_type,
+                action      = action,
+                strike      = strike,
+                expiry      = expiry,
+                contracts   = qty,
+                entry_price = entry_px,
+                strategy    = "reconciled",
+                legs        = [{"occ_symbol": occ, "side": side, "ratio_qty": 1}],
+                entered_at  = today,   # treat as today so same-day stop applies
+            )
+            log.info(
+                f"[OPTIONS] Reconciled existing position: {occ} "
+                f"{qty}x {opt_type} @{strike} entry=${entry_px:.2f}"
+            )
 
     # ── Allocation / Budget ────────────────────────────────────────────────────
 
