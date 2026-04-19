@@ -536,9 +536,14 @@ class OptionsExecutor:
                 _net_entry_price = _spread_mid_price  # use net debit as position entry_price
 
             if "buy" in signal.action:
-                limit_price = round(_spread_mid_price * 0.99, 2)   # bid below mid
+                limit_price = round(_spread_mid_price * 0.99, 2)   # debit: bid below mid (pay less)
             else:
-                limit_price = round(_spread_mid_price * 1.01, 2)   # offer above mid
+                # sell_to_open (credit strategy)
+                if is_mleg:
+                    # Alpaca mleg convention: positive = debit, NEGATIVE = credit received
+                    limit_price = -round(_spread_mid_price * 1.01, 2)  # offer to receive above mid
+                else:
+                    limit_price = round(_spread_mid_price * 1.01, 2)   # single-leg sell: offer above mid
 
             # ── CASE A: MULTI-LEG (Spreads, Butterflies, Condors) ────────────────
             if is_mleg:
@@ -572,10 +577,11 @@ class OptionsExecutor:
                 payload = {
                     "symbol": "", # Must be empty for MLEG
                     "qty": str(float(contracts)),
-                    "side": "buy",
+                    # "side" intentionally omitted — not required for mleg per Alpaca docs;
+                    # direction is conveyed by each leg's own side field.
                     "type": "limit",
                     "order_class": "mleg",
-                    "limit_price": str(limit_price),
+                    "limit_price": str(limit_price),  # positive=debit, negative=credit
                     "time_in_force": "day",
                     "legs": [
                         {
@@ -829,7 +835,8 @@ class OptionsExecutor:
                 payload = {
                     "symbol": "",
                     "qty": str(float(pos.contracts)),
-                    "side": "sell",
+                    # "side" intentionally omitted — not required for mleg per Alpaca docs;
+                    # each reversed leg carries its own side.
                     "type": "market",
                     "order_class": "mleg",
                     "time_in_force": "day",
