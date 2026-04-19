@@ -171,7 +171,10 @@ class OptionsExecutor:
                 entry_price = entry_px,
                 strategy    = "reconciled",
                 legs        = [{"occ_symbol": occ, "side": side, "ratio_qty": 1}],
-                entered_at  = today,   # treat as today so same-day stop applies
+                # Set to yesterday so same_day_entry=False → normal stop/trailing-stop logic
+                # fires immediately. If entered_at=today and open_stop_pct=0, the monitor
+                # always defers ("entered today — holding") and SL never triggers.
+                entered_at  = today - datetime.timedelta(days=1),
             )
             log.info(
                 f"[OPTIONS] Reconciled existing position: {occ} "
