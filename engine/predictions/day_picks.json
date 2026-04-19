@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-04-19T17:47:29-04:00",
+  "generated_at": "2026-04-19T17:58:05-04:00",
   "date": "2026-04-19",
   "market_regime": "bull",
   "picks": [
@@ -36,12 +36,12 @@
       "reason": "Daily Sweepea pullback to 8-EMA | ATR $0.55"
     },
     {
-      "symbol": "ANL",
+      "symbol": "OPTX",
       "action": "buy",
-      "price": 16.01,
+      "price": 9.1,
       "confidence": 0.82,
       "strategy": "Sweepea",
-      "reason": "Daily Sweepea pullback to 8-EMA | ATR $2.32"
+      "reason": "Daily Sweepea pullback to 20-EMA | ATR $1.43"
     }
   ]
 }

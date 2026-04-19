@@ -160,6 +160,12 @@ class OptionsExecutor:
             except Exception:
                 continue
 
+            # Determine whether the position was opened today or carried overnight.
+            # lastday_price == 0 / None means no price existed at yesterday's close
+            # → position was opened today (same-day entry, PDT rules apply).
+            _lastday = float(getattr(p, "lastday_price", 0) or 0)
+            _entered_at = today if _lastday == 0 else today - datetime.timedelta(days=1)
+
             self._positions[occ] = OptionsPosition(
                 occ_symbol  = occ,
                 symbol      = ticker,
@@ -171,10 +177,7 @@ class OptionsExecutor:
                 entry_price = entry_px,
                 strategy    = "reconciled",
                 legs        = [{"occ_symbol": occ, "side": side, "ratio_qty": 1}],
-                # Set to yesterday so same_day_entry=False → normal stop/trailing-stop logic
-                # fires immediately. If entered_at=today and open_stop_pct=0, the monitor
-                # always defers ("entered today — holding") and SL never triggers.
-                entered_at  = today - datetime.timedelta(days=1),
+                entered_at  = _entered_at,
             )
             log.info(
                 f"[OPTIONS] Reconciled existing position: {occ} "
