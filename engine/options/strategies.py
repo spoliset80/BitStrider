@@ -1,4 +1,4 @@
-﻿"""
+"""
 ApexTrader - Options Strategies (Level 3 Account) — A+ Edition
 Professional-grade options strategies with multi-layer entry filters:
 
@@ -513,6 +513,13 @@ class MomentumCallStrategy:
             if spot < prior_5d_high * 0.995:
                 return None
 
+            # A+ Filter 3b: breakout candle must be highest volume in 10 sessions
+            # Filters slow grind-ups — keeps only institutional-backed breakouts
+            candle_vol      = float(daily["volume"].iloc[-1])
+            ten_day_max_vol = float(daily["volume"].iloc[-11:-1].max())
+            if candle_vol < ten_day_max_vol * 0.90:
+                return None
+
             chain = _get_options_chain(symbol)
             if chain is None:
                 return None
@@ -520,6 +527,12 @@ class MomentumCallStrategy:
             # A+ Filter 4: IV rank -- buy cheap premium only
             if chain.iv_rank > _IV_RANK_CALL_MAX:
                 log.debug(f"MomentumCall {symbol}: IV rank {chain.iv_rank:.0f} > {_IV_RANK_CALL_MAX} (dynamic) -- skip")
+                return None
+
+            # A+ Filter 4b: IV must not exceed 130% of realised HV30
+            # IV rank can show "low" yet IV is still elevated vs actual realised vol
+            if chain.hv_30 > 0 and (chain.iv_rank / max(chain.hv_30, 1)) > 1.3:
+                log.debug(f"MomentumCall {symbol}: IV {chain.iv_rank:.0f} > 130% of HV30 {chain.hv_30:.0f} — skip")
                 return None
 
             strike_row = _pick_strike(chain.calls, spot, OPTIONS_DELTA_TARGET)
@@ -633,6 +646,10 @@ class BearPutStrategy:
                 return None
 
             chg_thresh = -4.0 if bull else -2.0
+            # In bull regime, require RSI ≤ 45 — single-day drops often bounce
+            # without momentum confirmation (don't fight the trend with puts)
+            if bull and rsi > 45:
+                return None
             if chg > chg_thresh:
                 return None
 
@@ -769,10 +786,18 @@ class CoveredCallStrategy:
 
         try:
             daily = get_bars(symbol, "20d", "1d")
-            if daily.empty:
+            if daily.empty or len(daily) < 7:
                 return None
 
-            spot = float(daily["close"].iloc[-1])
+            closes = daily["close"]
+            spot   = float(closes.iloc[-1])
+
+            # Don't sell covered calls during strong uptrends — caps the best gains
+            if len(closes) >= 6:
+                gain_5d = (spot - float(closes.iloc[-6])) / float(closes.iloc[-6]) * 100
+                if gain_5d > 5.0:
+                    log.debug(f"CoveredCall {symbol}: strong 5d uptrend +{gain_5d:.1f}% — skip")
+                    return None
 
             chain = _get_options_chain(symbol)
             if chain is None:
@@ -1147,7 +1172,7 @@ class BreakoutRetestCallStrategy:
                 return None
 
             rsi = _calc_rsi_scalar(closes)
-            if rsi is None or not (48 <= rsi <= 62):
+            if rsi is None or not (48 <= rsi <= 58):  # genuine retest: RSI cooled off
                 return None
 
             avg_vol20 = float(daily["volume"].iloc[-21:-1].mean())
@@ -1314,7 +1339,7 @@ class TrendPullbackSpreadStrategy:
                 return None
 
             spread_rr = round(max_profit / net_debit, 2)
-            if spread_rr < 0.5:
+            if spread_rr < 1.0:  # require max_profit >= net_debit (positive expectancy)
                 return None
 
             dte    = (chain.expiry - datetime.date.today()).days
@@ -1403,6 +1428,10 @@ class MeanReversionCallStrategy:
                 sma200 = float(closes.rolling(200).mean().iloc[-1])
                 if spot < sma200 * 0.85:
                     return None
+
+            # Don't buy calls below 50 EMA — intermediate downtrend bounces fail
+            if not _ema50_above(closes):
+                return None
 
             if not _no_earnings_soon(symbol, OPTIONS_EARNINGS_AVOID_DAYS):
                 log.debug(f"MeanReversion {symbol}: earnings within {OPTIONS_EARNINGS_AVOID_DAYS} days — skip")

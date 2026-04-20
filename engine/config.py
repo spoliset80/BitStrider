@@ -1,4 +1,4 @@
-﻿"""
+"""
 ApexTrader - Configuration
 Professional Automated Trading System
 Modular architecture with multiple strategies and PDT compliance
@@ -37,7 +37,7 @@ OPTIONS_MAX_POSITIONS       = int(os.getenv("OPTIONS_MAX_POSITIONS", "5"))      
 EXTENDED_HOURS_EQUITY_TRADING = os.getenv("EXTENDED_HOURS_EQUITY_TRADING", "false").lower() in ("1", "true", "yes")  # Allow equity trades pre/post market
 OPTIONS_DTE_MIN             = int(os.getenv("OPTIONS_DTE_MIN", "14"))             # min days-to-expiry at entry (14 avoids forced same-day close = PDT hit)
 OPTIONS_DTE_MAX             = int(os.getenv("OPTIONS_DTE_MAX", "40"))             # max days-to-expiry at entry
-OPTIONS_DELTA_TARGET        = float(os.getenv("OPTIONS_DELTA_TARGET", "0.40"))    # target delta (0.30-0.50)
+OPTIONS_DELTA_TARGET        = float(os.getenv("OPTIONS_DELTA_TARGET", "0.45"))   # ATM — max gamma on momentum breakouts    # target delta (0.30-0.50)
 OPTIONS_MIN_OPEN_INTEREST   = int(os.getenv("OPTIONS_MIN_OPEN_INTEREST", "100"))  # keep at 100 for broadest universe
 OPTIONS_MAX_SPREAD_PCT      = float(os.getenv("OPTIONS_MAX_SPREAD_PCT", "10.0"))  # max bid/ask spread % of mid
 OPTIONS_MAX_IV_PCT          = float(os.getenv("OPTIONS_MAX_IV_PCT", "150.0"))     # skip when IV is extreme
@@ -895,3 +895,14 @@ OPTIONS_CHAIN_CACHE_MAX = int(os.getenv("OPTIONS_CHAIN_CACHE_MAX", "300"))  # ma
 
 # Global memory warning threshold (in MB)
 MEMORY_WARN_MB = int(os.getenv("MEMORY_WARN_MB", "1500"))
+
+OPTIONS_TRAIL_ACTIVATE_PCT  = float(os.getenv("OPTIONS_TRAIL_ACTIVATE_PCT", "20.0"))  # trailing stop arms once P&L exceeds this %
+OPTIONS_TRAIL_DRAWDOWN_PCT  = float(os.getenv("OPTIONS_TRAIL_DRAWDOWN_PCT", "15.0"))  # close if pnl drops this many pp from peak
+
+# Options profit improvement config (added stage: options-sl-review)
+OPTIONS_PARTIAL_PROFIT_PCT  = float(os.getenv("OPTIONS_PARTIAL_PROFIT_PCT",  "50.0"))  # take half off at this gain %
+OPTIONS_TIME_EXIT_FLAT_PCT  = float(os.getenv("OPTIONS_TIME_EXIT_FLAT_PCT",  "10.0"))  # max abs P&L for time-based flat exit
+OPTIONS_IV_SPIKE_EXIT_PCT   = float(os.getenv("OPTIONS_IV_SPIKE_EXIT_PCT",   "15.0"))  # min gain before IV spike exit fires
+OPTIONS_IV_SPIKE_RANK_RISE  = float(os.getenv("OPTIONS_IV_SPIKE_RANK_RISE",  "30.0"))  # IV rank rise that triggers the exit
+OPTIONS_CC_DECAY_CLOSE_PCT  = float(os.getenv("OPTIONS_CC_DECAY_CLOSE_PCT",  "50.0"))  # covered call: close at this % decay
+OPTIONS_CC_DTE_CLOSE        = int(os.getenv("OPTIONS_CC_DTE_CLOSE",          "5"))     # covered call: close at this DTE
