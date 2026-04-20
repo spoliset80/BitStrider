@@ -1,47 +1,31 @@
 {
-  "generated_at": "2026-04-19T23:34:57-04:00",
-  "date": "2026-04-19",
+  "generated_at": "2026-04-20T13:34:55-04:00",
+  "date": "2026-04-20",
   "market_regime": "bull",
   "picks": [
     {
-      "symbol": "LITE",
+      "symbol": "SILA",
       "action": "buy",
-      "price": 894.07,
-      "confidence": 0.82,
-      "strategy": "Sweepea",
-      "reason": "Daily Sweepea pullback to 8-EMA | ATR $73.60"
+      "price": 30.435,
+      "confidence": 0.92,
+      "strategy": "Sentiment",
+      "reason": "Sentiment bullish + vol x4.77 + price>20SMA"
     },
     {
-      "symbol": "TDG",
+      "symbol": "MXL",
       "action": "buy",
-      "price": 1265.88,
-      "confidence": 0.82,
-      "strategy": "Sweepea",
-      "reason": "Daily Sweepea pullback to 8-EMA | ATR $41.28"
+      "price": 32.3104,
+      "confidence": 0.92,
+      "strategy": "Sentiment",
+      "reason": "Sentiment bullish + vol x5.32 + price>20SMA"
     },
     {
-      "symbol": "CADL",
+      "symbol": "CMPS",
       "action": "buy",
-      "price": 6.37,
-      "confidence": 0.82,
-      "strategy": "Sweepea",
-      "reason": "Daily Sweepea pullback to 8-EMA | ATR $0.31"
-    },
-    {
-      "symbol": "BETR",
-      "action": "buy",
-      "price": 41.23,
-      "confidence": 0.82,
-      "strategy": "Sweepea",
-      "reason": "Daily Sweepea pullback to 8-EMA | ATR $4.19"
-    },
-    {
-      "symbol": "BOBS",
-      "action": "buy",
-      "price": 13.02,
-      "confidence": 0.82,
-      "strategy": "Sweepea",
-      "reason": "Daily Sweepea pullback to 20-EMA | ATR $0.89"
+      "price": 9.8098,
+      "confidence": 0.9119,
+      "strategy": "Sentiment",
+      "reason": "Sentiment bullish + vol x4.62 + price>20SMA"
     }
   ]
 }

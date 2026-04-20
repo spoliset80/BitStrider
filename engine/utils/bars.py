@@ -23,7 +23,7 @@ ET = pytz.timezone("America/New_York")
 try:
     from alpaca.data.historical import StockHistoricalDataClient
     from alpaca.data.historical import OptionHistoricalDataClient
-    from alpaca.data.requests import StockBarsRequest
+    from alpaca.data.requests import StockBarsRequest, OptionBarsRequest
     from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
     ALPACA_AVAILABLE = True
 except ImportError:
@@ -279,6 +279,84 @@ def get_bars_batch(symbols, period: str = "5d", interval: str = "15m") -> Dict[s
         if s not in results:
             _record_empty_bars(s)
             results[s] = pd.DataFrame()
+    return results
+
+
+def get_option_bars(
+    symbol_or_symbols,
+    timeframe: str = "1d",
+    start: Optional["datetime.datetime"] = None,
+    end: Optional["datetime.datetime"] = None,
+    limit: int = 1000,
+) -> Dict[str, pd.DataFrame]:
+    """Fetch historical OHLCV bars for one or more option OCC symbols.
+
+    Uses Alpaca /v1beta1/options/bars (OptionHistoricalDataClient.get_option_bars).
+
+    Args:
+        symbol_or_symbols: OCC symbol string (e.g. 'AAPL240119C00100000') or list of up to 100.
+        timeframe: Bar size string — '1m', '5m', '15m', '1h', '1d', etc.
+        start: Inclusive start datetime (UTC-aware). Defaults to 30 days ago.
+        end: Inclusive end datetime (UTC-aware). Defaults to now.
+        limit: Max bars to return per symbol (1–10000, default 1000).
+
+    Returns:
+        Dict mapping OCC symbol → normalized DataFrame with columns:
+        time, open, high, low, close, volume, trade_count, vwap.
+        Empty DataFrame for any symbol with no data.
+    """
+    log = logging.getLogger("ApexTrader")
+    if not ALPACA_AVAILABLE:
+        log.warning("Alpaca SDK not available — get_option_bars returning empty")
+        return {}
+
+    if isinstance(symbol_or_symbols, str):
+        symbols = [symbol_or_symbols]
+    else:
+        symbols = list(symbol_or_symbols)
+
+    if not symbols:
+        return {}
+
+    if end is None:
+        end = datetime.datetime.now(pytz.UTC)
+    if start is None:
+        start = end - datetime.timedelta(days=30)
+
+    tf = _parse_timeframe(timeframe)
+    client = get_option_data_client()
+
+    results: Dict[str, pd.DataFrame] = {}
+    BATCH_SIZE = 100  # API max is 100 symbols per request
+
+    for i in range(0, len(symbols), BATCH_SIZE):
+        batch = symbols[i : i + BATCH_SIZE]
+        try:
+            bars = client.get_option_bars(OptionBarsRequest(
+                symbol_or_symbols=batch,
+                timeframe=tf,
+                start=start,
+                end=end,
+                limit=limit,
+            ))
+        except Exception as exc:
+            log.warning(f"[option_bars] Alpaca error for {batch}: {exc}")
+            for s in batch:
+                results[s] = pd.DataFrame()
+            continue
+
+        for sym in batch:
+            if sym not in bars or bars[sym] is None:
+                results[sym] = pd.DataFrame()
+                continue
+            try:
+                df = bars[sym].df.reset_index()
+                df = _normalize_df(df)
+                results[sym] = df
+            except Exception as exc:
+                log.warning(f"[option_bars] parse error for {sym}: {exc}")
+                results[sym] = pd.DataFrame()
+
     return results
 
 

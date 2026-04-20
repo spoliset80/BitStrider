@@ -2315,14 +2315,19 @@ def scan_options_universe(
         except Exception:
             pass
 
-    # Up to 12 workers: chain snapshots are the bottleneck (network I/O bound).
-    # urllib3 default pool size is 10; we stay at 12 because chains and bars
-    # use separate clients (OptionHistoricalDataClient vs StockHistoricalDataClient)
-    # so they don't share the same pool.
-    _PREFETCH_WORKERS = min(12, _n_total)
+    # Cap at 8 workers — both StockHistoricalDataClient and OptionHistoricalDataClient
+    # connect to data.alpaca.markets; urllib3's default pool size is 10 per client,
+    # and all workers may hit the same client simultaneously within _prefetch().
+    # Staying at 8 keeps concurrent connections safely below that limit.
+    _PREFETCH_WORKERS = min(8, _n_total)
     with concurrent.futures.ThreadPoolExecutor(max_workers=_PREFETCH_WORKERS) as pool:
         list(pool.map(_prefetch, ti_universe))
-    log.info(f"Options scan: prefetch complete — starting strategy evaluation")
+    _chains_loaded = sum(1 for sym in ti_universe if _chain_cache.get(sym) and _chain_cache[sym][1] is not None)
+    log.info(
+        f"Options scan: prefetch complete — {_chains_loaded}/{_n_total} chains loaded"
+        + (" (market closed / no active quotes)" if _chains_loaded == 0 else "")
+        + " — starting strategy evaluation"
+    )
     # ─────────────────────────────────────────────────────────────────────────
 
     for _scan_idx, symbol in enumerate(ti_universe, 1):
@@ -2344,6 +2349,11 @@ def scan_options_universe(
                 continue
 
         symbol_got_signal = False
+        # Early-out: if chain failed to prefetch, skip all 9 strategies and record once.
+        _cached_chain = _chain_cache.get(symbol)
+        if _cached_chain is None or _cached_chain[1] is None:
+            _record_fail("chain_none", symbol)
+            continue
         # Try all strategies in priority order; one signal per symbol per cycle
         for strat in (momentum_strat, bear_put_strat, bear_call_strat, squeeze_strat, mean_rev_strat,
                       retest_strat, trend_spread_strat, iron_condor_strat, butterfly_strat):
