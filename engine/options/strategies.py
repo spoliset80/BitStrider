@@ -156,9 +156,28 @@ class OptionSignal:
     open_interest: int   = 0
     rr_ratio:      float = 0.0  # R/R: ATR expected move / premium
     breakeven:     float = 0.0  # breakeven price at expiry
-    # Debit spread fields (TrendPullbackSpread only; None = single-leg)
-    spread_sell_strike: Optional[float] = None   # short leg strike
+    # Debit spread fields (TrendPullbackSpread; None = single-leg)
+    spread_sell_strike: Optional[float] = None   # short leg strike (call spreads)
     spread_sell_mid:    Optional[float] = None   # credit received from short leg per share
+
+    # Iron condor — all 4 legs (None unless option_type == "iron_condor")
+    ic_put_long_strike:  Optional[float] = None  # long  put  (lowest  strike, buy)
+    ic_put_long_mid:     Optional[float] = None
+    ic_put_short_strike: Optional[float] = None  # short put  (2nd lowest, sell)
+    ic_put_short_mid:    Optional[float] = None
+    ic_call_short_strike:Optional[float] = None  # short call (2nd highest, sell)
+    ic_call_short_mid:   Optional[float] = None
+    ic_call_long_strike: Optional[float] = None  # long  call (highest strike, buy)
+    ic_call_long_mid:    Optional[float] = None
+    ic_put_credit:       Optional[float] = None  # credit from put spread at entry
+    ic_call_credit:      Optional[float] = None  # credit from call spread at entry
+
+    # Butterfly — additional legs beyond the main strike (None unless call_butterfly)
+    bf_low_strike:  Optional[float] = None  # long  ITM  call (buy 1)
+    bf_low_mid:     Optional[float] = None
+    bf_high_strike: Optional[float] = None  # long  OTM  call (buy 1)
+    bf_high_mid:    Optional[float] = None
+    bf_max_profit:  Optional[float] = None  # spread_width - net_debit
 
 
 @dataclass
@@ -360,9 +379,11 @@ def _pick_strike(
     chain_df: pd.DataFrame,
     spot: float,
     target_delta: float,
+    direction: str = "call",   # "call" or "put" — controls delta sign handling
 ) -> Optional[pd.Series]:
     """Pick the best strike with A+ quality filters.
     Priority: delta proximity, then ATM. Must pass OI, spread, IV gates.
+    direction: "put" for put chains (delta is negative, compare abs values).
     """
     if chain_df.empty:
         return None
@@ -396,12 +417,18 @@ def _pick_strike(
     if df.empty:
         return None
 
-    # Delta selection
+    # Delta selection — puts have negative delta, use abs() for distance calculation
     if "delta" in df.columns and df["delta"].abs().max() > 0:
         df["delta_dist"] = (df["delta"].abs() - target_delta).abs()
         best = df.loc[df["delta_dist"].idxmin()]
     else:
-        df["strike_dist"] = (df["strike"] - spot).abs()
+        # No delta data: for calls pick lowest OTM, for puts pick highest OTM
+        if direction == "put":
+            df["strike_dist"] = (spot - df["strike"]).clip(lower=0)
+        else:
+            df["strike_dist"] = (df["strike"] - spot).clip(lower=0)
+        if df["strike_dist"].max() == 0:
+            df["strike_dist"] = (df["strike"] - spot).abs()
         best = df.loc[df["strike_dist"].idxmin()]
 
     return best
@@ -994,8 +1021,17 @@ class IronCondorStrategy:
             if not _no_earnings_soon(symbol, OPTIONS_EARNINGS_AVOID_DAYS):
                 return None
             chain = _get_options_chain(symbol)
-            if chain is None or chain.iv_rank < 40:
+            if chain is None or chain.iv_rank < 50:   # raised from 40: need rich premium for 4-leg cost
                 return None
+
+            # BB width gate: only enter condors in genuine consolidation
+            if len(closes) >= 22:
+                bb_std   = float(closes.rolling(20).std().iloc[-1])
+                bb_mean  = float(closes.rolling(20).mean().iloc[-1])
+                bb_width = (bb_std * 4) / max(bb_mean, 1) * 100  # (2σ×2) / price
+                if bb_width > 8.0:   # > 8% wide BB = trending, not consolidating
+                    return None
+
             # Find OTM put/call strikes (delta ~0.20)
             short_put_row = _pick_strike(chain.puts, spot, 0.20, direction="put")
             short_call_row = _pick_strike(chain.calls, spot, 0.20, direction="call")
@@ -1036,6 +1072,9 @@ class IronCondorStrategy:
             conf = 0.70
             conf += min(0.05, (chain.iv_rank - 40) * 0.002)
             confidence = round(min(0.93, conf), 3)
+            put_credit  = round(short_put_mid  - long_put_mid,  3)
+            call_credit = round(short_call_mid - long_call_mid, 3)
+
             return OptionSignal(
                 symbol=symbol,
                 option_type="iron_condor",
@@ -1055,8 +1094,13 @@ class IronCondorStrategy:
                 open_interest=int(short_call_row.get("openinterest", 0)),
                 rr_ratio=round(net_credit / max_loss, 2),
                 breakeven=None,
-                spread_sell_strike=short_call,
-                spread_sell_mid=short_call_mid,
+                # Iron condor legs — all 4 strikes with entry mids
+                ic_put_long_strike=long_put,   ic_put_long_mid=long_put_mid,
+                ic_put_short_strike=short_put, ic_put_short_mid=short_put_mid,
+                ic_call_short_strike=short_call, ic_call_short_mid=short_call_mid,
+                ic_call_long_strike=long_call,   ic_call_long_mid=long_call_mid,
+                ic_put_credit=put_credit,
+                ic_call_credit=call_credit,
             )
         except Exception as e:
             log.debug(f"IronCondor {symbol}: {e}")
@@ -1089,13 +1133,31 @@ class ButterflyStrategy:
             chain = _get_options_chain(symbol)
             if chain is None or chain.iv_rank > 30:
                 return None
-            # ATM strike
+
+            # ATM strike — find closest to current spot
             strikes = sorted(chain.calls["strike"].unique())
             atm_idx = min(range(len(strikes)), key=lambda i: abs(strikes[i] - spot))
             if atm_idx < 1 or atm_idx > len(strikes) - 2:
                 return None
-            low_strike = strikes[atm_idx - 1]
             mid_strike = strikes[atm_idx]
+
+            # Pin proximity: spot must be within 2% of mid strike for profitable butterfly
+            if abs(spot - mid_strike) / spot > 0.02:
+                return None
+
+            # Neutral RSI: 45-55 only (truly rangebound)
+            rsi_val = _calc_rsi_scalar(closes)
+            if rsi_val is None or not (45 <= rsi_val <= 55):
+                return None
+
+            # Low realized vol: BB width below 6% (consolidating environment)
+            if len(closes) >= 22:
+                bb_std   = float(closes.rolling(20).std().iloc[-1])
+                bb_mean  = float(closes.rolling(20).mean().iloc[-1])
+                bb_width = (bb_std * 4) / max(bb_mean, 1) * 100
+                if bb_width > 6.0:
+                    return None
+            low_strike  = strikes[atm_idx - 1]
             high_strike = strikes[atm_idx + 1]
             # Prices
             def _mid(row):
@@ -1124,7 +1186,7 @@ class ButterflyStrategy:
                 action="buy_to_open",
                 strike=mid_strike,
                 expiry=chain.expiry,
-                mid_price=net_debit,
+                mid_price=net_debit,   # net debit = max loss
                 confidence=confidence,
                 reason=(
                     f"Butterfly {low_strike:.0f}/{mid_strike:.0f}/{high_strike:.0f}C "
@@ -1137,8 +1199,12 @@ class ButterflyStrategy:
                 open_interest=int(mid_row.iloc[0].get("openinterest", 0)),
                 rr_ratio=round(max_profit / net_debit, 2),
                 breakeven=None,
+                # Butterfly legs — sell 2 mid (spread_sell), buy low + high separately
                 spread_sell_strike=mid_strike,
                 spread_sell_mid=mid_mid,
+                bf_low_strike=low_strike,   bf_low_mid=low_mid,
+                bf_high_strike=high_strike, bf_high_mid=high_mid,
+                bf_max_profit=max_profit,
             )
         except Exception as e:
             log.debug(f"Butterfly {symbol}: {e}")

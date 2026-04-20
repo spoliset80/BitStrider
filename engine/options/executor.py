@@ -98,9 +98,17 @@ def _alpaca_option_symbol(symbol: str, expiry: datetime.date, option_type: str, 
 
 # ── Position dataclass ────────────────────────────────────────────────────────
 
+# ── Position types ───────────────────────────────────────────────────────────
+PTYPE_SINGLE    = "single"
+PTYPE_SPREAD    = "spread"
+PTYPE_CONDOR    = "condor"
+PTYPE_BUTTERFLY = "butterfly"
+PTYPE_COVERED   = "covered"
+
+
 @dataclass
 class OptionsPosition:
-    """Tracked open options position."""
+    """Tracked open options position — supports single-leg, spreads, condors, butterflies."""
     occ_symbol:       str
     symbol:           str
     option_type:      str
@@ -108,16 +116,33 @@ class OptionsPosition:
     strike:           float
     expiry:           datetime.date
     contracts:        int
-    entry_price:      float         # per-share net debit/credit at entry
+    entry_price:      float         # per-share net debit paid / net credit received
     strategy:         str
+    position_type:    str  = PTYPE_SINGLE  # one of the PTYPE_* constants above
     entered_at:       datetime.date = field(default_factory=datetime.date.today)
-    peak_pnl_pct:     float  = 0.0  # highest observed P&L % (trailing stop ref)
-    iv_rank_at_entry: float  = 0.0  # IV rank when position was opened
-    partial_taken:    bool   = False # True once 50% partial profit has been closed
-    # Spread legs (None for single-leg)
+    peak_pnl_pct:     float  = 0.0
+    iv_rank_at_entry: float  = 0.0
+    partial_taken:    bool   = False
+    # ── All legs as a list: [{occ, side, qty_ratio}] ─────────────────────────
+    # Empty for single-leg. For multi-leg, every non-primary leg is listed here.
+    # side: "buy" = long leg / buy-to-close; "sell" = short leg / sell-to-close
+    legs: list = field(default_factory=list)
+    # ── Debit spread (PTYPE_SPREAD) ───────────────────────────────────────────
     short_occ_symbol:  Optional[str]   = None
     short_strike:      Optional[float] = None
     short_entry_price: Optional[float] = None
+    # ── Iron condor (PTYPE_CONDOR) ────────────────────────────────────────────
+    ic_put_long_occ:    Optional[str]   = None
+    ic_put_short_occ:   Optional[str]   = None
+    ic_call_short_occ:  Optional[str]   = None
+    ic_call_long_occ:   Optional[str]   = None
+    ic_put_credit:      Optional[float] = None  # credit from put  spread at entry
+    ic_call_credit:     Optional[float] = None  # credit from call spread at entry
+    # ── Butterfly (PTYPE_BUTTERFLY) ───────────────────────────────────────────
+    bf_low_occ:    Optional[str]   = None   # long ITM call (buy 1)
+    bf_high_occ:   Optional[str]   = None   # long OTM call (buy 1)
+    bf_sell_occ:   Optional[str]   = None   # short ATM call (sell 2)
+    bf_max_profit: Optional[float] = None   # spread_width - net_debit
 
 
 # ── Executor ──────────────────────────────────────────────────────────────────
@@ -310,8 +335,23 @@ class OptionsExecutor:
             log.info(f"[OPTIONS] {signal.symbol} — not enough budget for 1 contract")
             return False
 
-        occ_sym = _alpaca_option_symbol(
-            signal.symbol, signal.expiry, signal.option_type, signal.strike
+        # Route to correct placement method by option type
+        opt_type = signal.option_type
+        if opt_type == "iron_condor":
+            return self._place_condor(signal, contracts)
+        elif opt_type == "call_butterfly":
+            return self._place_butterfly(signal, contracts)
+        else:
+            return self._place_single_or_spread(signal, contracts)
+
+    # ── _place_single_or_spread ───────────────────────────────────────────────
+
+    def _place_single_or_spread(self, signal, contracts: int) -> bool:
+        """Place a single-leg or 2-leg debit spread order."""
+        from .strategies import _alpaca_option_symbol as _occ
+        opt_type = signal.option_type
+        occ_sym  = _alpaca_option_symbol(
+            signal.symbol, signal.expiry, opt_type, signal.strike
         )
         if occ_sym in self._positions:
             log.info(f"[OPTIONS] Already have {occ_sym}")
@@ -319,12 +359,11 @@ class OptionsExecutor:
 
         side        = OrderSide.BUY if signal.action == "buy_to_open" else OrderSide.SELL
         is_spread   = signal.spread_sell_strike is not None and signal.spread_sell_mid is not None
-        # Long leg limit: 2% above mid to ensure fill
         long_mid    = signal.mid_price + (signal.spread_sell_mid or 0) if is_spread else signal.mid_price
         limit_price = round(long_mid * (1.02 if side == OrderSide.BUY else 0.98), 2)
 
         try:
-            order_req = LimitOrderRequest(
+            order_req  = LimitOrderRequest(
                 symbol=occ_sym, qty=contracts, side=side,
                 type="limit", time_in_force=TimeInForce.DAY,
                 limit_price=limit_price,
@@ -335,52 +374,45 @@ class OptionsExecutor:
                 f"@ ${limit_price:.2f} | {signal.reason} | conf={signal.confidence:.0%}"
             )
 
-            # Spread: submit short leg and verify fill within 30s
-            short_occ   = None
-            short_entry = None
-            if is_spread and signal.spread_sell_strike is not None:
+            short_occ = short_entry = None
+            if is_spread:
+                # Debit spread — short leg is always a call for call spreads,
+                # always a put for put spreads; infer from option_type
+                spread_type = "put" if opt_type == "put" else "call"
                 short_occ   = _alpaca_option_symbol(
-                    signal.symbol, signal.expiry, "call", signal.spread_sell_strike
+                    signal.symbol, signal.expiry, spread_type, signal.spread_sell_strike
                 )
                 short_limit = round((signal.spread_sell_mid or 0) * 0.98, 2)
                 try:
-                    short_req = LimitOrderRequest(
+                    short_order = self.client.submit_order(LimitOrderRequest(
                         symbol=short_occ, qty=contracts, side=OrderSide.SELL,
                         type="limit", time_in_force=TimeInForce.DAY,
                         limit_price=short_limit,
-                    )
-                    short_order = self.client.submit_order(short_req)
+                    ))
                     log.info(f"[OPTIONS] SPREAD SHORT: SELL {contracts}x {short_occ} @ ${short_limit:.2f}")
-
-                    # Verify short leg fills within 30s to avoid naked position
+                    # Verify within 30s
                     time.sleep(30)
                     open_ids = {str(o.id) for o in (self.client.get_orders() or [])}
                     if str(short_order.id) in open_ids:
-                        log.error(
-                            f"[OPTIONS] Spread short {short_occ} unfilled after 30s — "
-                            f"cancelling both legs to avoid naked position"
-                        )
+                        log.error(f"[OPTIONS] Spread short {short_occ} unfilled — cancelling")
                         for oid in (str(long_order.id), str(short_order.id)):
-                            try:
-                                self.client.cancel_order_by_id(oid)
-                            except Exception:
-                                pass
+                            try: self.client.cancel_order_by_id(oid)
+                            except Exception: pass
                         return False
                     short_entry = signal.spread_sell_mid
                 except Exception as e:
-                    log.warning(f"[OPTIONS] Spread short-leg failed {short_occ}: {e} — cancelling long leg")
-                    try:
-                        self.client.cancel_order_by_id(str(long_order.id))
-                    except Exception:
-                        pass
+                    log.warning(f"[OPTIONS] Spread short failed {short_occ}: {e} — cancelling long")
+                    try: self.client.cancel_order_by_id(str(long_order.id))
+                    except Exception: pass
                     return False
 
+            ptype = PTYPE_SPREAD if is_spread else (PTYPE_COVERED if signal.action == "sell_to_open" else PTYPE_SINGLE)
             self._positions[occ_sym] = OptionsPosition(
                 occ_symbol=occ_sym, symbol=signal.symbol,
-                option_type=signal.option_type, action=signal.action,
+                option_type=opt_type, action=signal.action,
                 strike=signal.strike, expiry=signal.expiry,
                 contracts=contracts, entry_price=signal.mid_price,
-                strategy=signal.strategy,
+                strategy=signal.strategy, position_type=ptype,
                 iv_rank_at_entry=float(signal.iv_rank),
                 short_occ_symbol=short_occ,
                 short_strike=signal.spread_sell_strike if is_spread else None,
@@ -392,9 +424,222 @@ class OptionsExecutor:
             log.error(f"[OPTIONS] Order failed {occ_sym}: {e}")
             return False
 
+    # ── _place_condor ─────────────────────────────────────────────────────────
+
+    def _place_condor(self, signal, contracts: int) -> bool:
+        """Submit all 4 iron condor legs; cancel all if any fail within 30s."""
+        sym    = signal.symbol
+        expiry = signal.expiry
+        occ_pl = _alpaca_option_symbol(sym, expiry, "put",  signal.ic_put_long_strike)
+        occ_ps = _alpaca_option_symbol(sym, expiry, "put",  signal.ic_put_short_strike)
+        occ_cs = _alpaca_option_symbol(sym, expiry, "call", signal.ic_call_short_strike)
+        occ_cl = _alpaca_option_symbol(sym, expiry, "call", signal.ic_call_long_strike)
+
+        if occ_cs in self._positions or occ_ps in self._positions:
+            log.info(f"[OPTIONS] Condor legs already held for {sym}")
+            return False
+
+        # Use short-call OCC as the primary key (it's the defining short leg)
+        primary_occ = occ_cs
+
+        leg_orders = {}
+        # (occ, side, limit_price)
+        leg_defs = [
+            (occ_pl, OrderSide.BUY,  round(signal.ic_put_long_mid  * 1.04, 2)),
+            (occ_ps, OrderSide.SELL, round(signal.ic_put_short_mid * 0.96, 2)),
+            (occ_cs, OrderSide.SELL, round(signal.ic_call_short_mid* 0.96, 2)),
+            (occ_cl, OrderSide.BUY,  round(signal.ic_call_long_mid * 1.04, 2)),
+        ]
+        try:
+            for occ, side, lp in leg_defs:
+                o = self.client.submit_order(LimitOrderRequest(
+                    symbol=occ, qty=contracts, side=side,
+                    type="limit", time_in_force=TimeInForce.DAY,
+                    limit_price=lp,
+                ))
+                leg_orders[occ] = str(o.id)
+                log.info(f"[OPTIONS] CONDOR LEG: {side.value.upper()} {contracts}x {occ} @ ${lp:.2f}")
+        except Exception as e:
+            log.error(f"[OPTIONS] Condor leg submission failed {sym}: {e} — cancelling all")
+            for oid in leg_orders.values():
+                try: self.client.cancel_order_by_id(oid)
+                except Exception: pass
+            return False
+
+        # Verify all 4 filled within 30s
+        time.sleep(30)
+        open_ids = {str(o.id) for o in (self.client.get_orders() or [])}
+        unfilled = [occ for occ, oid in leg_orders.items() if oid in open_ids]
+        if unfilled:
+            log.error(f"[OPTIONS] Condor {unfilled} unfilled after 30s — cancelling all legs")
+            for oid in leg_orders.values():
+                try: self.client.cancel_order_by_id(oid)
+                except Exception: pass
+            return False
+
+        self._positions[primary_occ] = OptionsPosition(
+            occ_symbol=primary_occ, symbol=sym,
+            option_type="iron_condor", action="sell_to_open",
+            strike=float(signal.ic_call_short_strike), expiry=expiry,
+            contracts=contracts, entry_price=signal.mid_price,
+            strategy=signal.strategy, position_type=PTYPE_CONDOR,
+            iv_rank_at_entry=float(signal.iv_rank),
+            legs=[
+                {"occ": occ_pl, "side": "buy",  "ratio": 1},
+                {"occ": occ_ps, "side": "sell", "ratio": 1},
+                {"occ": occ_cs, "side": "sell", "ratio": 1},
+                {"occ": occ_cl, "side": "buy",  "ratio": 1},
+            ],
+            ic_put_long_occ=occ_pl, ic_put_short_occ=occ_ps,
+            ic_call_short_occ=occ_cs, ic_call_long_occ=occ_cl,
+            ic_put_credit=signal.ic_put_credit,
+            ic_call_credit=signal.ic_call_credit,
+        )
+        log.info(
+            f"[OPTIONS] CONDOR OPEN: {sym} "
+            f"{signal.ic_put_long_strike:.0f}/{signal.ic_put_short_strike:.0f}P "
+            f"{signal.ic_call_short_strike:.0f}/{signal.ic_call_long_strike:.0f}C "
+            f"net=${signal.mid_price:.2f} | conf={signal.confidence:.0%}"
+        )
+        return True
+
+    # ── _place_butterfly ──────────────────────────────────────────────────────
+
+    def _place_butterfly(self, signal, contracts: int) -> bool:
+        """Submit all 3 butterfly legs (buy low, sell 2× mid, buy high)."""
+        sym    = signal.symbol
+        expiry = signal.expiry
+        occ_low  = _alpaca_option_symbol(sym, expiry, "call", signal.bf_low_strike)
+        occ_mid  = _alpaca_option_symbol(sym, expiry, "call", signal.strike)
+        occ_high = _alpaca_option_symbol(sym, expiry, "call", signal.bf_high_strike)
+
+        if occ_mid in self._positions:
+            log.info(f"[OPTIONS] Butterfly mid leg {occ_mid} already held")
+            return False
+
+        leg_defs = [
+            (occ_low,  OrderSide.BUY,  round(signal.bf_low_mid  * 1.04, 2), 1),
+            (occ_mid,  OrderSide.SELL, round(signal.spread_sell_mid * 0.96, 2), 2),
+            (occ_high, OrderSide.BUY,  round(signal.bf_high_mid * 1.04, 2), 1),
+        ]
+        leg_orders = {}
+        try:
+            for occ, side, lp, qty_ratio in leg_defs:
+                o = self.client.submit_order(LimitOrderRequest(
+                    symbol=occ, qty=contracts * qty_ratio, side=side,
+                    type="limit", time_in_force=TimeInForce.DAY,
+                    limit_price=lp,
+                ))
+                leg_orders[occ] = str(o.id)
+                log.info(f"[OPTIONS] BUTTERFLY LEG: {side.value.upper()} {contracts*qty_ratio}x {occ} @ ${lp:.2f}")
+        except Exception as e:
+            log.error(f"[OPTIONS] Butterfly leg failed {sym}: {e} — cancelling all")
+            for oid in leg_orders.values():
+                try: self.client.cancel_order_by_id(oid)
+                except Exception: pass
+            return False
+
+        # Verify all filled within 30s
+        time.sleep(30)
+        open_ids = {str(o.id) for o in (self.client.get_orders() or [])}
+        if any(oid in open_ids for oid in leg_orders.values()):
+            log.error(f"[OPTIONS] Butterfly legs unfilled — cancelling")
+            for oid in leg_orders.values():
+                try: self.client.cancel_order_by_id(oid)
+                except Exception: pass
+            return False
+
+        self._positions[occ_mid] = OptionsPosition(
+            occ_symbol=occ_mid, symbol=sym,
+            option_type="call_butterfly", action="buy_to_open",
+            strike=float(signal.strike), expiry=expiry,
+            contracts=contracts, entry_price=signal.mid_price,
+            strategy=signal.strategy, position_type=PTYPE_BUTTERFLY,
+            iv_rank_at_entry=float(signal.iv_rank),
+            legs=[
+                {"occ": occ_low,  "side": "buy",  "ratio": 1},
+                {"occ": occ_mid,  "side": "sell", "ratio": 2},
+                {"occ": occ_high, "side": "buy",  "ratio": 1},
+            ],
+            bf_low_occ=occ_low, bf_high_occ=occ_high, bf_sell_occ=occ_mid,
+            bf_max_profit=signal.bf_max_profit,
+        )
+        log.info(
+            f"[OPTIONS] BUTTERFLY OPEN: {sym} "
+            f"{signal.bf_low_strike:.0f}/{signal.strike:.0f}/{signal.bf_high_strike:.0f}C "
+            f"debit=${signal.mid_price:.2f} max=${signal.bf_max_profit:.2f} | conf={signal.confidence:.0%}"
+        )
+        return True
+
+    # ── _close_all_legs ───────────────────────────────────────────────────────
+
+    def _close_all_legs(self, pos: 'OptionsPosition', urgency: str = "normal") -> None:
+        """Close all legs of a multi-leg position by reversing each leg."""
+        reverse = {"buy": OrderSide.SELL, "sell": OrderSide.BUY}
+        for leg in pos.legs:
+            occ  = leg["occ"]
+            side = reverse[leg["side"]]
+            qty  = pos.contracts * leg["ratio"]
+            mid  = self._get_mid(occ)
+            if mid > 0:
+                mult = (0.90 if urgency == "stop" else 0.96) if side == OrderSide.SELL                   else (1.10 if urgency == "stop" else 1.04)
+                req = LimitOrderRequest(
+                    symbol=occ, qty=qty, side=side,
+                    time_in_force=TimeInForce.DAY,
+                    limit_price=round(mid * mult, 2),
+                )
+            else:
+                req = MarketOrderRequest(symbol=occ, qty=qty, side=side, time_in_force=TimeInForce.DAY)
+            try:
+                self.client.submit_order(req)
+                log.info(f"[OPTIONS] LEG CLOSE {side.value.upper()} {qty}x {occ}")
+            except Exception as e:
+                log.error(f"[OPTIONS] Leg close failed {occ}: {e}")
+
+    # ── Condor per-side close ─────────────────────────────────────────────────
+
+    def _close_condor_side(self, pos: 'OptionsPosition', side: str, urgency: str) -> None:
+        """Close one side (put or call) of an iron condor."""
+        if side == "put":
+            legs = [
+                {"occ": pos.ic_put_short_occ, "side": "sell"},  # buy-to-close short put
+                {"occ": pos.ic_put_long_occ,  "side": "buy"},   # sell-to-close long put
+            ]
+        else:
+            legs = [
+                {"occ": pos.ic_call_short_occ, "side": "sell"},
+                {"occ": pos.ic_call_long_occ,  "side": "buy"},
+            ]
+        reverse = {"buy": OrderSide.SELL, "sell": OrderSide.BUY}
+        for leg in legs:
+            if not leg["occ"]:
+                continue
+            close_side = reverse[leg["side"]]
+            mid = self._get_mid(leg["occ"])
+            mult = (0.90 if urgency == "stop" else 0.96) if close_side == OrderSide.SELL               else (1.10 if urgency == "stop" else 1.04)
+            req = LimitOrderRequest(
+                symbol=leg["occ"], qty=pos.contracts, side=close_side,
+                time_in_force=TimeInForce.DAY,
+                limit_price=round(mid * mult, 2),
+            ) if mid > 0 else MarketOrderRequest(
+                symbol=leg["occ"], qty=pos.contracts,
+                side=close_side, time_in_force=TimeInForce.DAY,
+            )
+            try:
+                self.client.submit_order(req)
+                log.info(f"[OPTIONS] CONDOR {side.upper()} SIDE CLOSE {close_side.value.upper()} {pos.contracts}x {leg['occ']}")
+            except Exception as e:
+                log.error(f"[OPTIONS] Condor side close failed {leg['occ']}: {e}")
+
     # ── Aggressive limit close ────────────────────────────────────────────────
 
     def _close_option(self, occ_sym: str, qty: Optional[int] = None, urgency: str = "normal") -> None:
+        # Route multi-leg positions to their proper close method
+        pos = self._positions.get(occ_sym)
+        if pos and pos.position_type in (PTYPE_CONDOR, PTYPE_BUTTERFLY):
+            self._close_all_legs(pos, urgency)
+            del self._positions[occ_sym]
+            return
         """Close an options position using an aggressive limit order.
 
         Never uses market orders — options spreads make market fills catastrophic.
@@ -466,18 +711,106 @@ class OptionsExecutor:
 
     # ── P&L monitoring ────────────────────────────────────────────────────────
 
-    def monitor_positions(self) -> None:
-        """Evaluate all open options positions and apply exit rules.
+    # ── Per-type monitor helpers ──────────────────────────────────────────────
 
-        Exit triggers (evaluated in priority order):
-        1. DTE ≤ 1              → close (expiry risk)
-        2. P&L ≤ stop threshold → close (stop loss)
-        3. Partial at +50%      → partial close first half (if contracts > 1)
-        4. P&L ≥ IV-scaled TP   → full close (profit target)
-        5. IV spike exit         → close calls when IV surges post-entry
-        6. Trailing stop         → close when peak - current ≥ scaled drawdown
-        7. Time exit             → close flat positions at 50% DTE elapsed
-        8. Covered call decay    → close at 50% decay or DTE ≤ 5
+    def _monitor_condor(
+        self, occ_sym: str, pos: "OptionsPosition",
+        all_pos: dict, today: datetime.date,
+    ) -> Optional[Tuple[str, str]]:
+        """Iron condor: per-side stop at 2× credit, full close at 50% profit.
+        Returns (action, urgency) or None. action: 'close_all'|'close_put'|'close_call'
+        """
+        dte = (pos.expiry - today).days
+        if dte <= 5:
+            log.info(f"[OPTIONS] Condor {occ_sym} DTE={dte} — theta risk, closing all")
+            return ("close_all", "normal")
+
+        # Fetch all 4 leg prices
+        leg_prices = {}
+        for leg in pos.legs:
+            lp = all_pos.get(leg["occ"])
+            leg_prices[leg["occ"]] = float(lp.current_price) if lp else 0.0
+
+        put_short_price  = leg_prices.get(pos.ic_put_short_occ,  0.0)
+        put_long_price   = leg_prices.get(pos.ic_put_long_occ,   0.0)
+        call_short_price = leg_prices.get(pos.ic_call_short_occ, 0.0)
+        call_long_price  = leg_prices.get(pos.ic_call_long_occ,  0.0)
+
+        # Cost-to-close each spread (positive = debit to close)
+        put_close_cost  = put_short_price  - put_long_price   # buy short, sell long
+        call_close_cost = call_short_price - call_long_price
+
+        put_credit  = pos.ic_put_credit  or 0.001
+        call_credit = pos.ic_call_credit or 0.001
+
+        # Per-side stop: if cost to close > 2× original credit, the spread is tested
+        put_tested  = put_close_cost  >= 2.0 * put_credit
+        call_tested = call_close_cost >= 2.0 * call_credit
+
+        if put_tested and call_tested:
+            log.warning(f"[OPTIONS] Condor {occ_sym} both sides tested — closing all (double breach)")
+            return ("close_all", "stop")
+        if call_tested:
+            log.warning(f"[OPTIONS] Condor {occ_sym} call side tested (close=${call_close_cost:.2f} vs credit=${call_credit:.2f}) — closing call spread")
+            return ("close_call", "stop")
+        if put_tested:
+            log.warning(f"[OPTIONS] Condor {occ_sym} put side tested (close=${put_close_cost:.2f} vs credit=${put_credit:.2f}) — closing put spread")
+            return ("close_put", "stop")
+
+        # Profit target: close whole condor when buy-back costs 50% of original credit
+        total_credit     = put_credit + call_credit
+        total_close_cost = put_close_cost + call_close_cost
+        if total_close_cost <= total_credit * 0.50:
+            log.info(f"[OPTIONS] Condor {occ_sym} 50% profit target reached — closing")
+            return ("close_all", "normal")
+
+        return None
+
+    def _monitor_butterfly(
+        self, occ_sym: str, pos: "OptionsPosition",
+        all_pos: dict, today: datetime.date,
+    ) -> Optional[str]:
+        """Butterfly: close at 60% of max profit or DTE ≤ 7. No time-based flat exit.
+        Returns urgency if should close, else None.
+        """
+        dte = (pos.expiry - today).days
+        if dte <= 7:
+            log.info(f"[OPTIONS] Butterfly {occ_sym} DTE={dte} — take what we have, closing")
+            return "normal"
+
+        # Compute net current value: low + high legs - 2× mid
+        low_p  = float(all_pos[pos.bf_low_occ].current_price)  if pos.bf_low_occ  and all_pos.get(pos.bf_low_occ)  else 0.0
+        mid_p  = float(all_pos[pos.bf_sell_occ].current_price) if pos.bf_sell_occ and all_pos.get(pos.bf_sell_occ) else 0.0
+        high_p = float(all_pos[pos.bf_high_occ].current_price) if pos.bf_high_occ and all_pos.get(pos.bf_high_occ) else 0.0
+        net_val = low_p + high_p - 2 * mid_p
+
+        max_profit = pos.bf_max_profit or 1.0
+        net_debit  = pos.entry_price
+
+        # Near-total loss stop: close if current value < 20% of net debit paid
+        # (use time-weighted: only fire after 40% of DTE elapsed)
+        days_held = (today - pos.entered_at).days
+        total_dte = max((pos.expiry - pos.entered_at).days, 1)
+        if days_held >= total_dte * 0.4 and net_val < net_debit * 0.20:
+            log.warning(f"[OPTIONS] Butterfly {occ_sym} near-total loss (val=${net_val:.2f} vs debit=${net_debit:.2f}) — closing")
+            return "stop"
+
+        # Profit target: 60% of max profit
+        profit_of_max = (net_val - net_debit) / max_profit * 100
+        if profit_of_max >= 60.0:
+            log.info(f"[OPTIONS] Butterfly {occ_sym} {profit_of_max:.0f}% of max profit — closing")
+            return "normal"
+
+        return None
+
+    def monitor_positions(self) -> None:
+        """Evaluate all open positions and apply per-type SL/TP logic.
+
+        Dispatches by position_type:
+          single / spread → directional P&L with IV-scaled TP and scaled trail
+          condor          → per-side 2× credit stop, 50% premium decay target
+          butterfly       → time-weighted stop, 60% of max profit target
+          covered         → 50% premium decay, DTE ≤ 5
         """
         if not self._positions:
             return
@@ -502,7 +835,27 @@ class OptionsExecutor:
                 to_close_full.append((occ_sym, "normal"))
                 continue
 
-            # ── Fetch current price ───────────────────────────────────────────
+            # ── Per-type dispatch ─────────────────────────────────────────────
+            if pos.position_type == PTYPE_CONDOR:
+                result = self._monitor_condor(occ_sym, pos, all_positions, today)
+                if result:
+                    action, urgency = result
+                    if action == "close_all":
+                        to_close_full.append((occ_sym, urgency))
+                    elif action == "close_call":
+                        self._close_condor_side(pos, "call", urgency)
+                    elif action == "close_put":
+                        self._close_condor_side(pos, "put", urgency)
+                continue
+
+            if pos.position_type == PTYPE_BUTTERFLY:
+                urgency = self._monitor_butterfly(occ_sym, pos, all_positions, today)
+                if urgency:
+                    to_close_full.append((occ_sym, urgency))
+                    _record_result(pos.strategy, urgency == "normal")
+                continue
+
+            # ── Fetch current price (single/spread/covered) ───────────────────
             ap = all_positions.get(occ_sym)
             if ap is None:
                 log.info(f"[OPTIONS] {occ_sym} no longer in positions — removing")
