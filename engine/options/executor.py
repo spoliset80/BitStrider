@@ -306,6 +306,50 @@ class OptionsExecutor:
                     )
                     continue
 
+            # ── Detect CALL/PUT SPREAD: 2 same-type legs [+N, -N] ───────────
+            for opt_legs in (calls, puts):
+                if len(opt_legs) == 2 and all(l["occ"] not in registered for l in opt_legs):
+                    l0, l1 = opt_legs[0], opt_legs[1]   # sorted asc by strike
+                    if l0["qty"] > 0 and l1["qty"] < 0 and l0["qty"] == abs(l1["qty"]):
+                        # Debit spread: buy lower strike, sell higher strike
+                        buy_leg, sell_leg = l0, l1
+                    elif l0["qty"] < 0 and l1["qty"] > 0 and abs(l0["qty"]) == l1["qty"]:
+                        # Credit spread: sell lower strike, buy higher strike
+                        buy_leg, sell_leg = l1, l0
+                    else:
+                        continue
+
+                    n         = abs(buy_leg["qty"])
+                    opt_type  = buy_leg["opt_type"]
+                    # net_debit: positive for debit spreads, negative for credit spreads
+                    net_debit = round(buy_leg["entry_px"] - sell_leg["entry_px"], 3)
+                    primary_occ = buy_leg["occ"]
+                    spread_name = f"{opt_type}_spread"
+                    self._positions[primary_occ] = OptionsPosition(
+                        occ_symbol  = primary_occ,
+                        symbol      = ticker,
+                        option_type = spread_name,
+                        action      = "buy_to_open" if net_debit > 0 else "sell_to_open",
+                        strike      = buy_leg["strike"],
+                        expiry      = expiry,
+                        contracts   = n,
+                        entry_price = net_debit,
+                        strategy    = "reconciled_spread",
+                        legs        = [
+                            {"occ_symbol": buy_leg["occ"],  "side": "buy",  "ratio_qty": 1},
+                            {"occ_symbol": sell_leg["occ"], "side": "sell", "ratio_qty": 1},
+                        ],
+                        entered_at  = buy_leg["entered_at"],
+                    )
+                    registered.add(buy_leg["occ"])
+                    registered.add(sell_leg["occ"])
+                    direction = "DEBIT" if net_debit > 0 else "CREDIT"
+                    log.info(
+                        f"[OPTIONS] Reconciled {opt_type.upper()} {direction} SPREAD: {ticker} "
+                        f"{buy_leg['strike']:.2f}/{sell_leg['strike']:.2f} "
+                        f"net={'${:.3f}'.format(net_debit)} ×{n}c"
+                    )
+
             # ── Fall through: register remaining legs as individual positions ─
             for item in items:
                 if item["occ"] in self._positions or item["occ"] in registered:
