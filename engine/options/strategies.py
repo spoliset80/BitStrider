@@ -2259,15 +2259,7 @@ def scan_options_universe(
     if not OPTIONS_ENABLED:
         return []
 
-    # Refresh regime-adaptive filter globals so they reflect current market conditions
-    global f["MAX_SPREAD_PCT"], f["MIN_OI_ATM"], f["MAX_PREMIUM_SPOT"], f["MIN_RR"], f["IV_RANK_CALL_MAX"], f["IV_RANK_PUT_MAX"]
-    _f = get_dynamic_option_filters()
-    f["MAX_SPREAD_PCT"]   = _f["MAX_SPREAD_PCT"]
-    f["MIN_OI_ATM"]       = _f["MIN_OI_ATM"]
-    f["MAX_PREMIUM_SPOT"] = _f["MAX_PREMIUM_SPOT"]
-    f["MIN_RR"]           = _f["MIN_RR"]
-    f["IV_RANK_CALL_MAX"] = _f["IV_RANK_CALL_MAX"]
-    f["IV_RANK_PUT_MAX"]  = _f["IV_RANK_PUT_MAX"]
+    # Strategies call _get_filters() per scan() — no global refresh needed here
 
     ti_universe = get_options_universe()
     if not ti_universe:
