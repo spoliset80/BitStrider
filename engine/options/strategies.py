@@ -555,6 +555,10 @@ class _BarCtx:
 def _fetch_bar_context(symbol: str) -> Optional[_BarCtx]:
     """Fetch 80-day daily bars and compute common indicators for all strategies.
 
+    During market hours, overlays live intraday price and volume so that
+    spot, chg_pct, and cur_vol reflect the actual current session — not
+    yesterday's stale close.  RSI/EMA/ATR still use daily closes (correct).
+
     Returns None if data is insufficient or spot is below OPTIONS_MIN_STOCK_PRICE.
     All strategies should call this instead of independently fetching bars.
     Results are cached in _bar_ctx_cache for the duration of the scan cycle.
@@ -565,13 +569,31 @@ def _fetch_bar_context(symbol: str) -> Optional[_BarCtx]:
     if daily.empty or len(daily) < 25:
         return None
     closes = daily["close"]
-    spot   = float(closes.iloc[-1])
+    prev    = float(closes.iloc[-2])   # always yesterday's close (for chg_pct vs prev day)
+    avg_vol20 = float(daily["volume"].iloc[-21:-1].mean())
+
+    # ── Intraday overlay ───────────────────────────────────────────────────
+    # During market hours fetch 1-min bars for today to get live spot & volume.
+    # Outside market hours fall back to the daily close (unchanged behaviour).
+    from engine.utils import is_market_open
+    _intraday_ok = False
+    if is_market_open():
+        try:
+            intraday = get_bars(symbol, "1d", "1m")
+            if not intraday.empty and len(intraday) >= 2:
+                spot    = float(intraday["close"].iloc[-1])
+                cur_vol = float(intraday["volume"].sum())   # accumulated intraday volume
+                _intraday_ok = True
+        except Exception:
+            pass
+    if not _intraday_ok:
+        spot    = float(closes.iloc[-1])
+        cur_vol = float(daily["volume"].iloc[-1])
+    # ── End intraday overlay ───────────────────────────────────────────────
+
     if spot < OPTIONS_MIN_STOCK_PRICE:
         return None
-    prev    = float(closes.iloc[-2])
-    chg_pct = (spot - prev) / prev * 100
-    avg_vol20 = float(daily["volume"].iloc[-21:-1].mean())
-    cur_vol   = float(daily["volume"].iloc[-1])
+    chg_pct   = (spot - prev) / prev * 100
     vol_ratio = cur_vol / max(avg_vol20, 1.0)
     rsi       = _calc_rsi_scalar(closes)
     ema20     = float(closes.ewm(span=20, adjust=False).mean().iloc[-1])

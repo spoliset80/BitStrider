@@ -48,3 +48,4 @@ dist/
 # Python package metadata
 *.egg-info/
 *.egg
+/apextrader
