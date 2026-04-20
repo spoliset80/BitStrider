@@ -37,9 +37,14 @@ from .strategies import get_strategy_instances, MomentumStrategy, TechnicalStrat
 _scan_offset: int = 0
 
 
-def _passes_guardrails(symbol: str) -> bool:
+def _passes_guardrails(symbol: str, bull_regime: bool = None) -> bool:
     """Pre-scan gates: dollar-volume, RVOL, and gap-chase guard.
-    Returns False to skip the symbol; never raises."""
+    Returns False to skip the symbol; never raises.
+
+    bull_regime: pass the pre-computed regime from scan_universe() to avoid
+    a concurrent re-fetch of _is_bull_regime() inside each worker thread.
+    If None, falls back to calling _is_bull_regime() directly.
+    """
     try:
         intraday = get_bars(symbol, "1d", "1m")
         if intraday.empty or len(intraday) < 5:
@@ -59,7 +64,8 @@ def _passes_guardrails(symbol: str) -> bool:
         # RVOL gate: only meaningful during regular market hours
         # In bear regime, skip RVOL gate — breakdown volume is often distributed,
         # not the spike pattern seen in squeeze/momentum setups.
-        if is_market_open() and _is_bull_regime():
+        _bull = bull_regime if bull_regime is not None else _is_bull_regime()
+        if is_market_open() and _bull:
             daily = get_bars(symbol, "5d", "1d")
             if not daily.empty and len(daily) >= 2:
                 avg_daily_vol = float(daily["volume"].iloc[:-1].mean())
@@ -192,7 +198,11 @@ def get_scan_targets(excluded: Set[str] = None) -> List[str]:
 def scan_universe(scan_targets: List[str], sentiment: str) -> Tuple[List, Dict[str, int], int]:
     clear_bar_cache()
 
+    # Compute regime ONCE here before spawning workers — avoids a thread race where
+    # multiple workers concurrently hit the 15-min TTL expiry and each make a
+    # separate get_bars("SPY") call to refresh the shared _regime_cache dict.
     bull_regime = _is_bull_regime()
+    regime_str  = "bull" if bull_regime else "bear"
     strats = get_strategy_instances(bull_regime)
 
     signals = []
@@ -200,9 +210,9 @@ def scan_universe(scan_targets: List[str], sentiment: str) -> Tuple[List, Dict[s
     scan_errors = 0
 
     def _scan_one(symbol: str):
-        if is_dead_ticker(symbol):
-            return None
-        if not _passes_guardrails(symbol):
+        # Dead-ticker check already done in get_scan_targets() — skip here.
+        # Pass pre-computed regime into guardrails to avoid re-calling _is_bull_regime()
+        if not _passes_guardrails(symbol, bull_regime=bull_regime):
             return None
 
         candidates = []
@@ -213,7 +223,7 @@ def scan_universe(scan_targets: List[str], sentiment: str) -> Tuple[List, Dict[s
                 elif isinstance(s, SentimentStrategy):
                     sig = s.scan(symbol, sentiment)
                 elif isinstance(s, MomentumStrategy):
-                    sig = s.scan(symbol, "bull" if bull_regime else "bear")
+                    sig = s.scan(symbol, regime_str)
                 else:
                     sig = s.scan(symbol)
                 if sig:

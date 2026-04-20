@@ -1,2 +1,1 @@
-# Predictions engine modules
-from .predictions import *
+from .predictions import save_day_picks

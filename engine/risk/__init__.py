@@ -1,2 +1,1 @@
-# Risk and kill-mode engine modules
-from .kill_mode import *
+from .kill_mode import check, is_active

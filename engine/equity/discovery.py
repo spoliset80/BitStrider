@@ -23,6 +23,9 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 # ── Module-level state ─────────────────────────────────────────────────────
 trending_stocks:           List[Dict] = []
 last_trending_scan:        float      = 0.0
+# Tickers discovered via trending feeds — kept separately so we never mutate
+# the imported config list (PRIORITY_1_MOMENTUM is a module-level constant).
+_discovered_trending:      List[str]  = []
 last_ti_scan:              float      = 0.0
 last_ti_options_scan:      float      = 0.0
 last_ti_toplists_scan:     float      = 0.0
@@ -47,6 +50,11 @@ def get_priority_scan_queue() -> List[str]:
 
 # ── Trending scan ──────────────────────────────────────────────────────────
 
+def get_discovered_trending() -> List[str]:
+    """Return tickers found by trending scans this session (read-only copy)."""
+    return list(_discovered_trending)
+
+
 def scan_trending_stocks(
     *,
     use_live_trending: bool,
@@ -59,8 +67,9 @@ def scan_trending_stocks(
 ) -> None:
     """Refresh ``trending_stocks`` from live feeds (Finnhub, etc.).
 
-    Mutates the caller-supplied *priority_1* list in-place when new tickers are found,
-    exactly as the original inline code did.
+    New tickers are stored in the module-level ``_discovered_trending`` list
+    rather than mutating the caller-supplied ``priority_1`` config list.
+    Callers can read discovered tickers via ``get_discovered_trending()``.
     """
     global trending_stocks, last_trending_scan
 
@@ -121,9 +130,12 @@ def scan_trending_stocks(
         new_stocks = [s for s in momentum_stocks if s["symbol"] not in priority_1]
         if new_stocks:
             log.info(f"[SCAN] Found {len(new_stocks)} new trending stocks: " + ", ".join(f"{s['symbol']} (+{s['momentum_pct']:.1f}% @ ${s['current_price']:.2f})" for s in new_stocks[:5]))
+            # Store in module-level set — never mutate the config list
+            _discovered_syms = {s for s in _discovered_trending}
             for s in new_stocks:
-                priority_1.append(s["symbol"])
-            log.info(f"[SCAN] Priority 1 expanded to {len(priority_1)} stocks")
+                if s["symbol"] not in _discovered_syms:
+                    _discovered_trending.append(s["symbol"])
+            log.info(f"[SCAN] Discovered trending: {len(_discovered_trending)} tickers this session")
 
         trending_stocks    = momentum_stocks
         last_trending_scan = now

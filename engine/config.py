@@ -6,14 +6,8 @@ Modular architecture with multiple strategies and PDT compliance
 
 
 import os
-# --- .env support: load user/environment profile if present ---
-try:
-    from dotenv import load_dotenv
-    _env_path = os.path.join(os.path.dirname(__file__), '..', '.env')
-    if os.path.exists(_env_path):
-        load_dotenv(_env_path, override=False)
-except ImportError:
-    pass  # python-dotenv not installed; skip .env loading
+# .env is loaded once by main.py at process start.
+# config.py reads env vars directly via os.getenv — no dotenv call here.
 
 # ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 # Broker Selection
@@ -32,7 +26,7 @@ OPTIONS_BROKER = "alpaca"                               # Only Alpaca supports o
 # covered calls on held positions. Expiry: 7–21 DTE (near-term).
 # ─────────────────────────────────────────────────────────────────
 OPTIONS_ENABLED             = os.getenv("OPTIONS_ENABLED", "true").lower() in ("1", "true", "yes")
-OPTIONS_ALLOCATION_PCT      = float(os.getenv("OPTIONS_ALLOCATION_PCT", "40.0"))  # % of equity for all options
+OPTIONS_ALLOCATION_PCT      = float(os.getenv("OPTIONS_ALLOCATION_PCT", "15.0"))  # % of equity for all options (override via .env)
 OPTIONS_MAX_POSITIONS       = int(os.getenv("OPTIONS_MAX_POSITIONS", "3"))        # max open options contracts
 OPTIONS_DTE_MIN             = int(os.getenv("OPTIONS_DTE_MIN", "14"))             # min days-to-expiry at entry (14 avoids forced same-day close = PDT hit)
 OPTIONS_DTE_MAX             = int(os.getenv("OPTIONS_DTE_MAX", "40"))             # max days-to-expiry at entry

@@ -134,6 +134,8 @@ class EnhancedExecutor:
         self.shorting_blocked: bool = False  # set true when broker rejects all short attempts for account
         self._pdt_stop_blocked: Dict[str, float] = {}  # {symbol: stop_price} — broker-rejected stops; monitored in software
         self._pdt_overnight_forced: set = set()  # symbols where PDT also blocks close — forced overnight, no retries
+        self._pdt_violation_alerted: bool = False  # tracks whether the PDT violation email has been sent this session
+        self._eod_close_done: object = None  # date of last completed EOD close (prevents duplicate runs)
         self._rebuild_entry_log_from_orders()
 
     # -- Entry Log Rebuild (survive restarts) ----------------------------
@@ -146,8 +148,11 @@ class EnhancedExecutor:
             import pytz
             from alpaca.trading.requests import GetOrdersRequest
             from alpaca.trading.enums import QueryOrderStatus
-            et = pytz.timezone("America/New_York")
-            req = GetOrdersRequest(status=QueryOrderStatus.CLOSED)
+            et       = pytz.timezone("America/New_York")
+            # Filter to today only — avoids fetching the full account order history
+            # on accounts with months of activity (can be thousands of orders).
+            today_start = datetime.datetime.combine(today, datetime.time.min).replace(tzinfo=pytz.UTC)
+            req = GetOrdersRequest(status=QueryOrderStatus.CLOSED, after=today_start)
             filled_orders = self.client.get_orders(filter=req)
             for order in filled_orders:
                 filled_at = getattr(order, "filled_at", None)
@@ -982,19 +987,23 @@ class EnhancedExecutor:
                 continue
 
             try:
-                # Cancel any open stop/trailing orders holding shares for this symbol
-                # before submitting the market close, otherwise it fails with
-                # "insufficient qty available" (shares held_for_orders).
+                # Cancel only DAY-TIF orders holding shares for this symbol before
+                # submitting the market close ("insufficient qty available" error).
+                # GTC trailing stops are intentionally preserved — they protect the
+                # position until the close fill settles and should not be cancelled.
                 try:
-                    import time as _t
-                    sym_orders = [o for o in (self.client.get_orders() or []) if o.symbol == sym]
+                    sym_orders = [
+                        o for o in (self.client.get_orders() or [])
+                        if o.symbol == sym
+                        and str(getattr(o, "time_in_force", "")).upper() != "GTC"
+                    ]
                     for _o in sym_orders:
                         try:
                             self.client.cancel_order_by_id(str(_o.id))
                         except Exception:
                             pass
                     if sym_orders:
-                        _t.sleep(0.4)
+                        time.sleep(0.4)
                 except Exception:
                     pass
 
