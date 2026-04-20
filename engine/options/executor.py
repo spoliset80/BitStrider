@@ -881,43 +881,52 @@ class OptionsExecutor:
                     to_close.append(occ_sym)
                 continue
 
-            # 2. P&L — use Alpaca's unrealized_pl per leg directly.
-            # Alpaca computes: unrealized_pl = (current_price - avg_entry_price) * qty * 100
-            # For short legs qty is negative, so unrealized_pl is positive when price falls.
-            # Summing across all legs gives the true net dollar P&L without any sign/ratio
-            # arithmetic on our side — immune to ratio_qty errors and uses actual fill prices.
+            # 2. P&L — fetch live bid/ask quotes for every leg, compute net mark.
+            # mid = (bid + ask) / 2 per leg, sign = +1 long / -1 short.
+            # Applies to all position types: naked, spread, butterfly, condor.
+            # current_mark = net spread price you'd receive (or pay) right now.
+            # pnl_pct = (current_mark - entry_mark) / entry_mark × 100
             try:
-                total_pl_dollars = 0.0
-                any_leg_missing = False
-                for leg in pos.legs:
-                    leg_pos = all_positions.get(leg["occ_symbol"])
-                    if leg_pos is None:
-                        any_leg_missing = True
-                        break
-                    total_pl_dollars += float(getattr(leg_pos, "unrealized_pl", 0.0))
-
+                # Check all legs still exist in the account first
+                any_leg_missing = any(
+                    all_positions.get(l["occ_symbol"]) is None for l in pos.legs
+                )
                 if any_leg_missing:
                     log.info(f"OPTIONS: {occ_sym} leg(s) closed externally — clearing tracker")
                     del self._positions[occ_sym]
                     continue
 
-                # entry_cost_dollars: capital at risk (debit paid, or credit received as risk)
-                # abs() handles both debit (+) and credit (-) entry_price conventions.
-                entry_cost_dollars = abs(pos.entry_price) * pos.contracts * CONTRACT_SIZE
+                # Fetch live quotes for all legs in one API call
+                _leg_syms = [l["occ_symbol"] for l in pos.legs]
+                _quotes = self.data_client.get_option_latest_quote(
+                    OptionLatestQuoteRequest(symbol_or_symbols=_leg_syms)
+                )
+                current_mark = 0.0
+                for leg in pos.legs:
+                    _q = _quotes.get(leg["occ_symbol"])
+                    if _q is None:
+                        raise ValueError(f"no quote for {leg['occ_symbol']}")
+                    _mid  = (float(_q.bid_price) + float(_q.ask_price)) / 2.0
+                    _sign = 1 if leg["side"] == "buy" else -1
+                    current_mark += _sign * _mid
+
+                entry_mark = abs(pos.entry_price)   # net debit paid (or credit received) per share
+                entry_cost_dollars = entry_mark * pos.contracts * CONTRACT_SIZE
                 if entry_cost_dollars < 0.01:
                     continue
 
-                # pnl_pct: positive = profitable, negative = losing
-                # Works identically for debit and credit strategies.
-                pnl_pct = total_pl_dollars / entry_cost_dollars * 100
+                # pnl_pct: positive = profitable, negative = losing.
+                # For debit spreads: current_mark > entry_mark → profit.
+                # For credit spreads: entry_price stored negative, entry_mark = abs → same formula.
+                pnl_pct = (current_mark - entry_mark) / entry_mark * 100
 
                 if pnl_pct > pos.peak_pnl_pct:
                     pos.peak_pnl_pct = pnl_pct
 
                 log.debug(
                     f"[OPTIONS] {pos.symbol} {pos.strategy} "
-                    f"P&L=${total_pl_dollars:+.2f} ({pnl_pct:+.1f}%) "
-                    f"entry_cost=${entry_cost_dollars:.2f} peak={pos.peak_pnl_pct:.1f}%"
+                    f"mark=${current_mark:.2f} entry=${entry_mark:.2f} "
+                    f"pnl={pnl_pct:+.1f}% peak={pos.peak_pnl_pct:.1f}%"
                 )
 
                 # 4. Exit decision  (same_day_entry / pdt_block computed at top of loop)
@@ -928,64 +937,33 @@ class OptionsExecutor:
 
                 # ── Butterfly-specific exit logic ─────────────────────────────
                 # % P&L stop is meaningless for butterflies: max loss is already
-                # capped at net_debit paid ($0.57 for AEHR), but the mark-to-market
-                # net value can go deeply negative intraday due to bid/ask spreads
-                # across 3 legs, making a % stop fire immediately after entry.
-                # Strategy: HOLD and wait for spot to drift back toward the profitable
-                # zone. Emergency exit only when DTE ≤ 3 and loss > 45% (theta is
-                # accelerating and recovery is unlikely). Same logic for iron condors.
+                # ── Butterfly / Iron Condor exit logic ───────────────────────
+                # current_mark and entry_mark already computed above from live quotes.
+                # Strategy: HOLD and wait for recovery. Emergency exit only at DTE ≤ 3.
                 _is_butterfly = "butterfly" in pos.option_type.lower() or "butterfly" in pos.strategy.lower()
                 _is_condor    = "condor"    in pos.option_type.lower() or "condor"    in pos.strategy.lower()
                 if _is_butterfly or _is_condor:
                     _mleg_type = "butterfly" if _is_butterfly else "iron condor"
 
-                    # Current spread price: fetch live bid/ask quotes for all legs,
-                    # compute per-leg mid, then apply qty sign (+1 long, -1 short).
-                    # This is the most accurate real-time mark — same as what the
-                    # terminal script showed ($0.30 for AEHR butterfly).
-                    try:
-                        _leg_syms = [l["occ_symbol"] for l in pos.legs]
-                        _quotes = self.data_client.get_option_latest_quote(
-                            OptionLatestQuoteRequest(symbol_or_symbols=_leg_syms)
-                        )
-                        _current_mark = 0.0
-                        for l in pos.legs:
-                            _q = _quotes.get(l["occ_symbol"])
-                            if _q is None:
-                                raise ValueError(f"no quote for {l['occ_symbol']}")
-                            _mid = (float(_q.bid_price) + float(_q.ask_price)) / 2.0
-                            _sign = 1 if l["side"] == "buy" else -1
-                            _current_mark += _sign * _mid
-                    except Exception as _qex:
-                        log.debug(f"[OPTIONS] {pos.symbol} quote fetch failed: {_qex} — skipping")
-                        continue
-                    _entry_mark = abs(pos.entry_price)   # net debit paid (positive)
-
-                    log.debug(
-                        f"[OPTIONS] {pos.symbol} {_mleg_type} "
-                        f"mark=${_current_mark:.2f} entry=${_entry_mark:.2f} "
-                        f"net_mv=${_net_mv:.2f} DTE={dte}"
-                    )
-
                     # Break-even mode: once mark drops below entry price, latch.
                     # Lowers profit target from +45% to 0% (just recover what was paid).
-                    if _current_mark < _entry_mark and not pos.breakeven_mode:
+                    if current_mark < entry_mark and not pos.breakeven_mode:
                         pos.breakeven_mode = True
                         log.info(
-                            f"OPTIONS: {pos.symbol} {_mleg_type} mark ${_current_mark:.2f} "
-                            f"< entry ${_entry_mark:.2f} — switching to break-even exit"
+                            f"OPTIONS: {pos.symbol} {_mleg_type} mark ${current_mark:.2f} "
+                            f"< entry ${entry_mark:.2f} — switching to break-even exit"
                         )
 
                     # Profit target: current mark recovered to entry (break-even mode)
                     #                or +45% above entry (normal mode).
                     # Only close if mark is positive (we receive money on close).
-                    _target_mark = _entry_mark if pos.breakeven_mode else _entry_mark * (1 + OPTIONS_PROFIT_TARGET_PCT / 100)
-                    if occ_sym not in to_close and _current_mark > 0 and _current_mark >= _target_mark:
+                    _target_mark = entry_mark if pos.breakeven_mode else entry_mark * (1 + OPTIONS_PROFIT_TARGET_PCT / 100)
+                    if occ_sym not in to_close and current_mark > 0 and current_mark >= _target_mark:
                         if not pdt_block:
                             _reason = "break-even" if pos.breakeven_mode else f"target +{OPTIONS_PROFIT_TARGET_PCT:.0f}%"
                             log.info(
                                 f"OPTIONS: {pos.symbol} {_mleg_type} {_reason} hit "
-                                f"(mark=${_current_mark:.2f} >= target=${_target_mark:.2f}) — closing"
+                                f"(mark=${current_mark:.2f} >= target=${_target_mark:.2f}) — closing"
                             )
                             to_close.append(occ_sym)
 
@@ -993,14 +971,14 @@ class OptionsExecutor:
                     # Close to recover what's left rather than let theta eat it to zero.
                     # If mark is inverted (≤ 0): clear tracker and let expire — no close cost.
                     elif occ_sym not in to_close and dte <= 3:
-                        if _current_mark <= 0:
+                        if current_mark <= 0:
                             if not same_day_entry:
                                 log.info(
                                     f"OPTIONS: {pos.symbol} {_mleg_type} DTE={dte} "
-                                    f"mark=${_current_mark:.2f} (inverted) — letting expire"
+                                    f"mark=${current_mark:.2f} (inverted) — letting expire"
                                 )
                                 del self._positions[occ_sym]
-                        elif _current_mark < _entry_mark * 0.55:
+                        elif current_mark < entry_mark * 0.55:
                             if same_day_entry:
                                 log.debug(
                                     f"OPTIONS: {pos.symbol} {_mleg_type} DTE={dte} emergency exit deferred — entered today"
@@ -1008,10 +986,11 @@ class OptionsExecutor:
                             elif not pdt_block:
                                 log.warning(
                                     f"OPTIONS: {pos.symbol} {_mleg_type} DTE={dte} emergency exit "
-                                    f"— mark=${_current_mark:.2f} < 55% of entry=${_entry_mark:.2f} — closing"
+                                    f"— mark=${current_mark:.2f} < 55% of entry=${entry_mark:.2f} — closing"
                                 )
                                 to_close.append(occ_sym)
                                 stop_symbols.append(pos.symbol)
+
 
                     continue   # skip standard % stop / trailing stop for mleg structures
                 # ── End butterfly/condor logic ────────────────────────────────

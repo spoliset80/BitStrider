@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-04-19T23:06:31-04:00",
+  "generated_at": "2026-04-19T23:27:23-04:00",
   "date": "2026-04-19",
   "market_regime": "bull",
   "picks": [
@@ -20,28 +20,20 @@
       "reason": "Daily Sweepea pullback to 8-EMA | ATR $0.31"
     },
     {
-      "symbol": "WULF",
+      "symbol": "NUAI",
       "action": "buy",
-      "price": 20.64,
+      "price": 4.61,
       "confidence": 0.82,
       "strategy": "Sweepea",
-      "reason": "Daily Sweepea pullback to 8-EMA | ATR $1.48"
+      "reason": "Daily Sweepea pullback to 8-EMA | ATR $0.55"
     },
     {
-      "symbol": "MRNA",
+      "symbol": "ANL",
       "action": "buy",
-      "price": 53.72,
+      "price": 16.01,
       "confidence": 0.82,
       "strategy": "Sweepea",
-      "reason": "Daily Sweepea pullback to 8-EMA | ATR $2.59"
-    },
-    {
-      "symbol": "LITE",
-      "action": "buy",
-      "price": 894.07,
-      "confidence": 0.82,
-      "strategy": "Sweepea",
-      "reason": "Daily Sweepea pullback to 8-EMA | ATR $73.60"
+      "reason": "Daily Sweepea pullback to 8-EMA | ATR $2.32"
     }
   ]
 }
