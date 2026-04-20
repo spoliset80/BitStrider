@@ -15,10 +15,13 @@ import logging
 import datetime
 import time
 from typing import List, Dict, Tuple, Optional
+from collections import defaultdict
 from dataclasses import dataclass, field
 import json
 import re
 from alpaca.trading.client import TradingClient
+from alpaca.data.historical.option import OptionHistoricalDataClient
+from alpaca.data.requests import OptionLatestQuoteRequest
 from alpaca.trading.requests import (
     LimitOrderRequest,
     MarketOrderRequest,
@@ -108,6 +111,9 @@ class OptionsPosition:
     entry_iv:      float = 0.0   # IV% at entry (0-1 scale from yfinance/Alpaca)
     is_naked:      bool  = False  # True = single naked leg, eligible for spread conversion
     open_stop_pct: float = 0.0   # Per-position hard stop override (25% open window, 0 = use global)
+    # Butterfly break-even mode: once mark goes negative, lower exit target to 0%
+    # (recover original debit) instead of waiting for +45%. Latches True, never resets.
+    breakeven_mode: bool = False
 
 
 class OptionsExecutor:
@@ -115,6 +121,7 @@ class OptionsExecutor:
 
     def __init__(self, client: TradingClient):
         self.client = client
+        self.data_client = OptionHistoricalDataClient(API_KEY, API_SECRET)
         self._positions: Dict[str, OptionsPosition] = {}   # occ_symbol -> OptionsPosition
         self._last_monitor_ts: float = 0.0
         self._MONITOR_INTERVAL = 20   # seconds between P&L checks (fast enough to catch intraday moves)
@@ -127,6 +134,10 @@ class OptionsExecutor:
         Uses avg_entry_price from Alpaca and conservative defaults (global stop/target, no
         open-window flag).  This allows monitor_positions() to manage positions entered in a
         previous session or in paper mode without having to track them from entry.
+
+        Multi-leg detection: groups legs by (ticker, expiry) and reconstructs butterfly
+        and iron-condor structures so that P&L and close orders are computed correctly
+        as a net position rather than per individual leg.
         """
         try:
             open_pos = [p for p in self.client.get_all_positions()
@@ -139,50 +150,191 @@ class OptionsExecutor:
             return
 
         today = datetime.date.today()
-        for p in open_pos:
-            occ = p.symbol  # full OCC symbol e.g. AAPL260418C00185000
-            if occ in self._positions:
-                continue  # already tracked from this session
 
-            # Parse OCC symbol: <TICKER><YYMMDD><C|P><8-digit-strike>
+        # ── Step 1: parse every option position into a plain dict ────────────
+        parsed: List[dict] = []
+        for p in open_pos:
+            occ = p.symbol
+            if occ in self._positions:
+                continue  # already tracked (entered this session before restart)
             m = re.match(r"^([A-Z]+)(\d{6})([CP])(\d{8})$", occ)
             if not m:
                 continue
             ticker, exp_str, cp_char, strike_str = m.groups()
             try:
-                expiry     = datetime.datetime.strptime(exp_str, "%y%m%d").date()
-                strike     = int(strike_str) / 1000.0
-                opt_type   = "call" if cp_char == "C" else "put"
-                qty        = abs(int(float(p.qty)))
-                side       = "buy" if float(p.qty) > 0 else "sell"
-                action     = "buy_to_open" if side == "buy" else "sell_to_open"
-                entry_px   = float(p.avg_entry_price)
+                expiry   = datetime.datetime.strptime(exp_str, "%y%m%d").date()
+                strike   = int(strike_str) / 1000.0
+                opt_type = "call" if cp_char == "C" else "put"
+                signed_qty = int(round(float(p.qty)))   # + = long, - = short
+                entry_px   = float(p.avg_entry_price)   # always positive (Alpaca convention)
+                lastday    = float(getattr(p, "lastday_price", 0) or 0)
+                entered_at = today if lastday == 0 else today - datetime.timedelta(days=1)
             except Exception:
                 continue
+            parsed.append(dict(
+                occ=occ, ticker=ticker, expiry=expiry,
+                strike=strike, opt_type=opt_type,
+                qty=signed_qty, entry_px=entry_px, entered_at=entered_at,
+            ))
 
-            # Determine whether the position was opened today or carried overnight.
-            # lastday_price == 0 / None means no price existed at yesterday's close
-            # → position was opened today (same-day entry, PDT rules apply).
-            _lastday = float(getattr(p, "lastday_price", 0) or 0)
-            _entered_at = today if _lastday == 0 else today - datetime.timedelta(days=1)
+        if not parsed:
+            return
 
-            self._positions[occ] = OptionsPosition(
-                occ_symbol  = occ,
-                symbol      = ticker,
-                option_type = opt_type,
-                action      = action,
-                strike      = strike,
-                expiry      = expiry,
-                contracts   = qty,
-                entry_price = entry_px,
-                strategy    = "reconciled",
-                legs        = [{"occ_symbol": occ, "side": side, "ratio_qty": 1}],
-                entered_at  = _entered_at,
-            )
-            log.info(
-                f"[OPTIONS] Reconciled existing position: {occ} "
-                f"{qty}x {opt_type} @{strike} entry=${entry_px:.2f}"
-            )
+        # ── Step 2: group by (ticker, expiry) for multi-leg detection ────────
+        groups: Dict[tuple, list] = defaultdict(list)
+        for item in parsed:
+            groups[(item["ticker"], item["expiry"])].append(item)
+
+        registered: set = set()   # OCCs already absorbed into a multi-leg position
+
+        for (ticker, expiry), items in groups.items():
+            calls = sorted([i for i in items if i["opt_type"] == "call"], key=lambda x: x["strike"])
+            puts  = sorted([i for i in items if i["opt_type"] == "put"],  key=lambda x: x["strike"])
+
+            # ── Detect CALL butterfly: [+N, -2N, +N] by ascending strike ─────
+            if len(calls) == 3 and all(c["occ"] not in registered for c in calls):
+                q0, q1, q2 = calls[0]["qty"], calls[1]["qty"], calls[2]["qty"]
+                if q0 > 0 and q2 > 0 and q1 < 0 and q0 == q2 and abs(q1) == 2 * q0:
+                    # net_debit = what was paid for both long wings minus credit from short body
+                    net_debit = round(
+                        calls[0]["entry_px"] + calls[2]["entry_px"] - 2 * calls[1]["entry_px"], 3
+                    )
+                    primary_occ = calls[0]["occ"]
+                    self._positions[primary_occ] = OptionsPosition(
+                        occ_symbol  = primary_occ,
+                        symbol      = ticker,
+                        option_type = "call_butterfly",
+                        action      = "buy_to_open",
+                        strike      = calls[1]["strike"],   # mid (short body) strike
+                        expiry      = expiry,
+                        contracts   = q0,
+                        entry_price = net_debit,            # positive debit; formula works correctly
+                        strategy    = "reconciled_butterfly",
+                        legs        = [
+                            {"occ_symbol": calls[0]["occ"], "side": "buy",  "ratio_qty": 1},
+                            {"occ_symbol": calls[1]["occ"], "side": "sell", "ratio_qty": 2},
+                            {"occ_symbol": calls[2]["occ"], "side": "buy",  "ratio_qty": 1},
+                        ],
+                        entered_at  = calls[0]["entered_at"],
+                    )
+                    for c in calls:
+                        registered.add(c["occ"])
+                    log.info(
+                        f"[OPTIONS] Reconciled CALL BUTTERFLY: {ticker} "
+                        f"{calls[0]['strike']:.2f}/{calls[1]['strike']:.2f}/{calls[2]['strike']:.2f}C "
+                        f"net_debit=${net_debit:.3f} ×{q0}c"
+                    )
+                    continue
+
+            # ── Detect PUT butterfly: [+N, -2N, +N] by ascending strike ──────
+            if len(puts) == 3 and all(p_["occ"] not in registered for p_ in puts):
+                q0, q1, q2 = puts[0]["qty"], puts[1]["qty"], puts[2]["qty"]
+                if q0 > 0 and q2 > 0 and q1 < 0 and q0 == q2 and abs(q1) == 2 * q0:
+                    net_debit = round(
+                        puts[0]["entry_px"] + puts[2]["entry_px"] - 2 * puts[1]["entry_px"], 3
+                    )
+                    primary_occ = puts[0]["occ"]
+                    self._positions[primary_occ] = OptionsPosition(
+                        occ_symbol  = primary_occ,
+                        symbol      = ticker,
+                        option_type = "put_butterfly",
+                        action      = "buy_to_open",
+                        strike      = puts[1]["strike"],
+                        expiry      = expiry,
+                        contracts   = q0,
+                        entry_price = net_debit,
+                        strategy    = "reconciled_butterfly",
+                        legs        = [
+                            {"occ_symbol": puts[0]["occ"], "side": "buy",  "ratio_qty": 1},
+                            {"occ_symbol": puts[1]["occ"], "side": "sell", "ratio_qty": 2},
+                            {"occ_symbol": puts[2]["occ"], "side": "buy",  "ratio_qty": 1},
+                        ],
+                        entered_at  = puts[0]["entered_at"],
+                    )
+                    for p_ in puts:
+                        registered.add(p_["occ"])
+                    log.info(
+                        f"[OPTIONS] Reconciled PUT BUTTERFLY: {ticker} "
+                        f"{puts[0]['strike']:.2f}/{puts[1]['strike']:.2f}/{puts[2]['strike']:.2f}P "
+                        f"net_debit=${net_debit:.3f} ×{q0}c"
+                    )
+                    continue
+
+            # ── Detect IRON CONDOR: 2 puts + 2 calls, pattern [+,-,-,+] ──────
+            # puts sorted asc: [long OTM put (+), short near-ATM put (-)]
+            # calls sorted asc: [short near-ATM call (-), long OTM call (+)]
+            if (len(puts) == 2 and len(calls) == 2
+                    and all(i["occ"] not in registered for i in items)):
+                qp0, qp1 = puts[0]["qty"], puts[1]["qty"]
+                qc0, qc1 = calls[0]["qty"], calls[1]["qty"]
+                base = abs(qp0)
+                if (qp0 > 0 and qp1 < 0 and qc0 < 0 and qc1 > 0
+                        and abs(qp0) == abs(qp1) == abs(qc0) == abs(qc1)):
+                    # net_credit = premiums received (shorts) minus premiums paid (long wings)
+                    net_credit = round(
+                        puts[1]["entry_px"] + calls[0]["entry_px"]
+                        - puts[0]["entry_px"] - calls[1]["entry_px"], 3
+                    )
+                    primary_occ = calls[0]["occ"]   # short call as position key
+                    # For sell_to_open: store entry_price as NEGATIVE so the P&L formula
+                    # (current_net_value - entry_price) / abs(entry_price) shows +% when profitable.
+                    self._positions[primary_occ] = OptionsPosition(
+                        occ_symbol  = primary_occ,
+                        symbol      = ticker,
+                        option_type = "iron_condor",
+                        action      = "sell_to_open",
+                        strike      = calls[0]["strike"],
+                        expiry      = expiry,
+                        contracts   = base,
+                        entry_price = -abs(net_credit),     # negative for credit strategy
+                        strategy    = "reconciled_condor",
+                        legs        = [
+                            {"occ_symbol": puts[0]["occ"],  "side": "buy",  "ratio_qty": 1},
+                            {"occ_symbol": puts[1]["occ"],  "side": "sell", "ratio_qty": 1},
+                            {"occ_symbol": calls[0]["occ"], "side": "sell", "ratio_qty": 1},
+                            {"occ_symbol": calls[1]["occ"], "side": "buy",  "ratio_qty": 1},
+                        ],
+                        entered_at  = calls[0]["entered_at"],
+                    )
+                    for i in items:
+                        registered.add(i["occ"])
+                    log.info(
+                        f"[OPTIONS] Reconciled IRON CONDOR: {ticker} "
+                        f"{puts[0]['strike']:.2f}/{puts[1]['strike']:.2f}P "
+                        f"{calls[0]['strike']:.2f}/{calls[1]['strike']:.2f}C "
+                        f"net_credit=${net_credit:.3f} ×{base}c"
+                    )
+                    continue
+
+            # ── Fall through: register remaining legs as individual positions ─
+            for item in items:
+                if item["occ"] in self._positions or item["occ"] in registered:
+                    continue
+                side   = "buy" if item["qty"] > 0 else "sell"
+                action = "buy_to_open" if side == "buy" else "sell_to_open"
+                # For single short legs: negate entry_price so P&L formula is correct.
+                # Formula: (current_net_value - entry_price) / abs(entry_price)
+                # Short: current_net_value = -current_price; with negative entry_price
+                # this shows +% when current_price falls below what was received.
+                stored_entry = item["entry_px"] if side == "buy" else -item["entry_px"]
+                self._positions[item["occ"]] = OptionsPosition(
+                    occ_symbol  = item["occ"],
+                    symbol      = item["ticker"],
+                    option_type = item["opt_type"],
+                    action      = action,
+                    strike      = item["strike"],
+                    expiry      = item["expiry"],
+                    contracts   = abs(item["qty"]),
+                    entry_price = stored_entry,
+                    strategy    = "reconciled",
+                    legs        = [{"occ_symbol": item["occ"], "side": side, "ratio_qty": 1}],
+                    entered_at  = item["entered_at"],
+                )
+                log.info(
+                    f"[OPTIONS] Reconciled {side.upper()} position: {item['occ']} "
+                    f"{abs(item['qty'])}x {item['opt_type']} @{item['strike']} "
+                    f"entry=${item['entry_px']:.2f}"
+                )
 
     # ── Allocation / Budget ────────────────────────────────────────────────────
 
@@ -633,7 +785,11 @@ class OptionsExecutor:
                 strike=signal.strike,
                 expiry=signal.expiry,
                 contracts=contracts,
-                entry_price=_net_entry_price,
+                # For sell_to_open (credit strategies): store as negative so the P&L formula
+                # (current_net_value - entry_price) / abs(entry_price) shows +% when profitable.
+                # At entry, current_net_value ≈ -net_credit; with entry_price = -net_credit → 0%.
+                # At max profit (all legs expire worthless), current_net_value → 0 → +100%.
+                entry_price=(-abs(_net_entry_price) if "sell" in signal.action else _net_entry_price),
                 strategy=signal.strategy,
                 legs=entry_legs,
                 entry_iv=_entry_iv,
@@ -725,38 +881,43 @@ class OptionsExecutor:
                     to_close.append(occ_sym)
                 continue
 
-            # 2. Net value = sum(sign * ratio * current_price) across all stored legs
-            # sign: +1 for buy legs (we own), -1 for sell legs (we owe)
-            # This formula works identically for single, spread, butterfly, and condor.
+            # 2. P&L — use Alpaca's unrealized_pl per leg directly.
+            # Alpaca computes: unrealized_pl = (current_price - avg_entry_price) * qty * 100
+            # For short legs qty is negative, so unrealized_pl is positive when price falls.
+            # Summing across all legs gives the true net dollar P&L without any sign/ratio
+            # arithmetic on our side — immune to ratio_qty errors and uses actual fill prices.
             try:
-                current_net_value = 0.0
+                total_pl_dollars = 0.0
                 any_leg_missing = False
                 for leg in pos.legs:
                     leg_pos = all_positions.get(leg["occ_symbol"])
                     if leg_pos is None:
                         any_leg_missing = True
                         break
-                    sign = 1 if leg["side"] == "buy" else -1
-                    current_net_value += sign * leg["ratio_qty"] * float(leg_pos.current_price)
+                    total_pl_dollars += float(getattr(leg_pos, "unrealized_pl", 0.0))
 
                 if any_leg_missing:
                     log.info(f"OPTIONS: {occ_sym} leg(s) closed externally — clearing tracker")
                     del self._positions[occ_sym]
                     continue
 
-                # 3. P&L — normalise by abs(entry) so credit and debit strategies
-                # both show positive % when profitable
-                entry_price = pos.entry_price
-                if abs(entry_price) < 0.001:
+                # entry_cost_dollars: capital at risk (debit paid, or credit received as risk)
+                # abs() handles both debit (+) and credit (-) entry_price conventions.
+                entry_cost_dollars = abs(pos.entry_price) * pos.contracts * CONTRACT_SIZE
+                if entry_cost_dollars < 0.01:
                     continue
-                pnl_pct = (current_net_value - entry_price) / abs(entry_price) * 100
+
+                # pnl_pct: positive = profitable, negative = losing
+                # Works identically for debit and credit strategies.
+                pnl_pct = total_pl_dollars / entry_cost_dollars * 100
 
                 if pnl_pct > pos.peak_pnl_pct:
                     pos.peak_pnl_pct = pnl_pct
 
                 log.debug(
-                    f"[OPTIONS] {pos.symbol} {pos.strategy} net=${current_net_value:.2f} "
-                    f"entry=${entry_price:.2f} P&L={pnl_pct:+.1f}% peak={pos.peak_pnl_pct:.1f}%"
+                    f"[OPTIONS] {pos.symbol} {pos.strategy} "
+                    f"P&L=${total_pl_dollars:+.2f} ({pnl_pct:+.1f}%) "
+                    f"entry_cost=${entry_cost_dollars:.2f} peak={pos.peak_pnl_pct:.1f}%"
                 )
 
                 # 4. Exit decision  (same_day_entry / pdt_block computed at top of loop)
@@ -764,6 +925,96 @@ class OptionsExecutor:
                 # Per-position stop: tighter for open-window entries (25%) vs global (30%)
                 # Must be computed BEFORE the outer check so tighter stops are reachable.
                 _eff_stop = pos.open_stop_pct if pos.open_stop_pct > 0 else OPTIONS_STOP_LOSS_PCT
+
+                # ── Butterfly-specific exit logic ─────────────────────────────
+                # % P&L stop is meaningless for butterflies: max loss is already
+                # capped at net_debit paid ($0.57 for AEHR), but the mark-to-market
+                # net value can go deeply negative intraday due to bid/ask spreads
+                # across 3 legs, making a % stop fire immediately after entry.
+                # Strategy: HOLD and wait for spot to drift back toward the profitable
+                # zone. Emergency exit only when DTE ≤ 3 and loss > 45% (theta is
+                # accelerating and recovery is unlikely). Same logic for iron condors.
+                _is_butterfly = "butterfly" in pos.option_type.lower() or "butterfly" in pos.strategy.lower()
+                _is_condor    = "condor"    in pos.option_type.lower() or "condor"    in pos.strategy.lower()
+                if _is_butterfly or _is_condor:
+                    _mleg_type = "butterfly" if _is_butterfly else "iron condor"
+
+                    # Current spread price: fetch live bid/ask quotes for all legs,
+                    # compute per-leg mid, then apply qty sign (+1 long, -1 short).
+                    # This is the most accurate real-time mark — same as what the
+                    # terminal script showed ($0.30 for AEHR butterfly).
+                    try:
+                        _leg_syms = [l["occ_symbol"] for l in pos.legs]
+                        _quotes = self.data_client.get_option_latest_quote(
+                            OptionLatestQuoteRequest(symbol_or_symbols=_leg_syms)
+                        )
+                        _current_mark = 0.0
+                        for l in pos.legs:
+                            _q = _quotes.get(l["occ_symbol"])
+                            if _q is None:
+                                raise ValueError(f"no quote for {l['occ_symbol']}")
+                            _mid = (float(_q.bid_price) + float(_q.ask_price)) / 2.0
+                            _sign = 1 if l["side"] == "buy" else -1
+                            _current_mark += _sign * _mid
+                    except Exception as _qex:
+                        log.debug(f"[OPTIONS] {pos.symbol} quote fetch failed: {_qex} — skipping")
+                        continue
+                    _entry_mark = abs(pos.entry_price)   # net debit paid (positive)
+
+                    log.debug(
+                        f"[OPTIONS] {pos.symbol} {_mleg_type} "
+                        f"mark=${_current_mark:.2f} entry=${_entry_mark:.2f} "
+                        f"net_mv=${_net_mv:.2f} DTE={dte}"
+                    )
+
+                    # Break-even mode: once mark drops below entry price, latch.
+                    # Lowers profit target from +45% to 0% (just recover what was paid).
+                    if _current_mark < _entry_mark and not pos.breakeven_mode:
+                        pos.breakeven_mode = True
+                        log.info(
+                            f"OPTIONS: {pos.symbol} {_mleg_type} mark ${_current_mark:.2f} "
+                            f"< entry ${_entry_mark:.2f} — switching to break-even exit"
+                        )
+
+                    # Profit target: current mark recovered to entry (break-even mode)
+                    #                or +45% above entry (normal mode).
+                    # Only close if mark is positive (we receive money on close).
+                    _target_mark = _entry_mark if pos.breakeven_mode else _entry_mark * (1 + OPTIONS_PROFIT_TARGET_PCT / 100)
+                    if occ_sym not in to_close and _current_mark > 0 and _current_mark >= _target_mark:
+                        if not pdt_block:
+                            _reason = "break-even" if pos.breakeven_mode else f"target +{OPTIONS_PROFIT_TARGET_PCT:.0f}%"
+                            log.info(
+                                f"OPTIONS: {pos.symbol} {_mleg_type} {_reason} hit "
+                                f"(mark=${_current_mark:.2f} >= target=${_target_mark:.2f}) — closing"
+                            )
+                            to_close.append(occ_sym)
+
+                    # Emergency exit: DTE ≤ 3 with remaining positive value below 55% of entry.
+                    # Close to recover what's left rather than let theta eat it to zero.
+                    # If mark is inverted (≤ 0): clear tracker and let expire — no close cost.
+                    elif occ_sym not in to_close and dte <= 3:
+                        if _current_mark <= 0:
+                            if not same_day_entry:
+                                log.info(
+                                    f"OPTIONS: {pos.symbol} {_mleg_type} DTE={dte} "
+                                    f"mark=${_current_mark:.2f} (inverted) — letting expire"
+                                )
+                                del self._positions[occ_sym]
+                        elif _current_mark < _entry_mark * 0.55:
+                            if same_day_entry:
+                                log.debug(
+                                    f"OPTIONS: {pos.symbol} {_mleg_type} DTE={dte} emergency exit deferred — entered today"
+                                )
+                            elif not pdt_block:
+                                log.warning(
+                                    f"OPTIONS: {pos.symbol} {_mleg_type} DTE={dte} emergency exit "
+                                    f"— mark=${_current_mark:.2f} < 55% of entry=${_entry_mark:.2f} — closing"
+                                )
+                                to_close.append(occ_sym)
+                                stop_symbols.append(pos.symbol)
+
+                    continue   # skip standard % stop / trailing stop for mleg structures
+                # ── End butterfly/condor logic ────────────────────────────────
 
                 if pnl_pct >= OPTIONS_PROFIT_TARGET_PCT:
                     if pdt_block:
@@ -812,16 +1063,20 @@ class OptionsExecutor:
             except Exception as e:
                 log.error(f"Error monitoring {occ_sym}: {e}")
 
-        # Execute closes
+        # Execute closes — pass all_positions so _close_option can compute limit price
         for occ_sym in to_close:
-            self._close_option(occ_sym)
+            self._close_option(occ_sym, all_positions=all_positions)
 
         # IV conversion check (rate-limited to every 10 min, touches only open naked positions)
         self._maybe_convert_to_spread()
 
-    def _close_option(self, occ_sym: str) -> None:
+    def _close_option(self, occ_sym: str, all_positions: Optional[dict] = None) -> None:
         """Close an options position by reversing all stored legs atomically.
         Works identically for single, spread, butterfly, and condor positions.
+
+        For multi-leg positions uses a limit order at current_net_mid * 0.97 to avoid
+        market-maker slippage on wide bid/ask spreads (AEHR/EOSE/SOUN style names).
+        Falls back to market if current mark cannot be computed.
         """
         pos = self._positions.get(occ_sym)
         if pos is None:
@@ -829,7 +1084,7 @@ class OptionsExecutor:
 
         try:
             if len(pos.legs) > 1:
-                # Multi-leg: reverse every side and submit as a single mleg order
+                # Multi-leg: reverse every side and submit as a single mleg limit order
                 reversed_legs = [
                     {
                         "symbol": l["occ_symbol"],
@@ -838,20 +1093,77 @@ class OptionsExecutor:
                     }
                     for l in pos.legs
                 ]
+
+                # Compute net mark price to set a sensible limit.
+                # For a closing order the net direction is reversed vs entry:
+                #   debit entry  → closing is a credit (we receive) → limit < 0 in Alpaca convention
+                #   credit entry → closing is a debit (we pay)      → limit > 0
+                # We target 97% of the current mid to guarantee a fill without full-spread
+                # slippage on all legs simultaneously (critical for low-liquidity names).
+                _close_limit_price = None
+                if all_positions:
+                    try:
+                        net_mid = 0.0
+                        for l in pos.legs:
+                            lp = all_positions.get(l["occ_symbol"])
+                            if lp is None:
+                                raise ValueError("leg missing")
+                            sign = 1 if l["side"] == "buy" else -1
+                            net_mid += sign * l["ratio_qty"] * float(lp.current_price)
+                        # For closing: reverse the sign (we're doing the opposite trade)
+                        close_mid = -net_mid
+
+                        # Safety: for long-debit mleg positions (butterfly, debit spread)
+                        # NEVER pay to close when mark has gone negative — that would cost
+                        # more than the original debit (exceeding defined max loss).
+                        # Correct action: let it expire worthless. Max loss = debit paid.
+                        _is_long_debit_mleg = (
+                            pos.action == "buy_to_open"
+                            and ("butterfly" in pos.option_type.lower()
+                                 or "butterfly" in pos.strategy.lower()
+                                 or "spread" in pos.strategy.lower())
+                        )
+                        if close_mid > 0 and _is_long_debit_mleg:
+                            log.info(
+                                f"[OPTIONS] {pos.symbol} mleg close would cost "
+                                f"${close_mid:.2f} (mark negative) — letting expire worthless. "
+                                f"Closing would exceed defined max loss."
+                            )
+                            del self._positions[occ_sym]
+                            return
+
+                        if abs(close_mid) > 0.01:
+                            # Debit close (we pay): limit slightly above mid to ensure fill
+                            # Credit close (we receive): limit at 97% of mid (accept slightly less)
+                            if close_mid > 0:
+                                _close_limit_price = round(close_mid * 1.03, 2)   # paying — bid up 3%
+                            else:
+                                _close_limit_price = round(close_mid * 0.97, 2)   # receiving — 3% haircut
+                    except Exception as _e:
+                        log.debug(f"[OPTIONS] Could not compute mleg close limit for {occ_sym}: {_e}")
+
                 payload = {
                     "symbol": "",
                     "qty": str(float(pos.contracts)),
                     # "side" intentionally omitted — not required for mleg per Alpaca docs;
                     # each reversed leg carries its own side.
-                    "type": "market",
                     "order_class": "mleg",
                     "time_in_force": "day",
                     "legs": reversed_legs,
                 }
-                log.info(
-                    f"OPTIONS MLEG CLOSE: {pos.symbol} {pos.strategy} "
-                    f"({len(pos.legs)} legs, {pos.contracts} contract(s))"
-                )
+                if _close_limit_price is not None:
+                    payload["type"] = "limit"
+                    payload["limit_price"] = str(_close_limit_price)
+                    log.info(
+                        f"OPTIONS MLEG CLOSE (limit @ {_close_limit_price:+.2f}): "
+                        f"{pos.symbol} {pos.strategy} ({len(pos.legs)} legs, {pos.contracts} contract(s))"
+                    )
+                else:
+                    payload["type"] = "market"
+                    log.info(
+                        f"OPTIONS MLEG CLOSE (market fallback): {pos.symbol} {pos.strategy} "
+                        f"({len(pos.legs)} legs, {pos.contracts} contract(s))"
+                    )
                 self.client.post("/orders", payload)
 
             else:
