@@ -34,6 +34,7 @@ last_edgar_scan:           float      = 0.0
 # Sympathy + EDGAR tickers queued for the NEXT scan cycle.
 # get_scan_targets() pops these to the front so they are guaranteed to be scanned.
 _priority_scan_queue:      List[str]  = []
+last_alpaca_mover_scan:    float      = 0.0
 _ti_future                            = None
 _ti_started_at:            float      = 0.0
 _ti_warned_running:        bool       = False
@@ -480,6 +481,76 @@ def scan_sympathy_and_edgar(
             log.debug(f"[EDGAR] Scan error: {exc}")
         finally:
             last_edgar_scan = now
+
+
+def scan_alpaca_movers(*, interval_min: float = 10.0) -> None:
+    """Fetch Alpaca Most Actives + Market Movers and inject qualifying symbols
+    into the priority scan queue.
+
+    The endpoint resets at market open — data before 09:30 ET is from the
+    previous session, so we only run during regular market hours.
+    """
+    global last_alpaca_mover_scan, _priority_scan_queue
+
+    from engine.utils import is_market_open
+
+    if not is_market_open():
+        return
+
+    now = time.time()
+    if now - last_alpaca_mover_scan < interval_min * 60:
+        return
+
+    try:
+        import engine.config as _cfg
+        from alpaca.data.historical.screener import ScreenerClient
+        from alpaca.data.requests import MostActivesRequest, MarketMoversRequest
+        from alpaca.data.enums import MostActivesBy
+
+        sc = ScreenerClient(_cfg.API_KEY, _cfg.API_SECRET)
+
+        actives_resp = sc.get_most_actives(MostActivesRequest(by=MostActivesBy.VOLUME, top=30))
+        # Build a set of symbols that cleared the trade-count floor (real participation)
+        active_syms = {
+            a.symbol
+            for a in actives_resp.most_actives
+            if int(a.trade_count) >= 10_000
+        }
+
+        movers_resp = sc.get_market_movers(MarketMoversRequest(market_type="stocks", top=20))
+
+        injected: List[str] = []
+        queue_set = set(_priority_scan_queue)
+        delisted  = set(_cfg.DELISTED_STOCKS)
+
+        for m in movers_resp.gainers:
+            sym = m.symbol
+            # Structural filter: warrants/rights have > 5 chars (e.g. BZAIW, GFAIW)
+            if len(sym) > 5:
+                continue
+            # Price band: cheap enough for options chains, not so high position-sizing breaks
+            if not (5.0 <= float(m.price) <= 500.0):
+                continue
+            # Move band: meaningful but not a halt/binary-news situation
+            if not (3.0 <= float(m.percent_change) <= 40.0):
+                continue
+            # Volume confirmation: must also appear in most actives
+            if sym not in active_syms:
+                continue
+            if sym in queue_set or sym in delisted:
+                continue
+            _priority_scan_queue.append(sym)
+            queue_set.add(sym)
+            injected.append(sym)
+
+        last_alpaca_mover_scan = now
+        if injected:
+            log.info(f"[ALPACA-MOVERS] {len(injected)} gainers queued for scan: {injected}")
+        else:
+            log.debug("[ALPACA-MOVERS] No gainers passed filters this cycle")
+
+    except Exception as exc:
+        log.warning(f"[ALPACA-MOVERS] Screener fetch failed: {exc}")
 
 
 def scan_tradeideas_toplists(

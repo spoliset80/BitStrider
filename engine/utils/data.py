@@ -146,26 +146,47 @@ def get_finnhub_trending_tickers() -> List[str]:
 
 
 def check_sentiment_gate(ticker: str) -> Tuple[bool, float]:
-    """Return (passes_gate, bullish_pct) from Finnhub news sentiment.
+    """Return (passes_gate, bullish_pct) from Alpaca News headline sentiment.
 
-    Returns (True, 0.5) when the API key is absent or the call fails —
-    defaulting to allow so a Finnhub outage doesn't block all trades.
+    Scores the last 10 news headlines for *ticker* using keyword matching.
+    Returns (True, 0.5) when credentials are absent or the call fails —
+    defaulting to allow so a news outage never blocks all trades.
     """
-    from engine.config import FINNHUB_API_KEY, SENTIMENT_BULLISH_THRESHOLD
-    if not FINNHUB_API_KEY:
+    from engine import config as _cfg
+    from engine.config import SENTIMENT_BULLISH_THRESHOLD
+    if not _cfg.API_KEY or not _cfg.API_SECRET:
         return True, 0.5
     try:
-        import requests
-        resp = requests.get(
-            f"https://finnhub.io/api/v1/news-sentiment?symbol={ticker}&token={FINNHUB_API_KEY}",
+        import requests as _req
+        resp = _req.get(
+            "https://data.alpaca.markets/v1beta1/news",
+            params={"symbols": ticker, "limit": 10, "sort": "desc"},
+            headers={
+                "APCA-API-KEY-ID": _cfg.API_KEY,
+                "APCA-API-SECRET-KEY": _cfg.API_SECRET,
+            },
             timeout=5,
         )
         resp.raise_for_status()
-        data      = resp.json()
-        sentiment = data.get("sentiment")
-        if sentiment:
-            bullish_pct = sentiment.get("bullishPercent", 50.0) / 100.0
-            return bullish_pct >= SENTIMENT_BULLISH_THRESHOLD, bullish_pct
-        return False, 0.0
+        articles = resp.json().get("news", [])
+        if not articles:
+            return True, 0.5
+
+        _BULLISH = {"upgrade", "beat", "surge", "raises", "record", "strong", "buy", "outperform"}
+        _BEARISH = {"downgrade", "miss", "decline", "cut", "weak", "sell", "underperform",
+                    "loss", "warning", "recall"}
+        bullish = bearish = 0
+        for art in articles:
+            headline = art.get("headline", "").lower()
+            if any(w in headline for w in _BULLISH):
+                bullish += 1
+            elif any(w in headline for w in _BEARISH):
+                bearish += 1
+
+        total = bullish + bearish
+        bullish_pct = bullish / max(total, 1)
+        if total == 0:
+            return True, 0.5
+        return bullish_pct >= SENTIMENT_BULLISH_THRESHOLD, bullish_pct
     except Exception:
         return True, 0.5

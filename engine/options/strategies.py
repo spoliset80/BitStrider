@@ -395,6 +395,8 @@ def _get_chain_alpaca(
         underlying_symbol=symbol,
         expiration_date_gte=exp_gte,
         expiration_date_lte=exp_lte,
+        strike_price_gte=round(spot * 0.70, 2),
+        strike_price_lte=round(spot * 1.30, 2),
     )
     snapshots = client.get_option_chain(req)
     if not snapshots:

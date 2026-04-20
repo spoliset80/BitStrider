@@ -21,7 +21,7 @@ import json
 import re
 from alpaca.trading.client import TradingClient
 from alpaca.data.historical.option import OptionHistoricalDataClient
-from alpaca.data.requests import OptionLatestQuoteRequest
+from alpaca.data.requests import OptionSnapshotRequest
 from alpaca.trading.requests import (
     LimitOrderRequest,
     MarketOrderRequest,
@@ -605,6 +605,45 @@ class OptionsExecutor:
         if not self._is_account_tradeable():
             return False
 
+        # 1c. Corporate actions guard — block entry if a reverse split or merger is
+        #     pending for the underlying within the next 14 calendar days.
+        #     Uses the Alpaca corporate actions endpoint (same auth credentials).
+        try:
+            import requests as _req
+            import datetime as _dt
+            _today = _dt.date.today()
+            _ca_resp = _req.get(
+                "https://data.alpaca.markets/v1beta1/corporate_actions",
+                params={
+                    "symbols": signal.symbol,
+                    "types": "reverse_split,cash_merger,stock_merger,stock_and_cash_merger",
+                    "start": _today.isoformat(),
+                    "end": (_today + _dt.timedelta(days=14)).isoformat(),
+                    "limit": 10,
+                },
+                headers={
+                    "APCA-API-KEY-ID": API_KEY,
+                    "APCA-API-SECRET-KEY": API_SECRET,
+                },
+                timeout=5,
+            )
+            _ca_resp.raise_for_status()
+            _ca_data = _ca_resp.json()
+            _ca_events = (
+                _ca_data.get("reverse_splits", [])
+                + _ca_data.get("cash_mergers", [])
+                + _ca_data.get("stock_mergers", [])
+                + _ca_data.get("stock_and_cash_mergers", [])
+            )
+            if _ca_events:
+                log.info(
+                    f"[OPTIONS] Corporate action pending for {signal.symbol} within 14 days "
+                    f"({len(_ca_events)} event(s)) — skipping entry"
+                )
+                return False
+        except Exception:
+            pass  # network/parse failure — allow entry rather than block all trades
+
         # 2. PDT & Account Guard
         is_small_account, dt_remaining = self._check_pdt_status()
         if is_small_account:
@@ -940,17 +979,18 @@ class OptionsExecutor:
                     del self._positions[occ_sym]
                     continue
 
-                # Fetch live quotes for all legs in one API call
+                # Fetch live snapshots for all legs in one API call.
+                # OptionsSnapshot includes bid/ask (latest_quote) + greeks + IV.
                 _leg_syms = [l["occ_symbol"] for l in pos.legs]
-                _quotes = self.data_client.get_option_latest_quote(
-                    OptionLatestQuoteRequest(symbol_or_symbols=_leg_syms)
+                _snaps = self.data_client.get_option_snapshot(
+                    OptionSnapshotRequest(symbol_or_symbols=_leg_syms)
                 )
                 current_mark = 0.0
                 for leg in pos.legs:
-                    _q = _quotes.get(leg["occ_symbol"])
-                    if _q is None:
-                        raise ValueError(f"no quote for {leg['occ_symbol']}")
-                    _mid  = (float(_q.bid_price) + float(_q.ask_price)) / 2.0
+                    _s = _snaps.get(leg["occ_symbol"])
+                    if _s is None or _s.latest_quote is None:
+                        raise ValueError(f"no snapshot/quote for {leg['occ_symbol']}")
+                    _mid  = (float(_s.latest_quote.bid_price) + float(_s.latest_quote.ask_price)) / 2.0
                     _sign = 1 if leg["side"] == "buy" else -1
                     current_mark += _sign * _mid
 
@@ -978,6 +1018,12 @@ class OptionsExecutor:
                 # Per-position stop: tighter for open-window entries (25%) vs global (30%)
                 # Must be computed BEFORE the outer check so tighter stops are reachable.
                 _eff_stop = pos.open_stop_pct if pos.open_stop_pct > 0 else OPTIONS_STOP_LOSS_PCT
+                # DTE-tightened stop: as expiry nears, tighten stop to preserve remaining value.
+                # Only applies to standard spreads/naked (butterfly/condor use separate logic below).
+                if dte <= 13:
+                    _eff_stop = min(_eff_stop, 15.0)
+                elif dte <= 20:
+                    _eff_stop = min(_eff_stop, 22.0)
 
                 # ── Butterfly-specific exit logic ─────────────────────────────
                 # % P&L stop is meaningless for butterflies: max loss is already

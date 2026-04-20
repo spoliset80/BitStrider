@@ -25,6 +25,8 @@ from engine.config import (
     BEAR_SHORT_UNIVERSE,
 )
 from engine.utils import clear_bar_cache, get_bars, is_market_open, is_dead_ticker
+from engine.utils.bars import get_data_client as _get_data_client
+from alpaca.data import StockSnapshotRequest as _StockSnapshotRequest
 from .universe import get_tier as _get_tier_live, get_latest_batch as _get_latest_batch, get_ti_primary as _get_ti_primary
 from .discovery import get_priority_scan_queue as _get_priority_scan_queue
 
@@ -37,6 +39,34 @@ from engine.utils.market import _is_bull_regime, _INVERSE_ETFS
 # slices of the universe are covered across consecutive cycles.
 _scan_offset: int = 0
 
+# ── Batch snapshot cache ──────────────────────────────────────────────────────
+# Populated once at the start of each scan_universe() call via a single
+# batch request.  _passes_guardrails() reads from this cache to avoid
+# per-symbol 1-minute bars requests (390 bars × N symbols = dominant I/O cost).
+_snapshot_cache: Dict = {}
+
+
+def _prefetch_snapshots(symbols: List[str]) -> None:
+    """Batch-fetch stock snapshots for *symbols* and store in _snapshot_cache.
+
+    A single API call replaces N individual get_bars("1d","1m") requests in
+    _passes_guardrails(), reducing scan latency significantly for large universes.
+    Failures are silently swallowed — _passes_guardrails() falls back to bars.
+    """
+    global _snapshot_cache
+    _snapshot_cache = {}
+    if not symbols:
+        return
+    try:
+        client = _get_data_client()
+        snaps = client.get_stock_snapshot(
+            _StockSnapshotRequest(symbol_or_symbols=symbols)
+        )
+        if isinstance(snaps, dict):
+            _snapshot_cache = snaps
+    except Exception:
+        pass  # fall back to per-symbol get_bars in _passes_guardrails
+
 
 def _passes_guardrails(symbol: str, bull_regime: bool = None) -> bool:
     """Pre-scan gates: dollar-volume, RVOL, and gap-chase guard.
@@ -47,12 +77,24 @@ def _passes_guardrails(symbol: str, bull_regime: bool = None) -> bool:
     If None, falls back to calling _is_bull_regime() directly.
     """
     try:
-        intraday = get_bars(symbol, "1d", "1m")
-        if intraday.empty or len(intraday) < 5:
-            return True  # not enough data — let strategies decide
-
-        price   = float(intraday["close"].iloc[-1])
-        day_vol = float(intraday["volume"].sum())
+        # ── Fast path: use batch-prefetched snapshot (no per-symbol HTTP call) ─
+        _snap = _snapshot_cache.get(symbol)
+        if (
+            _snap is not None
+            and _snap.daily_bar is not None
+            and _snap.latest_trade is not None
+        ):
+            price   = float(_snap.latest_trade.price)
+            day_vol = float(_snap.daily_bar.volume)
+            open_px = float(_snap.daily_bar.open)
+        else:
+            # ── Fallback: fetch 1-min intraday bars ───────────────────────────
+            intraday = get_bars(symbol, "1d", "1m")
+            if intraday.empty or len(intraday) < 5:
+                return True  # not enough data — let strategies decide
+            price   = float(intraday["close"].iloc[-1])
+            day_vol = float(intraday["volume"].sum())
+            open_px = float(intraday["open"].iloc[0])
 
         # Minimum price gate — skip penny stocks (poor fills, wide spreads)
         if price < MIN_STOCK_PRICE:
@@ -80,14 +122,20 @@ def _passes_guardrails(symbol: str, bull_regime: bool = None) -> bool:
                         return False
 
         # Gap-chase guard: skip if up >MAX_GAP_CHASE_PCT% without a tight consolidation base
-        open_px = float(intraday["open"].iloc[0])
         if open_px > 0:
             day_gain = ((price - open_px) / open_px) * 100
             if day_gain > MAX_GAP_CHASE_PCT:
-                last_n    = intraday.iloc[-GAP_CHASE_CONSOL_BARS:]
-                bar_range = float(last_n["high"].max() - last_n["low"].min())
-                if bar_range > price * 0.02:  # range > 2% = no consolidation
-                    return False
+                # When 1-min bars are available, require tight recent consolidation.
+                # With snapshot-only data, skip the consolidation check (conservative:
+                # allows the signal — strategy-level filters apply next).
+                _snap_fast_path = _snapshot_cache.get(symbol) is not None and \
+                    _snapshot_cache[symbol].daily_bar is not None and \
+                    _snapshot_cache[symbol].latest_trade is not None
+                if not _snap_fast_path:
+                    last_n    = intraday.iloc[-GAP_CHASE_CONSOL_BARS:]
+                    bar_range = float(last_n["high"].max() - last_n["low"].min())
+                    if bar_range > price * 0.02:  # range > 2% = no consolidation
+                        return False
 
         return True
     except Exception as e:
@@ -198,6 +246,11 @@ def get_scan_targets(excluded: Set[str] = None) -> List[str]:
 
 def scan_universe(scan_targets: List[str], sentiment: str) -> Tuple[List, Dict[str, int], int]:
     clear_bar_cache()
+
+    # Batch-prefetch stock snapshots for all scan targets in one API call.
+    # Populates _snapshot_cache so _passes_guardrails() avoids per-symbol
+    # get_bars("1d","1m") requests — the dominant I/O cost of each scan cycle.
+    _prefetch_snapshots(scan_targets)
 
     # Compute regime ONCE here before spawning workers — avoids a thread race where
     # multiple workers concurrently hit the 15-min TTL expiry and each make a

@@ -379,7 +379,7 @@ TRADEIDEAS_UPDATE_CONFIG_FILE                     = True
 TI_PRIMARY_SCAN_BATCH_LIMIT                       = int(__import__('os').getenv('TI_PRIMARY_SCAN_BATCH_LIMIT', '50'))
 
 # Sector sympathy scanner — injects peer tickers when a leader stock fires
-USE_SECTOR_SYMPATHY          = os.getenv("USE_SECTOR_SYMPATHY",  "true").lower() in ("1", "true", "yes")
+USE_SECTOR_SYMPATHY          = False  # disabled — EDGAR 8-K is the primary discovery signal
 SECTOR_SYMPATHY_INTERVAL_MIN = int(os.getenv("SECTOR_SYMPATHY_INTERVAL_MIN", "15"))
 
 # EDGAR 8-K feed scanner — injects tickers from material event filings (free, no auth)
@@ -595,6 +595,7 @@ BEAR_BREAKDOWN = {
 # ─────────────────────────────────────────────────────────────────
 RVOL_MIN                 = 2.0         # Require relative volume ≥ 2x before entering
 MIN_STOCK_PRICE          = 3.0         # Skip penny stocks below $3 (poor fill quality, high spread)
+ALPACA_MOVER_SCAN_INTERVAL_MIN = 10   # Re-poll Alpaca screener every 10 min (resets at market open)
 MIN_DOLLAR_VOLUME        = 20_000_000  # Skip illiquid setups: price × day_vol < $20M
 MAX_GAP_CHASE_PCT        = 15.0       # Skip if already up >15% without consolidation
 GAP_CHASE_CONSOL_BARS    = 5          # Number of 1-min bars to check for tight base

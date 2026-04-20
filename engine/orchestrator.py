@@ -154,6 +154,9 @@ def _run_discovery() -> None:
         priority_1=cfg.PRIORITY_1_MOMENTUM,
         priority_2=cfg.PRIORITY_2_ESTABLISHED,
     )
+    _discovery.scan_alpaca_movers(
+        interval_min=cfg.ALPACA_MOVER_SCAN_INTERVAL_MIN,
+    )
 
 
 # ── Options cycle ─────────────────────────────────────────────────────────────
