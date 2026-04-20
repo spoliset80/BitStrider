@@ -30,7 +30,8 @@ from .discovery import get_priority_scan_queue as _get_priority_scan_queue
 
 _ET  = pytz.timezone("America/New_York")
 _log = logging.getLogger("ApexTrader")
-from .strategies import get_strategy_instances, MomentumStrategy, TechnicalStrategy, SentimentStrategy, _is_bull_regime, _INVERSE_ETFS
+from .strategies import get_strategy_instances, MomentumStrategy, TechnicalStrategy, SentimentStrategy
+from engine.utils.market import _is_bull_regime, _INVERSE_ETFS
 
 # Rotating scan offset — advances by SCAN_MAX_SYMBOLS each call so different
 # slices of the universe are covered across consecutive cycles.

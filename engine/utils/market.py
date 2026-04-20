@@ -204,3 +204,47 @@ def get_live_holdings(client) -> Tuple[set, set, set]:
     except Exception as e:
         log.warning(f"get_live_holdings failed: {e}")
         return set(), set(), set()
+
+
+# ── Market regime (SPY 200-SMA) ───────────────────────────────────────────────
+# Canonical single-source definition — imported by equity, options, scan, orchestrator.
+# Previously duplicated in equity/strategies.py as a private underscore function.
+
+_regime_cache: dict = {"ts": 0.0, "bull": True}
+_REGIME_TTL   = 900  # 15-min cache
+
+
+def is_bull_regime() -> bool:
+    """Return True when SPY is above its 200-day SMA (bullish macro regime).
+
+    Cached for 15 min. Defaults to True on any fetch failure so strategies stay live.
+    """
+    import time as _t
+    now = _t.monotonic()
+    if now - _regime_cache["ts"] < _REGIME_TTL:
+        return _regime_cache["bull"]
+    try:
+        from engine.utils.bars import get_bars
+        spy    = get_bars("SPY", "250d", "1d")
+        if spy.empty or len(spy) < 200:
+            _regime_cache.update({"ts": now, "bull": True})
+            return True
+        sma200 = float(spy["close"].rolling(200).mean().iloc[-1])
+        price  = float(spy["close"].iloc[-1])
+        bull   = price > sma200
+    except Exception:
+        bull = True
+    _regime_cache.update({"ts": now, "bull": bull})
+    return bull
+
+
+# Backward-compat alias — callers using the private name still work
+_is_bull_regime = is_bull_regime
+
+
+# ── Inverse ETF universe ──────────────────────────────────────────────────────
+# ETFs that profit from market declines — treated as LONG buys in bear regime.
+INVERSE_ETFS: frozenset = frozenset({
+    "SQQQ", "SPXU", "UVXY", "TZA", "FAZ", "SOXS", "LABD", "DUST",
+})
+_INVERSE_ETFS = INVERSE_ETFS   # backward-compat private alias

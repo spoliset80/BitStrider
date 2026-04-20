@@ -1,4 +1,4 @@
-﻿"""
+"""
 ApexTrader - Options Strategies (Level 3 Account) — A+ Edition
 Professional-grade options strategies with multi-layer entry filters:
 
@@ -64,7 +64,12 @@ from engine.config import (
     MEMORY_WARN_MB,
     get_options_universe,
 )
-from engine.equity.strategies import _is_bull_regime, _calc_atr14, _INVERSE_ETFS
+from engine.utils.market import _is_bull_regime, _INVERSE_ETFS
+from engine.utils.bars import calculate_atr as _calc_atr14_base
+
+def _calc_atr14(bars, period: int = 14) -> float:
+    from engine.utils.bars import calculate_atr
+    return calculate_atr(bars, period)
 
 _OPTIONS_UNIVERSE_CACHE: list[str] | None = None
 _OPTIONS_UNIVERSE_CACHE_TS: datetime.datetime = datetime.datetime.min.replace(tzinfo=datetime.timezone.utc)
@@ -135,15 +140,14 @@ def get_dynamic_option_filters():
             "IV_RANK_PUT_MAX": 70.0 if bull else 80.0,  # bear crash = elevated IV is the environment, not a reason to skip puts
         }
 
-# Use these in all filter checks below
-_FILTERS = get_dynamic_option_filters()
-_MAX_SPREAD_PCT   = _FILTERS["MAX_SPREAD_PCT"]
-_MIN_OI_ATM       = _FILTERS["MIN_OI_ATM"]
-_MAX_PREMIUM_SPOT = _FILTERS["MAX_PREMIUM_SPOT"]
-_MIN_RR           = _FILTERS["MIN_RR"]
-_IV_RANK_CALL_MAX = _FILTERS["IV_RANK_CALL_MAX"]
-_IV_RANK_PUT_MAX  = _FILTERS["IV_RANK_PUT_MAX"]
-_IV_RANK_CC_MIN   = 50.0  # covered calls: sell when IV is elevated (static)
+# Filter thresholds are fetched fresh per-strategy call via get_dynamic_option_filters().
+# Do NOT assign module-level globals here — they would reflect regime at import time, not
+# at scan time. Each strategy's scan() calls _get_filters() at entry instead.
+_IV_RANK_CC_MIN = 50.0   # covered calls: sell when IV is elevated (static, regime-independent)
+
+def _get_filters() -> dict:
+    """Return fresh regime-adaptive filter thresholds. Call once per strategy scan()."""
+    return get_dynamic_option_filters()
 
 
 # -- Data Structures -----------------------------------------------------------
@@ -467,7 +471,7 @@ def _pick_strike(
         df = df[(df["bid"] > 0) & (df["ask"] > 0)].copy()
         df["mid"]        = (df["bid"] + df["ask"]) / 2
         df["spread_pct"] = (df["ask"] - df["bid"]) / df["mid"].clip(lower=0.01) * 100
-        df = df[df["spread_pct"] <= _MAX_SPREAD_PCT]
+        df = df[df["spread_pct"] <= f["MAX_SPREAD_PCT"]]
     else:
         df["mid"]        = df.get("lastprice", 0)
         df["spread_pct"] = 100.0
@@ -628,6 +632,7 @@ class MomentumCallStrategy:
     name = "MomentumCall"
 
     def scan(self, symbol: str) -> Optional[OptionSignal]:
+        f = _get_filters()
         if not OPTIONS_ENABLED:
             return None
         # Inverse ETFs (SQQQ, SPXU, UVXY…) go UP in bear markets — allow calls on
@@ -668,8 +673,8 @@ class MomentumCallStrategy:
                 return None
 
             # A+ Filter 4: IV rank -- buy cheap premium only
-            if chain.iv_rank > _IV_RANK_CALL_MAX:
-                log.debug(f"MomentumCall {symbol}: IV rank {chain.iv_rank:.0f} > {_IV_RANK_CALL_MAX} (dynamic) -- skip")
+            if chain.iv_rank > f["IV_RANK_CALL_MAX"]:
+                log.debug(f"MomentumCall {symbol}: IV rank {chain.iv_rank:.0f} > {f["IV_RANK_CALL_MAX"]} (dynamic) -- skip")
                 return None
 
             strike_row = _pick_strike(chain.calls, ctx.spot, OPTIONS_DELTA_TARGET)
@@ -687,26 +692,26 @@ class MomentumCallStrategy:
                 return None
 
             # A+ Filter 5: Premium/spot cap
-            if mid / ctx.spot * 100 > _MAX_PREMIUM_SPOT:
+            if mid / ctx.spot * 100 > f["MAX_PREMIUM_SPOT"]:
                 return None
 
             # A+ Filter 6: R/R gate
             rr = _calc_rr(chain.atr14, dte, mid)
-            if rr < _MIN_RR:
+            if rr < f["MIN_RR"]:
                 return None
 
             # A+ OI gate at ATM — skip if Alpaca returns no OI data (all zeros)
             if "openinterest" in chain.calls.columns and chain.calls["openinterest"].max() > 0:
                 atm = chain.calls[(chain.calls["strike"] >= ctx.spot * 0.90) & (chain.calls["strike"] <= ctx.spot * 1.10)]
-                if int(atm["openinterest"].sum()) < _MIN_OI_ATM:
+                if int(atm["openinterest"].sum()) < f["MIN_OI_ATM"]:
                     return None
 
             # A+ Confidence formula
             conf  = 0.72
             conf += min(0.06, (ctx.chg_pct - 3.0) * 0.015)
             conf += min(0.05, (ctx.vol_ratio - 1.5) * 0.025)
-            conf += min(0.04, (_IV_RANK_CALL_MAX - chain.iv_rank) * 0.001)
-            conf += min(0.04, (rr - _MIN_RR) * 0.02)
+            conf += min(0.04, (f["IV_RANK_CALL_MAX"] - chain.iv_rank) * 0.001)
+            conf += min(0.04, (rr - f["MIN_RR"]) * 0.02)
             if ctx.spot > prior_5d_high:
                 conf += 0.03   # genuine breakout bonus
             confidence = round(min(0.97, conf), 3)
@@ -752,14 +757,15 @@ class BearPutStrategy:
     - 20-EMA declining AND price below EMA (bull strict; bear waived if macro downtrend)
     - 3-day downside momentum OR 5-consecutive-day 50-EMA downtrend (bear)
     - Price broke below prior 5-day low (waived on crash days in bear)
-    - IV rank < _IV_RANK_PUT_MAX (buy spreads even in elevated IV — short leg hedges)
+    - IV rank < f["IV_RANK_PUT_MAX"] (buy spreads even in elevated IV — short leg hedges)
     - Spread R/R (max_profit / net_debit) >= 1.0
-    - ATM OI >= _MIN_OI_ATM
+    - ATM OI >= f["MIN_OI_ATM"]
     """
 
     name = "BearPut"
 
     def scan(self, symbol: str) -> Optional[OptionSignal]:
+        f = _get_filters()
         if not OPTIONS_ENABLED:
             return None
         if symbol not in _get_options_universe():
@@ -813,8 +819,8 @@ class BearPutStrategy:
                 return None
 
             # IV gate — spreads tolerate higher IV since short leg hedges premium cost
-            if chain.iv_rank > _IV_RANK_PUT_MAX:
-                log.debug(f"BearPut {symbol}: IV rank {chain.iv_rank:.0f} > {_IV_RANK_PUT_MAX} — skip")
+            if chain.iv_rank > f["IV_RANK_PUT_MAX"]:
+                log.debug(f"BearPut {symbol}: IV rank {chain.iv_rank:.0f} > {f["IV_RANK_PUT_MAX"]} — skip")
                 return None
 
             # Long leg: δ0.40 (ATM/slight ITM)
@@ -869,13 +875,13 @@ class BearPutStrategy:
             # A+ OI gate at ATM — skip if Alpaca returns no OI data (all zeros)
             if "openinterest" in chain.puts.columns and chain.puts["openinterest"].max() > 0:
                 atm = chain.puts[(chain.puts["strike"] >= ctx.spot * 0.90) & (chain.puts["strike"] <= ctx.spot * 1.10)]
-                if int(atm["openinterest"].sum()) < _MIN_OI_ATM:
+                if int(atm["openinterest"].sum()) < f["MIN_OI_ATM"]:
                     return None
 
             conf  = 0.72
             conf += min(0.07, abs(ctx.chg_pct - abs(chg_thresh)) * 0.015)
             conf += min(0.05, (ctx.vol_ratio - 1.2) * 0.025)
-            conf += min(0.04, (_IV_RANK_PUT_MAX - chain.iv_rank) * 0.001)
+            conf += min(0.04, (f["IV_RANK_PUT_MAX"] - chain.iv_rank) * 0.001)
             conf += min(0.05, (spread_rr - 1.0) * 0.025)
             if not bull:
                 conf += 0.04
@@ -931,6 +937,7 @@ class CoveredCallStrategy:
         qty_held: int,
         existing_option_symbols: set,
     ) -> Optional[OptionSignal]:
+        f = _get_filters()
         if not OPTIONS_ENABLED:
             return None
         if qty_held < CONTRACT_SIZE:
@@ -1007,11 +1014,53 @@ class CoveredCallStrategy:
 
 # -- New Strategy Helpers ------------------------------------------------------
 
+# Session-level earnings cache — {symbol: next_earnings_date or None}
+# Earnings dates are stable intraday so a session cache is sufficient.
+_earnings_cache: dict = {}
+
 def _no_earnings_soon(symbol: str, days: int = 15) -> bool:
-    """Return True if no earnings are expected within `days` calendar days.
-    Earnings calendar data requires a third-party feed (removed); always
-    returns True (fail-safe: allow the trade).
+    """Return True if no earnings are expected within *days* calendar days.
+
+    Data source: yfinance Ticker.calendar — returns the next earnings date
+    for most US-listed stocks. Falls back to True (allow trade) when:
+      - yfinance is not installed
+      - the calendar field is absent or unparseable
+      - the API call fails
+    so a yfinance outage never blocks all option trades.
     """
+    if symbol in _earnings_cache:
+        next_date = _earnings_cache[symbol]
+        if next_date is None:
+            return True   # no date known — allow
+        return (next_date - datetime.date.today()).days > days
+
+    try:
+        import yfinance as _yf
+        cal = _yf.Ticker(symbol).calendar
+        # calendar is a dict; earnings date is under "Earnings Date" key
+        # yfinance returns it as a list of Timestamps or a single Timestamp
+        earnings_entry = None
+        if cal is not None:
+            raw = cal.get("Earnings Date") or cal.get("Earnings Dates")
+            if raw is not None:
+                if hasattr(raw, "__iter__") and not isinstance(raw, str):
+                    raw_list = list(raw)
+                    earnings_entry = raw_list[0] if raw_list else None
+                else:
+                    earnings_entry = raw
+        if earnings_entry is not None:
+            import pandas as _pd
+            ts = _pd.Timestamp(earnings_entry)
+            next_date = ts.date()
+            _earnings_cache[symbol] = next_date
+            gap = (next_date - datetime.date.today()).days
+            if gap <= days:
+                log.debug(f"{symbol}: earnings in {gap}d — skipping options entry")
+            return gap > days
+    except Exception as e:
+        log.debug(f"_no_earnings_soon({symbol}): yfinance failed ({e}) — allowing trade")
+
+    _earnings_cache[symbol] = None   # cache miss — no date available
     return True
 
 
@@ -1130,12 +1179,13 @@ class BearCallSpreadStrategy:
     - 3-day trend flat/down: not in a genuine breakout
     - No earnings within OPTIONS_EARNINGS_AVOID_DAYS
     - Spread R/R (credit / max_loss) >= 0.35 (collect at least 35% of width)
-    - ATM OI >= _MIN_OI_ATM, spread <= _MAX_SPREAD_PCT
+    - ATM OI >= f["MIN_OI_ATM"], spread <= f["MAX_SPREAD_PCT"]
     """
 
     name = "BearCallSpread"
 
     def scan(self, symbol: str) -> Optional[OptionSignal]:
+        f = _get_filters()
         if not OPTIONS_ENABLED:
             return None
         # Inverse ETFs go UP in bear — selling calls on them is wrong direction
@@ -1234,7 +1284,7 @@ class BearCallSpreadStrategy:
             # OI gate — skip if Alpaca returns no OI data (all zeros)
             if "openinterest" in chain.calls.columns and chain.calls["openinterest"].max() > 0:
                 atm = chain.calls[(chain.calls["strike"] >= ctx.spot * 0.90) & (chain.calls["strike"] <= ctx.spot * 1.10)]
-                if int(atm["openinterest"].sum()) < _MIN_OI_ATM:
+                if int(atm["openinterest"].sum()) < f["MIN_OI_ATM"]:
                     return None
 
             dte    = (chain.expiry - datetime.date.today()).days
@@ -1357,6 +1407,7 @@ class ShortSqueezeStrategy:
     name = "ShortSqueeze"
 
     def scan(self, symbol: str) -> Optional[OptionSignal]:
+        f = _get_filters()
         if not OPTIONS_ENABLED:
             return None
         if not _YF_AVAILABLE:
@@ -1448,7 +1499,7 @@ class ShortSqueezeStrategy:
                     (chain.calls["strike"] >= ctx.spot * 0.90) &
                     (chain.calls["strike"] <= ctx.spot * 1.10)
                 ]
-                if int(atm["openinterest"].sum()) < _MIN_OI_ATM:
+                if int(atm["openinterest"].sum()) < f["MIN_OI_ATM"]:
                     return None
 
             # -- Mode decision: naked call vs bull call spread ----------------
@@ -1557,7 +1608,7 @@ class ShortSqueezeStrategy:
                 if long_mid / ctx.spot * 100 > 4.0:
                     return None
                 rr = _calc_rr(chain.atr14, dte, long_mid)
-                if rr < _MIN_RR:
+                if rr < f["MIN_RR"]:
                     return None
 
                 conf = 0.70
@@ -1565,7 +1616,7 @@ class ShortSqueezeStrategy:
                 conf += min(0.04, rev_growth * 0.15)
                 if rs_13w is not None:
                     conf += min(0.04, rs_13w * 0.001)
-                conf += min(0.03, (rr - _MIN_RR) * 0.015)
+                conf += min(0.03, (rr - f["MIN_RR"]) * 0.015)
                 conf += min(0.03, (ctx.vol_ratio - 1.1) * 0.03)
                 confidence = round(min(0.95, conf), 3)
 
@@ -1611,6 +1662,7 @@ class IronCondorStrategy:
     name = "IronCondor"
 
     def scan(self, symbol: str) -> Optional[OptionSignal]:
+        f = _get_filters()
         if not OPTIONS_ENABLED:
             return None
         try:
@@ -1725,12 +1777,13 @@ class ButterflyStrategy:
     - Wing width >= 2% of spot (filters micro-cap / illiquid chains)
     - Debit cap: net_debit <= 30% of wing_width (cost must be cheap relative to max payoff)
     - R/R gate: max_profit / net_debit >= 2.0
-    - OI >= _MIN_OI_ATM on ATM short strike
+    - OI >= f["MIN_OI_ATM"] on ATM short strike
     - No earnings within OPTIONS_EARNINGS_AVOID_DAYS
     """
     name = "Butterfly"
 
     def scan(self, symbol: str) -> Optional[OptionSignal]:
+        f = _get_filters()
         if not OPTIONS_ENABLED:
             return None
         try:
@@ -1808,7 +1861,7 @@ class ButterflyStrategy:
             oi      = int(mid_row.iloc[0].get("openinterest", 0))         if not mid_row.empty else 0
 
             # OI gate on the ATM short strike — skip if Alpaca returns no OI data (all zeros)
-            if oi > 0 and oi < _MIN_OI_ATM:
+            if oi > 0 and oi < f["MIN_OI_ATM"]:
                 return None
 
             # Confidence — starts low, must earn it; max 0.92 (pin trades are speculative)
@@ -1856,6 +1909,7 @@ class BreakoutRetestCallStrategy:
     name = "BreakoutRetest"
 
     def scan(self, symbol: str) -> Optional[OptionSignal]:
+        f = _get_filters()
         if not OPTIONS_ENABLED:
             return None
         is_inverse = symbol in _INVERSE_ETFS
@@ -1884,7 +1938,7 @@ class BreakoutRetestCallStrategy:
             chain = _get_options_chain(symbol)
             if chain is None:
                 return None
-            if chain.iv_rank > _IV_RANK_CALL_MAX:
+            if chain.iv_rank > f["IV_RANK_CALL_MAX"]:
                 return None
 
             # ATM call (delta ~0.50)
@@ -1899,17 +1953,17 @@ class BreakoutRetestCallStrategy:
             oi     = int(strike_row.get("openinterest", 0))
             dte    = (chain.expiry - datetime.date.today()).days
 
-            if mid <= 0 or mid / ctx.spot * 100 > _MAX_PREMIUM_SPOT:
+            if mid <= 0 or mid / ctx.spot * 100 > f["MAX_PREMIUM_SPOT"]:
                 return None
 
             rr = _calc_rr(chain.atr14, dte, mid)
-            if rr < _MIN_RR:
+            if rr < f["MIN_RR"]:
                 return None
 
             conf  = 0.75
             conf += min(0.06, (ctx.vol_ratio - 1.2) * 0.04)
-            conf += min(0.04, (_IV_RANK_CALL_MAX - chain.iv_rank) * 0.001)
-            conf += min(0.04, (rr - _MIN_RR) * 0.02)
+            conf += min(0.04, (f["IV_RANK_CALL_MAX"] - chain.iv_rank) * 0.001)
+            conf += min(0.04, (rr - f["MIN_RR"]) * 0.02)
             confidence = round(min(0.95, conf), 3)
 
             return OptionSignal(
@@ -1958,6 +2012,7 @@ class TrendPullbackSpreadStrategy:
     name = "TrendPullbackSpread"
 
     def scan(self, symbol: str) -> Optional[OptionSignal]:
+        f = _get_filters()
         if not OPTIONS_ENABLED:
             return None
         if not _is_bull_regime():
@@ -1986,7 +2041,7 @@ class TrendPullbackSpreadStrategy:
             chain = _get_options_chain(symbol)
             if chain is None:
                 return None
-            if chain.iv_rank > _IV_RANK_CALL_MAX:
+            if chain.iv_rank > f["IV_RANK_CALL_MAX"]:
                 return None
 
             # Long leg: ITM call delta 0.65
@@ -2039,7 +2094,7 @@ class TrendPullbackSpreadStrategy:
 
             conf  = 0.73
             conf += min(0.05, (52 - ctx.rsi) * 0.002)
-            conf += min(0.04, (_IV_RANK_CALL_MAX - chain.iv_rank) * 0.001)
+            conf += min(0.04, (f["IV_RANK_CALL_MAX"] - chain.iv_rank) * 0.001)
             conf += min(0.05, spread_rr * 0.02)
             confidence = round(min(0.95, conf), 3)
 
@@ -2089,6 +2144,7 @@ class MeanReversionCallStrategy:
     name = "MeanReversion"
 
     def scan(self, symbol: str) -> Optional[OptionSignal]:
+        f = _get_filters()
         if not OPTIONS_ENABLED:
             return None
 
@@ -2137,7 +2193,7 @@ class MeanReversionCallStrategy:
                 return None
 
             rr = _calc_rr(chain.atr14, dte, mid)
-            if rr < _MIN_RR:
+            if rr < f["MIN_RR"]:
                 return None
 
             sma20    = float(ctx.closes.rolling(20).mean().iloc[-1])
@@ -2146,7 +2202,7 @@ class MeanReversionCallStrategy:
 
             conf  = 0.70
             conf += min(0.08, (35 - ctx.rsi) * 0.003)
-            conf += min(0.04, (rr - _MIN_RR) * 0.02)
+            conf += min(0.04, (rr - f["MIN_RR"]) * 0.02)
             confidence = round(min(0.94, conf), 3)
 
             return OptionSignal(
@@ -2204,14 +2260,14 @@ def scan_options_universe(
         return []
 
     # Refresh regime-adaptive filter globals so they reflect current market conditions
-    global _MAX_SPREAD_PCT, _MIN_OI_ATM, _MAX_PREMIUM_SPOT, _MIN_RR, _IV_RANK_CALL_MAX, _IV_RANK_PUT_MAX
+    global f["MAX_SPREAD_PCT"], f["MIN_OI_ATM"], f["MAX_PREMIUM_SPOT"], f["MIN_RR"], f["IV_RANK_CALL_MAX"], f["IV_RANK_PUT_MAX"]
     _f = get_dynamic_option_filters()
-    _MAX_SPREAD_PCT   = _f["MAX_SPREAD_PCT"]
-    _MIN_OI_ATM       = _f["MIN_OI_ATM"]
-    _MAX_PREMIUM_SPOT = _f["MAX_PREMIUM_SPOT"]
-    _MIN_RR           = _f["MIN_RR"]
-    _IV_RANK_CALL_MAX = _f["IV_RANK_CALL_MAX"]
-    _IV_RANK_PUT_MAX  = _f["IV_RANK_PUT_MAX"]
+    f["MAX_SPREAD_PCT"]   = _f["MAX_SPREAD_PCT"]
+    f["MIN_OI_ATM"]       = _f["MIN_OI_ATM"]
+    f["MAX_PREMIUM_SPOT"] = _f["MAX_PREMIUM_SPOT"]
+    f["MIN_RR"]           = _f["MIN_RR"]
+    f["IV_RANK_CALL_MAX"] = _f["IV_RANK_CALL_MAX"]
+    f["IV_RANK_PUT_MAX"]  = _f["IV_RANK_PUT_MAX"]
 
     ti_universe = get_options_universe()
     if not ti_universe:

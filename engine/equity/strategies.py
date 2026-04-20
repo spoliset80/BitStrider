@@ -59,30 +59,10 @@ def _calc_atr14(bars: pd.DataFrame, period: int = 14) -> float:
         return 0.0
 
 
-# ── Market Regime Filter (SPY 200-SMA) ────────────────────────────────────────
-_regime_cache: dict = {"ts": 0.0, "bull": True}
-_REGIME_TTL   = 900  # seconds — refresh every 15 min
-
-def _is_bull_regime() -> bool:
-    """True when SPY is above its 200-day SMA (bullish regime).
-    Cached for 15 min to avoid excessive API calls.
-    Defaults to True on any fetch failure so strategies remain live.
-    """
-    now = time.monotonic()
-    if now - _regime_cache["ts"] < _REGIME_TTL:
-        return _regime_cache["bull"]
-    try:
-        spy = get_bars("SPY", "250d", "1d")
-        if spy.empty or len(spy) < 200:
-            _regime_cache.update({"ts": now, "bull": True})
-            return True
-        sma200 = float(spy["close"].rolling(200).mean().iloc[-1])
-        price  = float(spy["close"].iloc[-1])
-        bull   = price > sma200
-    except Exception:
-        bull = True
-    _regime_cache.update({"ts": now, "bull": bull})
-    return bull
+# ── Market Regime Filter ──────────────────────────────────────────────────────
+# Canonical implementation lives in engine.utils.market.
+# Imported here so existing strategy code continues to call _is_bull_regime() directly.
+from engine.utils.market import _is_bull_regime  # canonical regime function — shared across all strategy modules
 
 
 # ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
@@ -95,7 +75,11 @@ class SweepeaStrategy:
     def scan(self, symbol: str) -> Optional[Signal]:
         # ── Path A: daily 8/20-EMA pullback (post-squeeze secondary entry) ──────
         try:
-            daily = get_bars(symbol, "90d", "1d")
+            # Daily bar only meaningful after 10 AM ET — skip pre-market noise
+            if datetime.datetime.now(ET).hour >= 10:
+              daily = get_bars(symbol, "90d", "1d")
+            else:
+              daily = pd.DataFrame()
             if not daily.empty and len(daily) >= 25:
                 daily = daily.copy()
                 daily["ema8"]  = daily["close"].ewm(span=8,  adjust=False).mean()
@@ -257,6 +241,9 @@ class TrendBreakerStrategy:
     """
 
     def scan(self, symbol: str) -> Optional[Signal]:
+        # Daily bar only meaningful after 10 AM ET — pre-market bar has <5% of normal volume
+        if datetime.datetime.now(ET).hour < 10:
+            return None
         daily = get_bars(symbol, "60d", "1d")
         if daily.empty or len(daily) < 22:
             return None
@@ -723,22 +710,30 @@ class VWAPReclaimStrategy:
 # Float Rotation Strategy
 # ──────────────────────────────────────────────────────────────
 # Module-level caches — persist across scan cycles and strategy instances
-_float_info_cache: dict = {}
+_float_info_cache: dict = {}   # {symbol: float_shares or 0.0 if unavailable}
 _mcap_cache:        dict = {}  # {symbol: market_cap_float}
 
 def _get_float_shares(symbol: str) -> Optional[float]:
-    """Cached float share count for low-float strategies.
-    Returns None until a float data provider (Finviz, Alpaca, etc.) is wired in."""
+    """Cached float share count sourced from yfinance.
+
+    Returns None when float data is unavailable (yfinance not installed, or
+    the symbol has no float data). Caches both hits and misses for the session
+    so repeated scans of the same symbol don't re-fetch.
+    TTL: session-level (process restart clears it — float data is stable intraday).
+    """
     if symbol in _float_info_cache:
-        return _float_info_cache[symbol]
-    # Wire in a float data provider here when available:
-    # try:
-    #     shares = get_float_shares(symbol)
-    #     if shares and shares > 0:
-    #         _float_info_cache[symbol] = float(shares)
-    #         return float(shares)
-    # except Exception:
-    #     pass
+        v = _float_info_cache[symbol]
+        return v if v > 0 else None
+    try:
+        import yfinance as _yf
+        info   = _yf.Ticker(symbol).info
+        shares = info.get("floatShares") or info.get("sharesOutstanding")
+        if shares and float(shares) > 0:
+            _float_info_cache[symbol] = float(shares)
+            return float(shares)
+    except Exception:
+        pass
+    _float_info_cache[symbol] = 0.0   # cache miss so we don't re-fetch this session
     return None
 
 
@@ -1063,6 +1058,9 @@ class BearBreakdownStrategy:
             return None
         # Never short inverse ETFs — they're already bearish instruments
         if symbol in _INVERSE_ETFS:
+            return None
+        # Daily bar only meaningful after 10 AM ET
+        if datetime.datetime.now(ET).hour < 10:
             return None
 
         daily = get_bars(symbol, "60d", "1d")

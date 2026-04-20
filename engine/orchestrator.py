@@ -45,7 +45,8 @@ from .utils import (
     get_vix_interval,
     get_live_holdings,
 )
-from .equity.strategies import _is_bull_regime, Signal
+from .equity.strategies import Signal
+from .utils.market import _is_bull_regime
 from .equity.scan import get_scan_targets, scan_universe
 from .equity.universe import filter_universe_by_positions
 from .equity import discovery as _discovery
