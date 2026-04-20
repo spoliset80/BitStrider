@@ -129,6 +129,16 @@ def scan_tradeideas_toplists() -> None:
     )
 
 
+def scan_sympathy_and_edgar() -> None:
+    _discovery.scan_sympathy_and_edgar(
+        sympathy_enabled=cfg.USE_SECTOR_SYMPATHY,
+        edgar_enabled=cfg.USE_EDGAR_SCANNER,
+        sympathy_interval_min=cfg.SECTOR_SYMPATHY_INTERVAL_MIN,
+        edgar_interval_min=cfg.EDGAR_SCANNER_INTERVAL_MIN,
+        priority_1=cfg.PRIORITY_1_MOMENTUM,
+        priority_2=cfg.PRIORITY_2_ESTABLISHED,
+    )
+
 def scan_top3_only() -> None:
     sentiment = get_market_sentiment()
     log.info(f"Market sentiment: {sentiment}")
@@ -137,6 +147,7 @@ def scan_top3_only() -> None:
     scan_tradeideas_universe()
     scan_tradeideas_unusual_options()
     scan_tradeideas_toplists()
+    scan_sympathy_and_edgar()
 
     _positions, _orders, _excluded = get_live_holdings(client)
     scan_targets = get_scan_targets(_excluded)
@@ -244,6 +255,7 @@ def scan_and_trade() -> None:
 
     scan_trending_stocks()
     scan_tradeideas_universe()
+    scan_sympathy_and_edgar()
 
     _open_positions, _open_orders, _excluded = get_live_holdings(client)
     scan_targets = filter_universe_by_positions(get_scan_targets(), _excluded)

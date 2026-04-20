@@ -26,6 +26,7 @@ from engine.config import (
 )
 from engine.utils import clear_bar_cache, get_bars, is_market_open, is_dead_ticker
 from .universe import get_tier as _get_tier_live, get_latest_batch as _get_latest_batch, get_ti_primary as _get_ti_primary
+from .discovery import get_priority_scan_queue as _get_priority_scan_queue
 
 _ET  = pytz.timezone("America/New_York")
 _log = logging.getLogger("ApexTrader")
@@ -167,6 +168,8 @@ def get_scan_targets(excluded: Set[str] = None) -> List[str]:
     if in_bear:
         # Always seed with inverse ETFs first — they are valid longs in bear regime
         _push(_INVERSE_ETFS)
+        # Sympathy + EDGAR tickers queued this cycle — push before TI batch
+        _push(_get_priority_scan_queue())
         # Push capped TI batch (respects max_fresh so bear-universe gets slots)
         _push(latest_batch)
         # Guarantee bear short universe symbols get into every bear cycle scan.
@@ -176,7 +179,8 @@ def get_scan_targets(excluded: Set[str] = None) -> List[str]:
         # Fill any remaining capacity from the rotating universe
         _push(rotated_base, limit=SCAN_MAX_SYMBOLS)
     else:
-        # Bull/neutral: latest batch guaranteed + rotating universe fills the rest
+        # Bull/neutral: sympathy/EDGAR tickers first, then latest batch + rotating universe
+        _push(_get_priority_scan_queue())
         _push(latest_batch)
         _push(rotated_base, limit=SCAN_MAX_SYMBOLS)
         if len(targets) < SCAN_MAX_SYMBOLS:

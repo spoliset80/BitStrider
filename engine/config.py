@@ -384,6 +384,14 @@ TRADEIDEAS_BROWSER                                = __import__('os').getenv('TRA
 TRADEIDEAS_UPDATE_CONFIG_FILE                     = True
 TI_PRIMARY_SCAN_BATCH_LIMIT                       = int(__import__('os').getenv('TI_PRIMARY_SCAN_BATCH_LIMIT', '50'))
 
+# Sector sympathy scanner — injects peer tickers when a leader stock fires
+USE_SECTOR_SYMPATHY          = os.getenv("USE_SECTOR_SYMPATHY",  "true").lower() in ("1", "true", "yes")
+SECTOR_SYMPATHY_INTERVAL_MIN = int(os.getenv("SECTOR_SYMPATHY_INTERVAL_MIN", "15"))
+
+# EDGAR 8-K feed scanner — injects tickers from material event filings (free, no auth)
+USE_EDGAR_SCANNER            = os.getenv("USE_EDGAR_SCANNER",    "true").lower() in ("1", "true", "yes")
+EDGAR_SCANNER_INTERVAL_MIN   = int(os.getenv("EDGAR_SCANNER_INTERVAL_MIN",   "10"))
+
 # ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 # Daily Limits
 # ─────────────────────────────────────────────────────────────────

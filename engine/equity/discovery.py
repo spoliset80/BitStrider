@@ -21,15 +21,28 @@ log = logging.getLogger("ApexTrader")
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 # ── Module-level state ─────────────────────────────────────────────────────
-trending_stocks:    List[Dict] = []
-last_trending_scan: float      = 0.0
-last_ti_scan:       float      = 0.0
-last_ti_options_scan: float = 0.0
-last_ti_toplists_scan: float = 0.0
-_ti_future                     = None
-_ti_started_at:     float      = 0.0
-_ti_warned_running: bool       = False
+trending_stocks:           List[Dict] = []
+last_trending_scan:        float      = 0.0
+last_ti_scan:              float      = 0.0
+last_ti_options_scan:      float      = 0.0
+last_ti_toplists_scan:     float      = 0.0
+last_sympathy_scan:        float      = 0.0
+last_edgar_scan:           float      = 0.0
+# Sympathy + EDGAR tickers queued for the NEXT scan cycle.
+# get_scan_targets() pops these to the front so they are guaranteed to be scanned.
+_priority_scan_queue:      List[str]  = []
+_ti_future                            = None
+_ti_started_at:            float      = 0.0
+_ti_warned_running:        bool       = False
 _ti_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+
+
+def get_priority_scan_queue() -> List[str]:
+    """Return and clear the pending sympathy/EDGAR tickers for this scan cycle."""
+    global _priority_scan_queue
+    pending = list(_priority_scan_queue)
+    _priority_scan_queue = []
+    return pending
 
 
 # ── Trending scan ──────────────────────────────────────────────────────────
@@ -382,6 +395,79 @@ def scan_tradeideas_unusual_options(
         scan_keys=["unusualoptionsvolume"],
         remote_debug_port=remote_debug_port,
     )
+
+
+def scan_sympathy_and_edgar(
+    *,
+    sympathy_enabled: bool,
+    edgar_enabled: bool,
+    sympathy_interval_min: float,
+    edgar_interval_min: float,
+    priority_1: list,
+    priority_2: list,
+) -> None:
+    """
+    Sector sympathy + EDGAR 8-K scanner.
+
+    Sympathy: checks leader stocks (via Finnhub quote) for gap/momentum moves
+    that historically pull related peers. Triggered sympathies are injected
+    into priority_1 for immediate scanning.
+
+    EDGAR: polls the SEC 8-K ATOM feed for material filings (supply agreements,
+    contract awards, acquisitions) and injects matched tickers into priority_2
+    for follow-on monitoring.
+    """
+    global last_sympathy_scan, last_edgar_scan
+
+    now = time.time()
+    delisted: set = set()
+    try:
+        from engine.config import DELISTED_STOCKS
+        delisted = set(DELISTED_STOCKS)
+    except Exception:
+        pass
+
+    # ── Sector sympathy ───────────────────────────────────────────────────
+    if sympathy_enabled and (now - last_sympathy_scan) >= (sympathy_interval_min * 60):
+        try:
+            from engine.data.sector_sympathy import get_active_sympathies
+            sympathies = get_active_sympathies()
+            if sympathies:
+                p1_set = set(priority_1)
+                queue_set = set(_priority_scan_queue)
+                new_syms = [s for s in sympathies if s not in p1_set and s not in delisted]
+                if new_syms:
+                    log.info(f"[SYMPATHY] Injecting {len(new_syms)} sympathy tickers into P1 + scan queue: {new_syms}")
+                    priority_1.extend(new_syms)
+                    for s in new_syms:
+                        if s not in queue_set:
+                            _priority_scan_queue.append(s)
+                            queue_set.add(s)
+        except Exception as exc:
+            log.debug(f"[SYMPATHY] Scan error: {exc}")
+        finally:
+            last_sympathy_scan = now
+
+    # ── EDGAR 8-K feed ───────────────────────────────────────────────────
+    if edgar_enabled and (now - last_edgar_scan) >= (edgar_interval_min * 60):
+        try:
+            from engine.data.edgar_scraper import get_edgar_triggered_tickers
+            edgar_tickers = get_edgar_triggered_tickers()
+            if edgar_tickers:
+                p2_set = set(priority_2)
+                p1_set = set(priority_1)
+                queue_set = set(_priority_scan_queue)
+                for sym in edgar_tickers:
+                    if sym not in delisted and sym not in p2_set and sym not in p1_set:
+                        log.info(f"[EDGAR] Adding {sym} to P2 + scan queue for monitoring")
+                        priority_2.append(sym)
+                    if sym not in delisted and sym not in queue_set:
+                        _priority_scan_queue.append(sym)
+                        queue_set.add(sym)
+        except Exception as exc:
+            log.debug(f"[EDGAR] Scan error: {exc}")
+        finally:
+            last_edgar_scan = now
 
 
 def scan_tradeideas_toplists(
