@@ -2268,6 +2268,15 @@ def scan_options_universe(
         log.warning("Options scan: no eligible options universe tickers available — skipping")
         return []
 
+    # Merge screener/sympathy/edgar priority queue into options universe.
+    try:
+        from engine.equity.discovery import get_priority_scan_queue as _get_pq
+        _pq_syms = [s for s in _get_pq() if s not in set(ti_universe)]
+        if _pq_syms:
+            log.info(f"Options scan: injecting {len(_pq_syms)} priority-queue symbol(s): {_pq_syms}")
+            ti_universe = list(ti_universe) + _pq_syms
+    except Exception:
+        pass
     signals: List[OptionSignal] = []
     momentum_strat      = MomentumCallStrategy()
     bear_put_strat      = BearPutStrategy()

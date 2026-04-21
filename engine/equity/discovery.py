@@ -42,11 +42,12 @@ _ti_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
 
 
 def get_priority_scan_queue() -> List[str]:
-    """Return and clear the pending sympathy/EDGAR tickers for this scan cycle."""
-    global _priority_scan_queue
-    pending = list(_priority_scan_queue)
-    _priority_scan_queue = []
-    return pending
+    """Return the current sympathy/EDGAR/screener tickers (read-only peek).
+
+    Does NOT drain the queue — symbols remain until the next screener/discovery
+    refresh replaces them, so both equity and options scans see the same set.
+    """
+    return list(_priority_scan_queue)
 
 
 # ── Trending scan ──────────────────────────────────────────────────────────

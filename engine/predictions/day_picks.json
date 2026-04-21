@@ -1,15 +1,23 @@
 {
-  "generated_at": "2026-04-20T08:48:23-04:00",
-  "date": "2026-04-20",
+  "generated_at": "2026-04-21T09:05:45-04:00",
+  "date": "2026-04-21",
   "market_regime": "bull",
   "picks": [
     {
-      "symbol": "ICE",
+      "symbol": "BLD",
       "action": "buy",
-      "price": 161.21,
-      "confidence": 0.7822,
+      "price": 489.74,
+      "confidence": 0.92,
       "strategy": "Sentiment",
-      "reason": "Sentiment bullish + vol x3.32 + price>20SMA"
+      "reason": "Sentiment bullish + vol x6.40 + price>20SMA"
+    },
+    {
+      "symbol": "DHI",
+      "action": "buy",
+      "price": 153.37,
+      "confidence": 0.7194,
+      "strategy": "Sentiment",
+      "reason": "Sentiment bullish + vol x2.69 + price>20SMA"
     }
   ]
 }
