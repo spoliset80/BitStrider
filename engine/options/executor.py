@@ -567,7 +567,7 @@ class OptionsExecutor:
             except Exception as e:
                 log.error(f"[OPTIONS] IV convert failed for {occ_sym}: {e}", exc_info=True)
 
-
+    def _is_account_tradeable(self) -> bool:
         """Return False if the account is in liquidation-only / trading-blocked state."""
         global _ACCOUNT_RESTRICTED
         # Short-circuit: if we already caught a 40310000 this session, don't retry.
@@ -664,6 +664,13 @@ class OptionsExecutor:
         # 3. Budget & Contract Calculation
         total_budget, remaining = self._get_options_budget()
         contracts = self._calc_contracts(signal, remaining)
+        # Scale contracts by signal confidence (same curve as equity: 0.50× at floor → 1.0× at 0.85+)
+        from engine.config import MIN_SIGNAL_CONFIDENCE, CONF_SCALE_MIN_MULT, CONF_SCALE_FULL_CONF
+        _conf_mult = CONF_SCALE_MIN_MULT + (1.0 - CONF_SCALE_MIN_MULT) * min(
+            1.0, max(0.0, (signal.confidence - MIN_SIGNAL_CONFIDENCE) / (CONF_SCALE_FULL_CONF - MIN_SIGNAL_CONFIDENCE))
+        )
+        contracts = max(1, int(round(contracts * _conf_mult)))
+        log.debug(f"[OPTIONS] {signal.symbol} conf={signal.confidence:.0%} → scale={_conf_mult:.2f}× → {contracts}c")
         if contracts <= 0:
             per_contract = signal.mid_price * CONTRACT_SIZE
             log.info(
@@ -1146,6 +1153,10 @@ class OptionsExecutor:
         for occ_sym in to_close:
             self._close_option(occ_sym, all_positions=all_positions)
 
+        # Record stop cooldowns so stopped symbols can't re-enter within OPTIONS_STOP_COOLDOWN_DAYS
+        for sym in stop_symbols:
+            record_stop_cooldown(sym)
+
         # IV conversion check (rate-limited to every 10 min, touches only open naked positions)
         self._maybe_convert_to_spread()
 
@@ -1249,16 +1260,35 @@ class OptionsExecutor:
                 self.client.post("/orders", payload)
 
             else:
-                # Single leg
+                # Single leg — use limit order at current_price * 0.97 for better fills
                 side = OrderSide.SELL if pos.action == "buy_to_open" else OrderSide.BUY
-                order_req = MarketOrderRequest(
-                    symbol=occ_sym,
-                    qty=pos.contracts,
-                    side=side,
-                    time_in_force=TimeInForce.DAY,
-                )
+                _close_limit = None
+                if all_positions:
+                    _lp = all_positions.get(occ_sym)
+                    if _lp is not None:
+                        _cur = float(_lp.current_price)
+                        if _cur > 0.01:
+                            # Selling to close: accept 97% of mid to guarantee a fill
+                            # Buying to close: pay up 3% to get out quickly
+                            _close_limit = round(_cur * 0.97, 2) if side == OrderSide.SELL else round(_cur * 1.03, 2)
+                if _close_limit is not None:
+                    order_req = LimitOrderRequest(
+                        symbol=occ_sym,
+                        qty=pos.contracts,
+                        side=side,
+                        limit_price=_close_limit,
+                        time_in_force=TimeInForce.DAY,
+                    )
+                    log.info(f"OPTIONS CLOSE (limit @{_close_limit:.2f}): {side.value.upper()} {pos.contracts}x {occ_sym}")
+                else:
+                    order_req = MarketOrderRequest(
+                        symbol=occ_sym,
+                        qty=pos.contracts,
+                        side=side,
+                        time_in_force=TimeInForce.DAY,
+                    )
+                    log.info(f"OPTIONS CLOSE (market fallback): {side.value.upper()} {pos.contracts}x {occ_sym}")
                 self.client.submit_order(order_req)
-                log.info(f"OPTIONS CLOSE: {side.value.upper()} {pos.contracts}x {occ_sym}")
 
             del self._positions[occ_sym]
 

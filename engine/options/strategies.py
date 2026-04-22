@@ -453,6 +453,7 @@ def _pick_strike(
     chain_df: pd.DataFrame,
     spot: float,
     target_delta: float,
+    filters: Optional[dict] = None,
 ) -> Optional[pd.Series]:
     """Pick the best strike with A+ quality filters.
     Priority: delta proximity, then ATM. Must pass OI, spread, IV gates.
@@ -460,6 +461,7 @@ def _pick_strike(
     if chain_df.empty:
         return None
 
+    f = filters if filters is not None else get_dynamic_option_filters()
     df = chain_df.copy()
 
     # OI gate — skip entirely when Alpaca returns all-zero OI (data unavailable)
@@ -679,7 +681,7 @@ class MomentumCallStrategy:
                 log.debug(f"MomentumCall {symbol}: IV rank {chain.iv_rank:.0f} > {f["IV_RANK_CALL_MAX"]} (dynamic) -- skip")
                 return None
 
-            strike_row = _pick_strike(chain.calls, ctx.spot, OPTIONS_DELTA_TARGET)
+            strike_row = _pick_strike(chain.calls, ctx.spot, OPTIONS_DELTA_TARGET, f)
             if strike_row is None:
                 return None
 
@@ -826,7 +828,7 @@ class BearPutStrategy:
                 return None
 
             # Long leg: δ0.40 (ATM/slight ITM)
-            long_row = _pick_strike(chain.puts, ctx.spot, 0.40)
+            long_row = _pick_strike(chain.puts, ctx.spot, 0.40, f)
             if long_row is None:
                 return None
 
@@ -967,7 +969,7 @@ class CoveredCallStrategy:
                 log.debug(f"CoveredCall {symbol}: IV rank {chain.iv_rank:.0f} < {_IV_RANK_CC_MIN} -- skip")
                 return None
 
-            strike_row = _pick_strike(chain.calls, spot, OPTIONS_COVERED_CALL_DELTA)
+            strike_row = _pick_strike(chain.calls, spot, OPTIONS_COVERED_CALL_DELTA, f)
             if strike_row is None:
                 return None
 
@@ -1235,7 +1237,7 @@ class BearCallSpreadStrategy:
                 return None
 
             # Short leg: slight OTM call (δ0.35)
-            short_row = _pick_strike(chain.calls, ctx.spot, 0.35)
+            short_row = _pick_strike(chain.calls, ctx.spot, 0.35, f)
             if short_row is None:
                 return None
 
@@ -1508,7 +1510,7 @@ class ShortSqueezeStrategy:
             use_spread = chain.iv_rank > 50 or (not confirmed_rs and early_rs)
 
             # Long leg (both modes): δ ~0.32 OTM call
-            long_row = _pick_strike(chain.calls, ctx.spot, 0.32)
+            long_row = _pick_strike(chain.calls, ctx.spot, 0.32, f)
             if long_row is None:
                 return None
             long_strike = float(long_row["strike"])
@@ -1686,8 +1688,8 @@ class IronCondorStrategy:
                 return None
 
             # Short strikes: ~0.20 delta OTM (no direction kwarg — _pick_strike uses abs(delta))
-            short_put_row  = _pick_strike(chain.puts,  ctx.spot, 0.20)
-            short_call_row = _pick_strike(chain.calls, ctx.spot, 0.20)
+            short_put_row  = _pick_strike(chain.puts,  ctx.spot, 0.20, f)
+            short_call_row = _pick_strike(chain.calls, ctx.spot, 0.20, f)
             if short_put_row is None or short_call_row is None:
                 return None
 
@@ -1944,7 +1946,7 @@ class BreakoutRetestCallStrategy:
                 return None
 
             # ATM call (delta ~0.50)
-            strike_row = _pick_strike(chain.calls, ctx.spot, 0.50)
+            strike_row = _pick_strike(chain.calls, ctx.spot, 0.50, f)
             if strike_row is None:
                 return None
 
@@ -2047,7 +2049,7 @@ class TrendPullbackSpreadStrategy:
                 return None
 
             # Long leg: ITM call delta 0.65
-            long_row = _pick_strike(chain.calls, ctx.spot, 0.65)
+            long_row = _pick_strike(chain.calls, ctx.spot, 0.65, f)
             if long_row is None:
                 return None
 
@@ -2180,7 +2182,7 @@ class MeanReversionCallStrategy:
             # IV may be elevated (fear) — don't filter on IV rank for mean reversion
 
             # ITM call for higher delta exposure
-            strike_row = _pick_strike(chain.calls, ctx.spot, 0.65)
+            strike_row = _pick_strike(chain.calls, ctx.spot, 0.65, f)
             if strike_row is None:
                 return None
 
