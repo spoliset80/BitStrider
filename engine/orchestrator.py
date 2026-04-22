@@ -495,7 +495,10 @@ def scan_and_trade(ctx: AppContext) -> None:
     breakdown = ", ".join(f"{k}: {v}" for k, v in sorted(hit_counts.items()))
     log.info(f"[SCAN] Breakdown — {breakdown or 'none'} | Errors: {scan_errors} | Total: {len(signals)}")
     if not hit_counts:
-        log.info("[SCAN] No signals — market likely in downtrend")
+        if not is_market_open():
+            log.info("[SCAN] No signals — after hours (stale daily bars, intraday gates not met)")
+        else:
+            log.info("[SCAN] No signals — market likely in downtrend or momentum gates not met")
 
     for idx, s in enumerate(sorted(signals, key=lambda s: s.confidence, reverse=True)[:5], 1):
         log.info(f"[SCAN] TOP5_RAW #{idx}: {s.symbol} {s.action.upper()} ${s.price:.2f} conf={s.confidence:.0%} [{s.strategy}] — {s.reason}")

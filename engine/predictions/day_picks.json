@@ -1,23 +1,39 @@
 {
-  "generated_at": "2026-04-21T09:05:45-04:00",
+  "generated_at": "2026-04-21T22:26:50-04:00",
   "date": "2026-04-21",
   "market_regime": "bull",
   "picks": [
     {
-      "symbol": "BLD",
+      "symbol": "NTRS",
       "action": "buy",
-      "price": 489.74,
-      "confidence": 0.92,
+      "price": 171.769,
+      "confidence": 0.9122,
       "strategy": "Sentiment",
-      "reason": "Sentiment bullish + vol x6.40 + price>20SMA"
+      "reason": "Sentiment bullish + vol x4.62 + price>20SMA"
     },
     {
-      "symbol": "DHI",
+      "symbol": "CAR",
       "action": "buy",
-      "price": 153.37,
-      "confidence": 0.7194,
-      "strategy": "Sentiment",
-      "reason": "Sentiment bullish + vol x2.69 + price>20SMA"
+      "price": 714.0,
+      "confidence": 0.8346,
+      "strategy": "FloatRotation",
+      "reason": "Float rotation: 1.1x float (10.1M) | +14.8% day"
+    },
+    {
+      "symbol": "HPQ",
+      "action": "buy",
+      "price": 21.09,
+      "confidence": 0.82,
+      "strategy": "Sweepea",
+      "reason": "Daily Sweepea pullback to 8-EMA | ATR $0.76"
+    },
+    {
+      "symbol": "SYF",
+      "action": "buy",
+      "price": 77.63,
+      "confidence": 0.82,
+      "strategy": "Sweepea",
+      "reason": "Daily Sweepea pullback to 8-EMA | ATR $2.11"
     }
   ]
 }

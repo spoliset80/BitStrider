@@ -502,7 +502,7 @@ class MomentumStrategy:
         if (momentum >= MOMENTUM["min_momentum"]
                 and vol_ratio >= MOMENTUM["volume_surge"]
                 and price > sma20):
-            confidence = min(0.60 + (momentum / 100), 0.95)
+            confidence = min(0.73 + (momentum / 100), 0.95)
             return Signal(symbol, "buy", price, confidence,
                           f"Strong momentum ({momentum:.1f}%) + volume x{vol_ratio:.1f} + above SMA20", "Momentum")
 
@@ -511,7 +511,7 @@ class MomentumStrategy:
             if (momentum <= -MOMENTUM["min_momentum"] * 0.8
                     and vol_ratio >= MOMENTUM["volume_surge"]
                     and price < sma20):
-                confidence = min(0.60 + (-momentum / 100), 0.95)
+                confidence = min(0.73 + (-momentum / 100), 0.95)
                 return Signal(symbol, "short", price, confidence,
                               f"Bear momentum short (-{momentum:.1f}%) + volume x{vol_ratio:.1f} + below SMA20", "Momentum")
 
@@ -574,7 +574,7 @@ class GapBreakoutStrategy:
             return None
 
         atr14 = _calc_atr14(daily)
-        confidence = min(0.65 + (gap_pct / 100), 0.95)
+        confidence = min(0.73 + (gap_pct / 100), 0.95)
         return Signal(
             symbol, "buy", price, confidence,
             f"Gap up {gap_pct:.1f}% from ${prior_close:.2f} | volume x{vol_ratio:.1f}",
@@ -634,7 +634,7 @@ class ORBStrategy:
 
         # R-multiple: reward = price - orb_high, risk = orb_range
         r_multiple = (price - orb_high) / orb_range if orb_range > 0 else 0
-        confidence = min(0.70 + r_multiple * 0.1, 0.95)
+        confidence = min(0.73 + r_multiple * 0.1, 0.95)
 
         return Signal(
             symbol, "buy", price, confidence,
@@ -892,7 +892,7 @@ class OpeningBellSurgeStrategy:
 
         daily = get_bars(symbol, "5d", "1d")
         atr14 = _calc_atr14(daily) if not daily.empty and len(daily) >= 5 else 0.0
-        confidence = min(0.70 + (vol_ratio - OPENING_BELL_SURGE["vol_multiplier"]) * 0.03, 0.95)
+        confidence = min(0.73 + (vol_ratio - OPENING_BELL_SURGE["vol_multiplier"]) * 0.03, 0.95)
         return Signal(
             symbol, "buy", cur_price, confidence,
             f"Opening bell surge: vol x{vol_ratio:.1f} first {surge_n} bars | +{price_up_pct:.1f}% from open",

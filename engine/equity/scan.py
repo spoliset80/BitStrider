@@ -282,8 +282,8 @@ def scan_universe(scan_targets: List[str], sentiment: str) -> Tuple[List, Dict[s
                     sig = s.scan(symbol)
                 if sig:
                     candidates.append(sig)
-            except Exception:
-                pass
+            except Exception as _ex:
+                _log.debug(f"[SCAN] {symbol} {type(s).__name__}: {_ex}")
 
         if not candidates:
             return None
