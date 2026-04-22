@@ -64,7 +64,7 @@ from engine.config import (
     MEMORY_WARN_MB,
     get_options_universe,
 )
-from engine.utils.market import _INVERSE_ETFS
+from engine.utils.market import _INVERSE_ETFS, _is_bull_regime
 from engine.utils.bars import calculate_atr as _calc_atr14_base
 
 _market_state: Optional[MarketState] = None
