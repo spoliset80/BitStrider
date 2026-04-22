@@ -561,6 +561,9 @@ def scan_alpaca_movers(*, interval_min: float = 10.0) -> None:
             _priority_scan_queue.append(sym)
             queue_set.add(sym)
             injected.append(sym)
+            log.info(
+                f"[ALPACA-MOVERS] Adding {sym} to P2 + scan queue for monitoring"
+            )
 
         last_alpaca_mover_scan = now
         if injected:

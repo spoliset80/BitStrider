@@ -1,8 +1,16 @@
 {
-  "generated_at": "2026-04-21T23:31:48-04:00",
+  "generated_at": "2026-04-21T23:46:56-04:00",
   "date": "2026-04-21",
   "market_regime": "bull",
   "picks": [
+    {
+      "symbol": "MAS",
+      "action": "buy",
+      "price": 66.77,
+      "confidence": 0.895,
+      "strategy": "Sentiment",
+      "reason": "Sentiment bullish + vol x4.45 + price>20SMA"
+    },
     {
       "symbol": "CAR",
       "action": "buy",
@@ -10,6 +18,14 @@
       "confidence": 0.8346,
       "strategy": "FloatRotation",
       "reason": "Float rotation: 1.1x float (10.1M) | +14.8% day"
+    },
+    {
+      "symbol": "SYF",
+      "action": "buy",
+      "price": 77.63,
+      "confidence": 0.82,
+      "strategy": "Sweepea",
+      "reason": "Daily Sweepea pullback to 8-EMA | ATR $2.11"
     }
   ]
 }
