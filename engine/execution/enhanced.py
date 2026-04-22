@@ -47,6 +47,7 @@ from engine.config import (
     SMALL_ACCOUNT_EQUITY_THRESHOLD, SMALL_ACCOUNT_MAX_POSITIONS,
     SMALL_ACCOUNT_MIN_POSITION_DOLLARS,
     POSITION_SIZE_PCT, SMALL_ACCOUNT_POSITION_SIZE_PCT,
+    CONF_SCALE_MIN_MULT, CONF_SCALE_FULL_CONF,
     LIVE,
 )
 from engine.equity.strategies import Signal
@@ -642,6 +643,19 @@ class EnhancedExecutor:
             return False
 
         risk_info = calculate_risk_adjusted_size(acct.equity, signal.symbol, signal.price)
+
+        # Scale dollar_amount by confidence: 0.50× at floor (MIN_SIGNAL_CONFIDENCE) → 1.0× at 0.85+
+        from engine.config import MIN_SIGNAL_CONFIDENCE
+        _conf_floor = MIN_SIGNAL_CONFIDENCE
+        _conf_mult = CONF_SCALE_MIN_MULT + (1.0 - CONF_SCALE_MIN_MULT) * min(
+            1.0, max(0.0, (signal.confidence - _conf_floor) / (CONF_SCALE_FULL_CONF - _conf_floor))
+        )
+        risk_info = dict(risk_info, dollar_amount=round(risk_info["dollar_amount"] * _conf_mult, 2))
+        log.debug(
+            f"[SIZE] {signal.symbol} conf={signal.confidence:.0%} → "
+            f"scale={_conf_mult:.2f}× → ${risk_info['dollar_amount']:,.0f}"
+        )
+
         shares, skip_reason = self._size_with_buying_power(acct.buying_power, signal, risk_info, order_type)
         if shares < 1:
             # Confidence-swap: if a held position has lower entry confidence, rotate into the new signal.

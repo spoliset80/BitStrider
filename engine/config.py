@@ -268,6 +268,12 @@ POSITION_SIZE_PCT    = 7.5    # 7.5% per position → up to 12 positions within 
 USE_RISK_EQUALIZED_SIZING = False  # use fixed position sizing instead of risk-scaled
 RISK_PER_TRADE_PCT   = 0.8    # Risk 0.8% of account per trade (unused with fixed sizing)
 
+# Confidence-based position scaling: low-confidence signals get smaller allocations.
+# Multiplier scales linearly from CONF_SCALE_MIN_MULT at MIN_SIGNAL_CONFIDENCE
+# up to 1.0× at CONF_SCALE_FULL_CONF. Above that threshold: always full size.
+CONF_SCALE_MIN_MULT  = 0.50   # 50% of normal size at the confidence floor (0.72)
+CONF_SCALE_FULL_CONF = 0.85   # 100% of normal size at this confidence and above
+
 # Small account reduction caps (sub-$5k equity)
 SMALL_ACCOUNT_POSITION_SIZE_PCT = 7.5   # same 7.5% allocation for small accounts
 SMALL_ACCOUNT_RISK_PER_TRADE_PCT = 0.5 # lower risk per trade for small accounts

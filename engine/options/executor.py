@@ -695,9 +695,9 @@ class OptionsExecutor:
         if not is_butterfly and not is_condor:
             if _in_open_window:
                 # Higher confidence bar — only cleanest signals at the open
-                if signal.confidence < 0.90:
+                if signal.confidence < 0.85:
                     log.info(
-                        f"[OPTIONS] Open window: {signal.symbol} conf={signal.confidence:.0%} < 90% — skip"
+                        f"[OPTIONS] Open window: {signal.symbol} conf={signal.confidence:.0%} < 85% — skip"
                     )
                     return False
                 # 1 naked position max during the open window
@@ -709,16 +709,20 @@ class OptionsExecutor:
                 # 50% contract count (premium is peak at open)
                 contracts = max(1, contracts // 2)
                 _open_stop_pct = 25.0
-                # Gap gate: large pre-market gap means IV already inflated → spread
+                # Open window: default to spread (IV is peak at open).
+                # Only go naked if IV is very low AND gap is small — options are cheap.
                 gap = self._get_premarket_gap(signal.symbol)
-                _force_spread = abs(gap) > 0.03 or signal.iv_rank > 50
-                if abs(gap) > 0.03:
+                _allow_naked = signal.iv_rank < 20 and abs(gap) <= 0.02
+                _force_spread = not _allow_naked
+                if _allow_naked:
                     log.info(
-                        f"[OPTIONS] Open window: {signal.symbol} gap={gap:+.1%} > 3% → spread"
+                        f"[OPTIONS] Open window: {signal.symbol} IV rank={signal.iv_rank:.0f} < 20 "
+                        f"gap={gap:+.1%} — low IV, allowing naked"
                     )
-                elif signal.iv_rank > 50:
+                else:
                     log.info(
-                        f"[OPTIONS] Open window: {signal.symbol} IV rank={signal.iv_rank:.0f} > 50 → spread"
+                        f"[OPTIONS] Open window: {signal.symbol} IV rank={signal.iv_rank:.0f} "
+                        f"gap={gap:+.1%} → spread (default at open)"
                     )
             else:
                 # Normal session: IV rank decides naked vs spread
