@@ -154,6 +154,16 @@ def _run_discovery(ctx: AppContext, market_state: MarketState) -> None:
         interval_min=cfg.ALPACA_MOVER_SCAN_INTERVAL_MIN,
         market_state=market_state,
     )
+    _discovery.scan_preopen_intelligence(
+        enabled=cfg.USE_PREOPEN_INTELLIGENCE,
+        interval_min=cfg.PREOPEN_INTELLIGENCE_SCAN_INTERVAL_MIN,
+        market_state=market_state,
+        priority_1=cfg.PRIORITY_1_MOMENTUM,
+        priority_2=cfg.PRIORITY_2_ESTABLISHED,
+        max_watchlist=cfg.PREOPEN_INTELLIGENCE_MAX_TICKERS,
+        use_regime_gating=cfg.PREOPEN_USE_REGIME_GATING,
+        use_sentiment_gating=cfg.PREOPEN_USE_SENTIMENT_GATING,
+    )
 
 
 # ── Options cycle ─────────────────────────────────────────────────────────────
