@@ -1,5 +1,5 @@
 {
-  "updated": "2026-04-22T03:47:03Z",
+  "updated": "2026-04-22T04:28:06Z",
   "tickers": [
     "FCEL",
     "VELO",
@@ -14,10 +14,10 @@
     "UNHG",
     "POET",
     "VPG",
-    "POWI",
     "SLDP",
+    "POWI",
     "OBE",
-    "BULL",
+    "CALX",
     "TSCO",
     "TROO",
     "BLD",
@@ -26,15 +26,15 @@
     "HAS",
     "DGX",
     "IMMX",
+    "PRU",
     "TEL",
     "ITRI",
-    "PRU",
     "MAS",
     "ULTY",
     "JANX",
     "LOAR",
     "VSEC",
-    "SYF",
+    "HTZ",
     "FFAI",
     "CAR",
     "NVTS",
@@ -48,8 +48,6 @@
     "RPD",
     "KSS",
     "PBF",
-    "GPRO",
-    "AXTA",
-    "INGM"
+    "GPRO"
   ]
 }

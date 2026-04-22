@@ -47,6 +47,7 @@ from engine.config import (
     OPTIONS_TRAIL_DRAWDOWN_PCT,
     API_KEY, API_SECRET, PAPER,
 )
+from engine.utils import MarketState
 from .strategies import OptionSignal, CONTRACT_SIZE, record_stop_cooldown
 
 log = logging.getLogger("ApexTrader.Options")
@@ -592,7 +593,7 @@ class OptionsExecutor:
             log.warning(f"[OPTIONS] Could not verify account tradeable status: {e}")
             return True  # allow attempt; the order itself will catch any restriction
 
-    def place_option_order(self, signal: OptionSignal) -> bool:
+    def place_option_order(self, signal: OptionSignal, market_state: Optional[MarketState] = None) -> bool:
         """
         Production-ready order placement for ApexTrader.
         Fixes communications with Alpaca API and internal state tracking.
@@ -691,8 +692,8 @@ class OptionsExecutor:
 
         # ── 4b. Open Window / IV Gate ─────────────────────────────────────────
         # Decides naked vs spread AFTER type detection so butterflies/condors are untouched.
-        from engine.utils import is_open_window
-        _in_open_window = is_open_window()
+        market_state = market_state or MarketState.from_now()
+        _in_open_window = market_state.is_open_window
         _eff_spread_sell_strike = signal.spread_sell_strike  # may be overridden below
         _entry_iv      = signal.iv_pct   # IV% at scan time (stored on position)
         _is_naked_entry = False

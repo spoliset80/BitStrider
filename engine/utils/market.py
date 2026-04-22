@@ -11,30 +11,119 @@ from __future__ import annotations
 import datetime
 import logging
 import time
+from dataclasses import dataclass
 from typing import Optional, Tuple
 
 import pytz
 
 ET = pytz.timezone("America/New_York")
 
+
+@dataclass
+class MarketState:
+    now: datetime.datetime
+    hour: float
+    weekday: bool
+    is_market_open: bool
+    is_regular_hours: bool
+    is_options_lull_hours: bool
+    is_open_window: bool
+    sentiment: Optional[str] = None
+    bull_regime: Optional[bool] = None
+    vix: Optional[float] = None
+    vix_interval: Optional[int] = None
+    volatility_label: Optional[str] = None
+
+    @classmethod
+    def from_now(cls, now: Optional[datetime.datetime] = None) -> "MarketState":
+        if now is None:
+            now = datetime.datetime.now(ET)
+        weekday = now.weekday() < 5
+        t = now.strftime("%H:%M")
+        hour = now.hour + now.minute / 60.0
+        from engine.config import PAPER
+
+        is_market_open = weekday and "07:00" <= t <= "20:00"
+        is_regular_hours = weekday and "09:30" <= t <= "16:00"
+        is_options_lull_hours = False
+        is_open_window = False
+        if weekday and not PAPER:
+            is_options_lull_hours = (
+                (9.5 <= hour < (9.5 + 5 / 60.0))
+                or (11.5 <= hour < 13.75)
+            )
+            is_open_window = ((9.5 + 5 / 60.0) <= hour < (9.5 + 15 / 60.0))
+
+        return cls(
+            now=now,
+            hour=hour,
+            weekday=weekday,
+            is_market_open=is_market_open,
+            is_regular_hours=is_regular_hours,
+            is_options_lull_hours=is_options_lull_hours,
+            is_open_window=is_open_window,
+        )
+
+    @property
+    def phase(self) -> str:
+        if not self.weekday:
+            return "OFF-HOURS"
+        if self.hour < 9.5:
+            return "PRE-MARKET"
+        if self.hour < 16:
+            return "REGULAR HOURS"
+        if self.hour < 20:
+            return "AFTER-HOURS"
+        return "OFF-HOURS"
+
+    @property
+    def regime(self) -> str:
+        if self.bull_regime is None:
+            return "unknown"
+        return "bull" if self.bull_regime else "bear"
+
+    def resolve_regime(self) -> bool:
+        if self.bull_regime is None:
+            self.bull_regime = is_bull_regime()
+        return self.bull_regime
+
+    def resolve_sentiment(self) -> str:
+        if self.sentiment is None:
+            self.sentiment = get_market_sentiment()
+        return self.sentiment
+
+    def resolve_vix(self) -> tuple[float, int, str]:
+        if self.vix is None or self.vix_interval is None or self.volatility_label is None:
+            self.vix = get_vix()
+            from engine.config import (
+                SCAN_INTERVAL_EXTREME_VOL,
+                SCAN_INTERVAL_HIGH_VOL,
+                SCAN_INTERVAL_MODERATE_VOL,
+                SCAN_INTERVAL_NORMAL_VOL,
+                SCAN_INTERVAL_CALM_VOL,
+                SCAN_INTERVAL_LOW_VOL,
+            )
+            self.vix_interval, self.volatility_label = get_vix_interval(self.vix, {
+                "SCAN_INTERVAL_EXTREME_VOL": SCAN_INTERVAL_EXTREME_VOL,
+                "SCAN_INTERVAL_HIGH_VOL":    SCAN_INTERVAL_HIGH_VOL,
+                "SCAN_INTERVAL_MODERATE_VOL": SCAN_INTERVAL_MODERATE_VOL,
+                "SCAN_INTERVAL_NORMAL_VOL":  SCAN_INTERVAL_NORMAL_VOL,
+                "SCAN_INTERVAL_CALM_VOL":    SCAN_INTERVAL_CALM_VOL,
+                "SCAN_INTERVAL_LOW_VOL":     SCAN_INTERVAL_LOW_VOL,
+            })
+        return self.vix, self.vix_interval, self.volatility_label
+
+
 # ── Market hours ──────────────────────────────────────────────────────────────
 
 def is_market_open() -> bool:
     """Extended hours: 7:00 AM – 8:00 PM ET, weekdays only."""
-    now = datetime.datetime.now(ET)
-    if now.weekday() >= 5:
-        return False
-    t = now.strftime("%H:%M")
-    return "07:00" <= t <= "20:00"
+    return MarketState.from_now().is_market_open
 
 
 def is_regular_hours() -> bool:
     """Regular session: 9:30 AM – 4:00 PM ET, weekdays only."""
-    now = datetime.datetime.now(ET)
-    if now.weekday() >= 5:
-        return False
-    t = now.strftime("%H:%M")
-    return "09:30" <= t <= "16:00"
+    return MarketState.from_now().is_regular_hours
 
 
 def is_options_lull_hours() -> bool:

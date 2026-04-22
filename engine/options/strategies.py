@@ -41,7 +41,7 @@ except ImportError:
     _YF_AVAILABLE = False
 import pytz
 from engine.options._options_today import _calc_iv_rank
-from engine.utils import get_bars, calc_rsi, get_option_data_client, ALPACA_AVAILABLE
+from engine.utils import MarketState, get_bars, calc_rsi, get_option_data_client, ALPACA_AVAILABLE
 from engine.config import (
     OPTIONS_ENABLED,
     OPTIONS_DTE_MIN,
@@ -64,8 +64,10 @@ from engine.config import (
     MEMORY_WARN_MB,
     get_options_universe,
 )
-from engine.utils.market import _is_bull_regime, _INVERSE_ETFS
+from engine.utils.market import _INVERSE_ETFS
 from engine.utils.bars import calculate_atr as _calc_atr14_base
+
+_market_state: Optional[MarketState] = None
 
 def _calc_atr14(bars, period: int = 14) -> float:
     from engine.utils.bars import calculate_atr
@@ -583,9 +585,11 @@ def _fetch_bar_context(symbol: str) -> Optional[_BarCtx]:
     # ── Intraday overlay ───────────────────────────────────────────────────
     # During market hours fetch 1-min bars for today to get live spot & volume.
     # Outside market hours fall back to the daily close (unchanged behaviour).
-    from engine.utils import is_market_open
+    if _market_state is None:
+        raise RuntimeError("Options strategy scan requires market_state to be provided")
     _intraday_ok = False
-    if is_market_open():
+    is_open = _market_state.is_market_open
+    if is_open:
         try:
             intraday = get_bars(symbol, "1d", "1m")
             if not intraday.empty and len(intraday) >= 2:
@@ -2241,6 +2245,7 @@ class MeanReversionCallStrategy:
 def scan_options_universe(
     held_positions: Dict[str, int],
     existing_option_symbols: set,
+    market_state: MarketState,
 ) -> List[OptionSignal]:
     """Scan the options-eligible universe and return A+ ranked signals.
 
@@ -2264,6 +2269,9 @@ def scan_options_universe(
         return []
 
     # Strategies call _get_filters() per scan() — no global refresh needed here
+
+    global _market_state
+    _market_state = market_state
 
     ti_universe = get_options_universe()
     if not ti_universe:

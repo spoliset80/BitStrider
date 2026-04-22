@@ -34,19 +34,14 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 from . import config as cfg
 from .utils import (
     setup_logging,
-    is_market_open,
-    is_regular_hours,
-    is_options_lull_hours,
-    get_vix,
+    MarketState,
     get_finnhub_trending_tickers,
-    get_market_sentiment,
     get_market_hours_interval,
     get_position_tuning_interval,
     get_vix_interval,
     get_live_holdings,
 )
 from .equity.strategies import Signal
-from .utils.market import _is_bull_regime
 from .equity.scan import get_scan_targets, scan_universe
 from .equity.universe import filter_universe_by_positions
 from .equity import discovery as _discovery
@@ -77,6 +72,7 @@ class AppContext:
     options_executor: Optional[OptionsExecutor]
     # Per-session state
     last_market_regime:   str  = "bull"
+    market_state:         Optional[MarketState] = None
     # Short-fail cooldown: {symbol: monotonic_ts_until_retry}
     # Merged here from the old module-level global so it survives restarts
     # via executor._htb_cache and is accessible to the bear plan.
@@ -102,7 +98,7 @@ def _build_context() -> AppContext:
 # ── Discovery wrappers ────────────────────────────────────────────────────────
 # Thin wrappers that forward config into discovery — keeps scan_and_trade lean.
 
-def _run_discovery() -> None:
+def _run_discovery(ctx: AppContext, market_state: MarketState) -> None:
     """Fire all configured universe refresh sources (each throttled internally)."""
     _discovery.scan_trending_stocks(
         use_live_trending=cfg.USE_LIVE_TRENDING,
@@ -156,24 +152,29 @@ def _run_discovery() -> None:
     )
     _discovery.scan_alpaca_movers(
         interval_min=cfg.ALPACA_MOVER_SCAN_INTERVAL_MIN,
+        market_state=market_state,
     )
 
 
 # ── Options cycle ─────────────────────────────────────────────────────────────
 
-def _run_options_cycle(ctx: AppContext) -> None:
+def _run_options_cycle(ctx: AppContext, market_state: MarketState) -> None:
     """Monitor existing options positions and attempt one new entry per cycle."""
-    if ctx.options_executor is None or not is_regular_hours():
+    if ctx.options_executor is None:
         return
+
+    if not market_state.is_regular_hours:
+        return
+
     try:
         ctx.options_executor.monitor_positions()
-        if is_options_lull_hours():
+        if market_state.is_options_lull_hours:
             log.info("[OPTIONS] Lull period — monitoring only, no new entries")
             return
         all_positions = ctx.client.get_all_positions()
         held_map      = {p.symbol: int(float(p.qty)) for p in all_positions if float(p.qty) > 0}
         existing_syms = {pos.occ_symbol for pos in ctx.options_executor._positions.values()}
-        opt_signals   = scan_options_universe(held_map, existing_syms)
+        opt_signals   = scan_options_universe(held_map, existing_syms, ctx.market_state)
         if opt_signals:
             top = opt_signals[:10]
             log.info(
@@ -182,7 +183,7 @@ def _run_options_cycle(ctx: AppContext) -> None:
             )
             executed = False
             for sig in top:
-                if ctx.options_executor.place_option_order(sig):
+                if ctx.options_executor.place_option_order(sig, market_state):
                     executed = True
                     break
             if not executed:
@@ -198,12 +199,12 @@ def _run_options_cycle(ctx: AppContext) -> None:
 
 # ── Market regime ─────────────────────────────────────────────────────────────
 
-def _resolve_market_regime(ctx: AppContext) -> Tuple[str, int]:
+def _resolve_market_regime(ctx: AppContext, market_state: MarketState) -> Tuple[str, int]:
     """Return (regime, signals_cap). Falls back to last known regime on failure."""
     if not cfg.USE_MARKET_REGIME_FILTER:
         return ctx.last_market_regime, cfg.MAX_SIGNALS_PER_CYCLE
     try:
-        is_bull        = _is_bull_regime()
+        is_bull        = market_state.resolve_regime()
         regime         = "bull" if is_bull else "bear"
         ctx.last_market_regime = regime
         signals_cap    = cfg.MAX_SIGNALS_PER_CYCLE if is_bull else cfg.MARKET_REGIME_SIGNALS_CAP
@@ -450,9 +451,13 @@ def scan_and_trade(ctx: AppContext) -> None:
     """
     _session.reset_daily(ctx.client)
 
-    _run_options_cycle(ctx)
+    ctx.market_state = MarketState.from_now()
+    ctx.market_state.resolve_regime()
+    ctx.executor.update_market_state(ctx.market_state)
+    _run_options_cycle(ctx, ctx.market_state)
 
-    if not is_market_open():
+    market_state = ctx.market_state
+    if not market_state.is_market_open:
         if not cfg.FORCE_SCAN:
             log.info("[SYSTEM] Market closed — skipping scan")
             return
@@ -475,13 +480,13 @@ def scan_and_trade(ctx: AppContext) -> None:
 
     _session.check_quarterly(ctx.client, cfg.USE_QUARTERLY_TARGET, cfg.QUARTERLY_PROFIT_TARGET_PCT)
 
-    sentiment = get_market_sentiment()
+    sentiment = market_state.resolve_sentiment()
     log.info(f"[SCAN] Market sentiment: {sentiment}")
 
     ctx.executor.update_stale_orders()
     ctx.executor.check_tp_targets()
 
-    _run_discovery()
+    _run_discovery(ctx, market_state)
 
     scan_targets, excluded = _build_scan_targets(ctx)
     if not scan_targets:
@@ -489,9 +494,9 @@ def scan_and_trade(ctx: AppContext) -> None:
         return
 
     ctx.executor._swap_cycle_closed.clear()
-    regime, signals_cap = _resolve_market_regime(ctx)
+    regime, signals_cap = _resolve_market_regime(ctx, market_state)
 
-    signals, hit_counts, scan_errors = scan_universe(scan_targets, sentiment)
+    signals, hit_counts, scan_errors = scan_universe(scan_targets, sentiment, market_state)
 
     if cfg.LONG_ONLY_MODE:
         pre = len(signals)
@@ -501,7 +506,7 @@ def scan_and_trade(ctx: AppContext) -> None:
     breakdown = ", ".join(f"{k}: {v}" for k, v in sorted(hit_counts.items()))
     log.info(f"[SCAN] Breakdown — {breakdown or 'none'} | Errors: {scan_errors} | Total: {len(signals)}")
     if not hit_counts:
-        if not is_market_open():
+        if not market_state.is_market_open:
             log.info("[SCAN] No signals — after hours (stale daily bars, intraday gates not met)")
         else:
             log.info("[SCAN] No signals — market likely in downtrend or momentum gates not met")
@@ -577,22 +582,13 @@ def get_adaptive_interval(ctx: AppContext) -> int:
     if not cfg.ADAPTIVE_INTERVALS:
         return cfg.SCAN_INTERVAL_MIN
 
-    vix = get_vix()
-    vix_interval, vol = get_vix_interval(vix, {
-        "SCAN_INTERVAL_EXTREME_VOL": cfg.SCAN_INTERVAL_EXTREME_VOL,
-        "SCAN_INTERVAL_HIGH_VOL":    cfg.SCAN_INTERVAL_HIGH_VOL,
-        "SCAN_INTERVAL_MODERATE_VOL":cfg.SCAN_INTERVAL_MODERATE_VOL,
-        "SCAN_INTERVAL_NORMAL_VOL":  cfg.SCAN_INTERVAL_NORMAL_VOL,
-        "SCAN_INTERVAL_CALM_VOL":    cfg.SCAN_INTERVAL_CALM_VOL,
-        "SCAN_INTERVAL_LOW_VOL":     cfg.SCAN_INTERVAL_LOW_VOL,
-    })
+    market_state = ctx.market_state or MarketState.from_now()
+    vix, vix_interval, vol = market_state.resolve_vix()
     interval     = vix_interval
     market_phase = "ALL DAY"
 
     if cfg.USE_MARKET_HOURS_TUNING:
-        now = datetime.datetime.now()
-        h   = now.hour + now.minute / 60
-        mkt_interval, market_phase = get_market_hours_interval(h, {
+        mkt_interval, market_phase = get_market_hours_interval(market_state.hour, {
             "PREMARKET_SCAN_INTERVAL":     cfg.PREMARKET_SCAN_INTERVAL,
             "REGULAR_HOURS_SCAN_INTERVAL": cfg.REGULAR_HOURS_SCAN_INTERVAL,
             "AFTERHOURS_SCAN_INTERVAL":    cfg.AFTERHOURS_SCAN_INTERVAL,
@@ -634,13 +630,15 @@ def _prune_universe_job() -> None:
 # ── Top3-only (dry-run) mode ──────────────────────────────────────────────────
 
 def scan_top3_only(ctx: AppContext) -> None:
+    market_state = ctx.market_state or MarketState.from_now()
+    ctx.market_state = market_state
     sentiment = get_market_sentiment()
     log.info(f"Market sentiment: {sentiment}")
-    _run_discovery()
+    _run_discovery(ctx, market_state)
     _, _, excluded = get_live_holdings(ctx.client)
     scan_targets   = get_scan_targets(excluded)
     log.info(f"Top3 mode: scanning {len(scan_targets)} symbols ({len(excluded)} pre-excluded)")
-    signals, _, scan_errors = scan_universe(scan_targets, sentiment)
+    signals, _, scan_errors = scan_universe(scan_targets, sentiment, market_state)
     log.info(f"Scan errors: {scan_errors} | Signals: {len(signals)}")
     if not signals:
         log.info("No signals found in Top3 mode")
@@ -734,13 +732,21 @@ def start() -> None:
             )
             fut = getattr(_discovery, "_ti_future", None)
             if fut is not None:
-                log.info("Waiting up to 90s for startup TI capture…")
-                try:
-                    fut.result(timeout=90)
-                except concurrent.futures.TimeoutError:
-                    log.warning("Startup TI capture timed out — proceeding with current universe")
-                except Exception as e:
-                    log.warning(f"Startup TI capture failed: {e}")
+                if cfg.STARTUP_TI_CAPTURE_TIMEOUT_S > 0:
+                    log.info(
+                        f"Waiting up to {cfg.STARTUP_TI_CAPTURE_TIMEOUT_S}s for startup TI capture…"
+                    )
+                    try:
+                        fut.result(timeout=cfg.STARTUP_TI_CAPTURE_TIMEOUT_S)
+                    except concurrent.futures.TimeoutError:
+                        log.warning("Startup TI capture timed out — proceeding with current universe")
+                    except Exception as e:
+                        log.warning(f"Startup TI capture failed: {e}")
+                else:
+                    log.info(
+                        "Startup TI capture is running in background; first scan will use current universe. "
+                        "Use this only if fresh TI tickers are not required at startup."
+                    )
         except Exception as e:
             log.warning(f"Startup TI capture error: {e}")
 

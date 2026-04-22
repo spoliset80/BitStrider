@@ -10,9 +10,9 @@ import concurrent.futures
 import logging
 import time
 from pathlib import Path
-from typing import List, Dict
+from typing import List, Dict, Optional
 
-from engine.utils import get_trending_tickers, filter_trending_momentum, get_finnhub_trending_tickers, check_sentiment_gate
+from engine.utils import MarketState, get_trending_tickers, filter_trending_momentum, get_finnhub_trending_tickers, check_sentiment_gate
 from engine.config import PRIORITY_1_MOMENTUM as _P1, PRIORITY_2_ESTABLISHED as _P2
 from engine.ti.ti import get_scans, is_valid_ti_ticker, scrape_tradeideas
 
@@ -484,7 +484,7 @@ def scan_sympathy_and_edgar(
             last_edgar_scan = now
 
 
-def scan_alpaca_movers(*, interval_min: float = 10.0) -> None:
+def scan_alpaca_movers(*, interval_min: float = 10.0, market_state: Optional[MarketState] = None) -> None:
     """Fetch Alpaca Most Actives + Market Movers and inject qualifying symbols
     into the priority scan queue.
 
@@ -493,9 +493,9 @@ def scan_alpaca_movers(*, interval_min: float = 10.0) -> None:
     """
     global last_alpaca_mover_scan, _priority_scan_queue
 
-    from engine.utils import is_market_open
+    market_state = market_state or MarketState.from_now()
 
-    if not is_market_open():
+    if not market_state.is_market_open:
         return
 
     now = time.time()
@@ -569,7 +569,7 @@ def scan_alpaca_movers(*, interval_min: float = 10.0) -> None:
         if injected:
             log.info(f"[ALPACA-MOVERS] {len(injected)} gainers queued for scan: {injected}")
         else:
-            log.debug("[ALPACA-MOVERS] No gainers passed filters this cycle")
+            log.info("[ALPACA-MOVERS] No gainers passed filters this cycle")
 
     except Exception as exc:
         log.warning(f"[ALPACA-MOVERS] Screener fetch failed: {exc}")

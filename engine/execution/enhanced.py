@@ -51,7 +51,7 @@ from engine.config import (
     LIVE,
 )
 from engine.equity.strategies import Signal
-from engine.utils import is_regular_hours, calculate_risk_adjusted_size, check_vix_roc_filter, get_dynamic_tier
+from engine.utils import MarketState, calculate_risk_adjusted_size, check_vix_roc_filter, get_dynamic_tier
 from engine.notifications.notifications import send_email
 
 log = logging.getLogger("ApexTrader")
@@ -137,7 +137,12 @@ class EnhancedExecutor:
         self._pdt_overnight_forced: set = set()  # symbols where PDT also blocks close — forced overnight, no retries
         self._pdt_violation_alerted: bool = False  # tracks whether the PDT violation email has been sent this session
         self._eod_close_done: object = None  # date of last completed EOD close (prevents duplicate runs)
+        self.market_state: Optional[MarketState] = None
         self._rebuild_entry_log_from_orders()
+
+    def update_market_state(self, market_state: MarketState) -> None:
+        """Store the active market snapshot for per-cycle execution decisions."""
+        self.market_state = market_state
 
     # -- Entry Log Rebuild (survive restarts) ----------------------------
     def _rebuild_entry_log_from_orders(self) -> None:
@@ -182,6 +187,11 @@ class EnhancedExecutor:
                 )
         except Exception as e:
             log.warning(f"_rebuild_entry_log_from_orders failed (non-fatal): {e}")
+
+    def _current_market_state(self) -> MarketState:
+        if self.market_state is not None:
+            return self.market_state
+        return MarketState.from_now()
 
     # -- Position Cache ----------------------------------------------------
     def _find_weakest_position(self) -> Optional[str]:
@@ -582,7 +592,7 @@ class EnhancedExecutor:
 
         try:
             coid = f"apex-{signal.strategy}-{signal.symbol}-{int(time.time())}"
-            if EXTENDED_HOURS and not is_regular_hours():
+            if EXTENDED_HOURS and not self._current_market_state().is_regular_hours:
                 adj   = 1.002 if order_type == OrderType.LONG else 0.998
                 limit = round(signal.price * adj, 2)
                 req   = LimitOrderRequest(
@@ -697,7 +707,7 @@ class EnhancedExecutor:
             log.info(f"Skipping {signal.symbol} SHORT because LONG_ONLY_MODE is active")
             return False
 
-        if self.use_bracket_orders and is_regular_hours():
+        if self.use_bracket_orders and self._current_market_state().is_regular_hours:
             if self._create_bracket_order(signal, shares, risk_info, order_type):
                 self.pdt.add(datetime.date.today())
                 self._entry_log[signal.symbol] = {"strategy": signal.strategy, "date": datetime.date.today(), "confidence": signal.confidence}
@@ -755,7 +765,7 @@ class EnhancedExecutor:
             return False
         try:
             qty = abs(int(positions.positions_dict[signal.symbol].qty))
-            if EXTENDED_HOURS and not is_regular_hours():
+            if EXTENDED_HOURS and not self._current_market_state().is_regular_hours:
                 req = LimitOrderRequest(
                     symbol=signal.symbol, qty=qty, side=OrderSide.BUY,
                     time_in_force=TimeInForce.DAY,
@@ -1177,7 +1187,7 @@ class EnhancedExecutor:
             return
 
         now_utc = datetime.datetime.now(datetime.timezone.utc)
-        regular = is_regular_hours()
+        regular = self._current_market_state().is_regular_hours
 
         for order in open_orders:
             # Only handle plain entry/exit orders, not bracket legs or protective stops

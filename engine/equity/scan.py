@@ -7,7 +7,7 @@ import datetime
 import logging
 import pytz
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import List, Dict, Tuple, Set
+from typing import List, Dict, Tuple, Set, Optional
 
 from engine import config as _cfg
 from engine.config import (
@@ -24,7 +24,7 @@ from engine.config import (
     GAP_CHASE_CONSOL_BARS,
     BEAR_SHORT_UNIVERSE,
 )
-from engine.utils import clear_bar_cache, get_bars, is_market_open, is_dead_ticker
+from engine.utils import MarketState, clear_bar_cache, get_bars, is_dead_ticker
 from engine.utils.bars import get_data_client as _get_data_client
 from alpaca.data import StockSnapshotRequest as _StockSnapshotRequest
 from .universe import get_tier as _get_tier_live, get_latest_batch as _get_latest_batch, get_ti_primary as _get_ti_primary
@@ -68,13 +68,16 @@ def _prefetch_snapshots(symbols: List[str]) -> None:
         pass  # fall back to per-symbol get_bars in _passes_guardrails
 
 
-def _passes_guardrails(symbol: str, bull_regime: bool = None) -> bool:
+def _passes_guardrails(symbol: str, bull_regime: bool = None, market_state: Optional[MarketState] = None) -> bool:
     """Pre-scan gates: dollar-volume, RVOL, and gap-chase guard.
     Returns False to skip the symbol; never raises.
 
     bull_regime: pass the pre-computed regime from scan_universe() to avoid
     a concurrent re-fetch of _is_bull_regime() inside each worker thread.
     If None, falls back to calling _is_bull_regime() directly.
+
+    market_state: shared MarketState for the current scan cycle. If None,
+    it will be created lazily.
     """
     try:
         # ── Fast path: use batch-prefetched snapshot (no per-symbol HTTP call) ─
@@ -107,8 +110,8 @@ def _passes_guardrails(symbol: str, bull_regime: bool = None) -> bool:
         # RVOL gate: only meaningful during regular market hours
         # In bear regime, skip RVOL gate — breakdown volume is often distributed,
         # not the spike pattern seen in squeeze/momentum setups.
-        _bull = bull_regime if bull_regime is not None else _is_bull_regime()
-        if is_market_open() and _bull:
+        _bull = bull_regime if bull_regime is not None else market_state.resolve_regime()
+        if market_state.is_market_open and _bull:
             daily = get_bars(symbol, "5d", "1d")
             if not daily.empty and len(daily) >= 2:
                 avg_daily_vol = float(daily["volume"].iloc[:-1].mean())
@@ -244,7 +247,7 @@ def get_scan_targets(excluded: Set[str] = None) -> List[str]:
     return targets
 
 
-def scan_universe(scan_targets: List[str], sentiment: str) -> Tuple[List, Dict[str, int], int]:
+def scan_universe(scan_targets: List[str], sentiment: str, market_state: MarketState) -> Tuple[List, Dict[str, int], int]:
     clear_bar_cache()
 
     # Batch-prefetch stock snapshots for all scan targets in one API call.
@@ -255,7 +258,7 @@ def scan_universe(scan_targets: List[str], sentiment: str) -> Tuple[List, Dict[s
     # Compute regime ONCE here before spawning workers — avoids a thread race where
     # multiple workers concurrently hit the 15-min TTL expiry and each make a
     # separate get_bars("SPY") call to refresh the shared _regime_cache dict.
-    bull_regime = _is_bull_regime()
+    bull_regime = market_state.resolve_regime()
     regime_str  = "bull" if bull_regime else "bear"
     strats = get_strategy_instances(bull_regime)
 
@@ -266,7 +269,7 @@ def scan_universe(scan_targets: List[str], sentiment: str) -> Tuple[List, Dict[s
     def _scan_one(symbol: str):
         # Dead-ticker check already done in get_scan_targets() — skip here.
         # Pass pre-computed regime into guardrails to avoid re-calling _is_bull_regime()
-        if not _passes_guardrails(symbol, bull_regime=bull_regime):
+        if not _passes_guardrails(symbol, bull_regime=bull_regime, market_state=market_state):
             return None
 
         candidates = []

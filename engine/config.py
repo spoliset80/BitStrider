@@ -382,6 +382,10 @@ TRADEIDEAS_HEADLESS                              = __import__('os').getenv('TRAD
 TRADEIDEAS_CHROME_PROFILE                        = __import__('os').getenv('TRADEIDEAS_CHROME_PROFILE', '')
 TRADEIDEAS_BROWSER                                = __import__('os').getenv('TRADEIDEAS_BROWSER', 'edge')
 TRADEIDEAS_UPDATE_CONFIG_FILE                     = True
+# Wait this many seconds for the startup Trade Ideas capture before the first scan.
+# Default 90s preserves fresh TI tickers for the initial universe. Set to 0 only
+# for advanced starts where background TI loading is acceptable.
+STARTUP_TI_CAPTURE_TIMEOUT_S                     = int(__import__('os').getenv('STARTUP_TI_CAPTURE_TIMEOUT_S', '90'))
 TI_PRIMARY_SCAN_BATCH_LIMIT                       = int(__import__('os').getenv('TI_PRIMARY_SCAN_BATCH_LIMIT', '50'))
 
 # Sector sympathy scanner — injects peer tickers when a leader stock fires

@@ -19,11 +19,12 @@ import engine.config as cfg
 importlib.reload(cfg)
 
 from engine.equity.scan import scan_universe, get_scan_targets
+from engine.utils import MarketState
 
 targets = get_scan_targets()
 print(f"Step 2/3: Scanning {len(targets)} symbols across 7 strategies...")
 
-signals, hit_counts, scan_errors = scan_universe(targets, "neutral")
+signals, hit_counts, scan_errors = scan_universe(targets, "neutral", MarketState.from_now())
 
 if scan_errors:
     print(f"Scan errors: {scan_errors}")
