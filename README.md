@@ -32,15 +32,17 @@
 - **Bear regime detection** — SPY < 200-SMA flips to bear: long cap 1/cycle, inverse ETFs front-weighted, shorts unlocked
 - **Kill mode** — emergency close-all on VIX ≥ 40, SPY intraday drop ≥ 3%, or VIX +50% in 5 h
 - **Position swap** — when at max 12 positions, auto-closes weakest for a higher-confidence new signal (swap-only in bear)
-- **Confidence gate** — executes signals ≥ 80% (longs), higher threshold for shorts in bear regime
+- **Confidence gate** — executes signals ≥ 72% (longs); position sizing now scales with confidence up to 100% at 85%+
 
 **Options trading (Level 3, Alpaca)**
 - **A+ 9-filter scanner** — IV rank gate, EMA-20 trend, 3-day momentum, 5-day breakout/breakdown, chain liquidity, OI ≥ 500, spread ≤ 15%, R/R ≥ 1.5×, premium ≤ 3% of spot
-- **89% confidence gate** — only executes the highest-quality setups
+- **82% sniper threshold** — only executes the cleanest option setups by default via `OPTIONS_MIN_SIGNAL_CONFIDENCE`
+- **Open-window spread-first logic** — 9:35–9:45 ET prefers spreads; naked entries are allowed only when IV is very low and pre-market gap is small
+- **Options contract sizing scales by confidence** — low-conviction signals are smaller, stronger signals use full allocation
 - **Options diagnostic logging** — zero-signal scans now report fail reasons such as `adv`, `no_signal`, and cooldown rejections
-- **Watch list fallback** — when nothing clears the gate, shows the top-3 near-miss candidates (all structural gates passed) clearly labelled with their gate gap
+- **Watch list fallback** — when nothing clears the gate, shows the top-3 near-miss candidates (all structural filters passed) clearly labelled with their gate gap
 - **Master kill-switch** — `OPTIONS_ENABLED=false` in `.env` disables the entire options system without restart
-- **15% portfolio allocation**, max 3 concurrent contracts, 7–21 DTE, 50% profit target / 40% stop loss
+- **15% portfolio allocation**, max 3 concurrent contracts, 7–21 DTE, +45% profit target / -30% stop loss
 
 **Infrastructure**
 - **Trade Ideas integration** — headless Selenium scrape refreshes the universe every 30 min
@@ -64,9 +66,9 @@ apextrader/
 │   ├── config.py                 # All runtime constants
 │   ├── scan.py                   # get_scan_targets(), scan_universe(), filter_signals()
 │   ├── strategies.py             # 7 equity strategy classes
-│   ├── options_strategies.py     # A+ options: MomentumCall, BearPut, CoveredCall + scan_options_universe()
-│   ├── options_executor.py       # Options order placement (buy-to-open, close)
-│   ├── executor_enhanced.py      # Equity order placement, swap logic, bracket/stop orders
+│   ├── options/strategies.py      # A+ options: MomentumCall, BearPut, CoveredCall + scan_options_universe()
+│   ├── options/executor.py        # Options order placement (buy-to-open, close)
+│   ├── execution/enhanced.py      # Equity order placement, swap logic, bracket/stop orders
 │   ├── notifications.py          # Email templates: build_top5_report(), build_eod_report()
 │   ├── universe.py               # TTL-managed ticker universe (JSON-backed)
 │   ├── predictions.py            # Day-picks persistence (predictions/day_picks.json)
@@ -171,9 +173,9 @@ All tunable constants live in [`engine/config.py`](engine/config.py). Key settin
 | Setting | Default | Description |
 |---|---|---|
 | `TRADE_MODE` | `paper` | `paper` or `live` — set via env var |
-| `MIN_SIGNAL_CONFIDENCE` | `0.80` | Minimum confidence to execute a long |
+| `MIN_SIGNAL_CONFIDENCE` | `0.72` | Minimum confidence to execute a long |
 | `MAX_POSITIONS` | `12` | Max concurrent equity positions (7.5% × 12 = 90%) |
-| `POSITION_SIZE_PCT` | `20.0` | Per-trade allocation (% of account) |
+| `POSITION_SIZE_PCT` | `7.5` | Per-trade allocation (% of account) |
 | `SWAP_ON_FULL` | `True` | Close weakest position for a better signal when full |
 | `SWAP_MIN_CONFIDENCE` | `0.75` | Minimum confidence to trigger a swap |
 | `LONG_ONLY_MODE` | `True` | Disables short entries (PDT-safe) |
@@ -194,8 +196,9 @@ All tunable constants live in [`engine/config.py`](engine/config.py). Key settin
 | `OPTIONS_MAX_POSITIONS` | `3` | Max concurrent option contracts |
 | `OPTIONS_DTE_MIN` / `MAX` | `7` / `21` | Expiry window (near-term, higher-theta) |
 | `OPTIONS_DELTA_TARGET` | `0.40` | Target delta at entry (0.30–0.50 range) |
-| `OPTIONS_PROFIT_TARGET_PCT` | `50.0` | Close contract at +50% gain |
-| `OPTIONS_STOP_LOSS_PCT` | `40.0` | Close contract at -40% loss |
+| `OPTIONS_MIN_SIGNAL_CONFIDENCE` | `0.82` | Minimum confidence to consider an options signal |
+| `OPTIONS_PROFIT_TARGET_PCT` | `45.0` | Close contract at +45% gain |
+| `OPTIONS_STOP_LOSS_PCT` | `30.0` | Close contract at -30% loss |
 
 ---
 
@@ -229,7 +232,7 @@ Bear regime note: inverse ETFs (SQQQ, SPXU, UVXY, TZA, FAZ, SOXS, LABD, DUST) ar
 
 ## Options Strategies
 
-Implemented in [`engine/options_strategies.py`](engine/options_strategies.py). The standalone daily scanner is [`scripts/_options_today.py`](scripts/_options_today.py).
+Implemented in [`engine/options/strategies.py`](engine/options/strategies.py). The standalone daily scanner is [`scripts/_options_today.py`](scripts/_options_today.py).
 
 ### A+ Filter Pipeline (all 9 must pass)
 
@@ -243,11 +246,11 @@ Implemented in [`engine/options_strategies.py`](engine/options_strategies.py). T
 8. **R/R ratio** — ≥ 1.5× (breakeven vs. underlying move required)  
 9. **Premium cap** — mid ≤ 3% of spot price (avoids paying inflated premium)
 
-**Confidence gate:** composite score ≥ 89% to execute (confidence × min(R/R, 3)).
+**Confidence gate:** sniper threshold defaults to 82% via `OPTIONS_MIN_SIGNAL_CONFIDENCE`; score is derived from the A+ filter composite and R/R adjustment.
 
 ### Watch list fallback
 
-When zero signals clear the 89% gate, the scanner shows the **top-3 near-miss candidates** — tickers that passed all 9 structural filters but scored below the gate — with their confidence gap and full metrics. A `[WATCH]` email is sent instead of suppressing output entirely.
+When zero signals clear the sniper threshold, the scanner shows the **top-3 near-miss candidates** — tickers that passed all 9 structural filters but scored below the gate — with their confidence gap and full metrics. A `[WATCH]` email is sent instead of suppressing output entirely.
 
 ### Strategies
 
@@ -345,8 +348,8 @@ python scripts/test_notifications.py
 | **Daily profit target** | Locks in gains, halts new entries |
 | **Max positions cap** | Hard 12-position limit (90% equity deployed, 10% BP reserve) |
 | **Position swap** | Auto-exits weakest long for a stronger signal; swap-only in bear regime |
-| **Equity confidence gate** | 80% minimum for longs; higher threshold for shorts in bear |
-| **Options confidence gate** | 89% composite score (confidence × R/R) |
+| **Equity confidence gate** | 72% minimum for longs; position sizing scales with confidence up to 100% at 85%+ |
+| **Options confidence gate** | 82% default sniper threshold; only the strongest option setups are entered |
 | **Options kill-switch** | `OPTIONS_ENABLED=false` disables entire options system without restart |
 | **Dollar volume guardrail** | Skips illiquid symbols below minimum dollar volume |
 | **Long-only mode** | No short entries — avoids margin, HTB, PDT complications |

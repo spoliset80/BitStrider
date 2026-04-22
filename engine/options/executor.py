@@ -703,13 +703,13 @@ class OptionsExecutor:
             if _in_open_window:
                 # Higher confidence bar — only cleanest signals at the open
                 if signal.confidence < 0.85:
-                    log.info(
+                    log.debug(
                         f"[OPTIONS] Open window: {signal.symbol} conf={signal.confidence:.0%} < 85% — skip"
                     )
                     return False
                 # 1 naked position max during the open window
                 if self._count_open_options() >= 1:
-                    log.info(
+                    log.debug(
                         f"[OPTIONS] Open window: already 1 open position — skip {signal.symbol}"
                     )
                     return False
@@ -722,12 +722,12 @@ class OptionsExecutor:
                 _allow_naked = signal.iv_rank < 20 and abs(gap) <= 0.02
                 _force_spread = not _allow_naked
                 if _allow_naked:
-                    log.info(
+                    log.debug(
                         f"[OPTIONS] Open window: {signal.symbol} IV rank={signal.iv_rank:.0f} < 20 "
                         f"gap={gap:+.1%} — low IV, allowing naked"
                     )
                 else:
-                    log.info(
+                    log.debug(
                         f"[OPTIONS] Open window: {signal.symbol} IV rank={signal.iv_rank:.0f} "
                         f"gap={gap:+.1%} → spread (default at open)"
                     )
@@ -741,7 +741,7 @@ class OptionsExecutor:
                 is_mleg    = False
                 _is_naked_entry = True
                 if _in_open_window:
-                    log.info(
+                    log.debug(
                         f"[OPTIONS] Open window NAKED: {signal.symbol} {cp_type} "
                         f"@{signal.strike} ×{contracts}c | IV={_entry_iv:.0%} | stop=25%"
                     )
@@ -752,7 +752,7 @@ class OptionsExecutor:
                         _eff_spread_sell_strike = round(signal.strike * 0.90 / 0.5) * 0.5
                     else:
                         _eff_spread_sell_strike = round(signal.strike * 1.10 / 0.5) * 0.5
-                    log.info(
+                    log.debug(
                         f"[OPTIONS] IV gate forced spread for {signal.symbol}: "
                         f"derived short leg @{_eff_spread_sell_strike}"
                     )
@@ -780,7 +780,7 @@ class OptionsExecutor:
                     call=(cp_type == "call"),
                 )
                 _spread_mid_price = max(0.01, signal.mid_price - _short_credit)
-                log.info(
+                log.debug(
                     f"[OPTIONS] Auto-spread net debit: long=${signal.mid_price:.2f} "
                     f"- short_est=${_short_credit:.2f} = net=${_spread_mid_price:.2f} "
                     f"(was sending ${signal.mid_price:.2f} -- overstating BP)"
@@ -850,7 +850,7 @@ class OptionsExecutor:
                     ]
                 }
 
-                log.info(f"[OPTIONS] Submitting MLEG {signal.symbol}: {json.dumps(payload)}")
+                log.debug(f"[OPTIONS] Submitting MLEG {signal.symbol}: {json.dumps(payload)}")
                 self.client.post("/orders", payload)
 
             # ── CASE B: SINGLE OPTION (Standard) ─────────────────────────────
@@ -863,7 +863,7 @@ class OptionsExecutor:
                     limit_price=limit_price,
                     time_in_force=TimeInForce.DAY
                 )
-                log.info(f"[OPTIONS] Submitting SINGLE {occ_sym}")
+                log.debug(f"[OPTIONS] Submitting SINGLE {occ_sym}")
                 self.client.submit_order(order_req)
 
             # 5. Tracking — store all leg OCC symbols for strategy-agnostic close/monitor
@@ -900,7 +900,12 @@ class OptionsExecutor:
             leg_summary = ", ".join(
                 f"{l['side'].upper()} {l['occ_symbol']}" for l in entry_legs
             )
-            log.info(f"[OPTIONS] Tracked {signal.symbol} ({len(entry_legs)} leg(s)): {leg_summary}")
+            log.info(
+                f"[OPTIONS] EXECUTED {signal.symbol} {signal.option_type} "
+                f"{signal.strategy} {contracts}c conf={signal.confidence:.0%} "
+                f"legs={len(entry_legs)} open_window={_in_open_window}"
+            )
+            log.debug(f"[OPTIONS] Tracked {signal.symbol} ({len(entry_legs)} leg(s)): {leg_summary}")
             return True
 
         except Exception as e:

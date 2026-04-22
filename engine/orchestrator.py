@@ -177,14 +177,20 @@ def _run_options_cycle(ctx: AppContext) -> None:
         if opt_signals:
             top = opt_signals[:10]
             log.info(
-                f"[OPTIONS] {len(opt_signals)} signals — top: "
-                f"{top[0].symbol} {top[0].option_type} conf={top[0].confidence:.0%}"
+                f"[OPTIONS] {len(opt_signals)} candidates | open={len(ctx.options_executor._positions)} "
+                f"| top: {top[0].symbol} {top[0].option_type} conf={top[0].confidence:.0%}"
             )
+            executed = False
             for sig in top:
                 if ctx.options_executor.place_option_order(sig):
+                    executed = True
                     break
+            if not executed:
+                log.info(f"[OPTIONS] No option order executed this cycle | open={len(ctx.options_executor._positions)}")
         else:
-            log.info("[OPTIONS] No qualifying signals this cycle")
+            log.info(
+                f"[OPTIONS] No qualifying signals this cycle | open={len(ctx.options_executor._positions)}"
+            )
         log.info(f"[OPTIONS] {ctx.options_executor.status_summary()}")
     except Exception as e:
         log.error(f"[OPTIONS] Cycle error: {e}", exc_info=True)
