@@ -815,9 +815,12 @@ class OptionsExecutor:
                     ]
 
                 # Construct Payload
+                def _leg_side_str(leg_side) -> str:
+                    return leg_side.value if hasattr(leg_side, "value") else str(leg_side)
+
                 payload = {
                     "symbol": "", # Must be empty for MLEG
-                    "qty": str(float(contracts)),
+                    "qty": str(int(round(contracts))),
                     # "side" intentionally omitted — not required for mleg per Alpaca docs;
                     # direction is conveyed by each leg's own side field.
                     "type": "limit",
@@ -827,8 +830,11 @@ class OptionsExecutor:
                     "legs": [
                         {
                             "symbol": l["symbol"],
-                            "side": l["side"].value if hasattr(l["side"], 'value') else l["side"],
-                            "ratio_qty": str(float(l["ratio_qty"]))
+                            "side": _leg_side_str(l["side"]),
+                            "ratio_qty": str(int(l["ratio_qty"])),
+                            "position_intent": (
+                                "buy_to_open" if _leg_side_str(l["side"]) == "buy" else "sell_to_open"
+                            ),
                         } for l in legs_list
                     ]
                 }
@@ -1158,7 +1164,10 @@ class OptionsExecutor:
                     {
                         "symbol": l["occ_symbol"],
                         "side": "sell" if l["side"] == "buy" else "buy",
-                        "ratio_qty": str(float(l["ratio_qty"])),
+                        "ratio_qty": str(int(round(l["ratio_qty"]))),
+                        "position_intent": (
+                            "buy_to_close" if l["side"] == "sell" else "sell_to_close"
+                        ),
                     }
                     for l in pos.legs
                 ]
@@ -1213,7 +1222,7 @@ class OptionsExecutor:
 
                 payload = {
                     "symbol": "",
-                    "qty": str(float(pos.contracts)),
+                    "qty": str(int(round(pos.contracts))),
                     # "side" intentionally omitted — not required for mleg per Alpaca docs;
                     # each reversed leg carries its own side.
                     "order_class": "mleg",

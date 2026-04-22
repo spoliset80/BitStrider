@@ -504,13 +504,24 @@ def scan_alpaca_movers(*, interval_min: float = 10.0) -> None:
 
     try:
         import engine.config as _cfg
+        from concurrent.futures import ThreadPoolExecutor, TimeoutError as _FuturesTimeout
         from alpaca.data.historical.screener import ScreenerClient
         from alpaca.data.requests import MostActivesRequest, MarketMoversRequest
         from alpaca.data.enums import MostActivesBy
 
+        _SCREENER_TIMEOUT = 15  # seconds per request
+
         sc = ScreenerClient(_cfg.API_KEY, _cfg.API_SECRET)
 
-        actives_resp = sc.get_most_actives(MostActivesRequest(by=MostActivesBy.VOLUME, top=30))
+        with ThreadPoolExecutor(max_workers=1) as _pool:
+            try:
+                actives_resp = _pool.submit(
+                    sc.get_most_actives, MostActivesRequest(by=MostActivesBy.VOLUME, top=30)
+                ).result(timeout=_SCREENER_TIMEOUT)
+            except _FuturesTimeout:
+                log.warning("[ALPACA-MOVERS] most_actives timed out — skipping cycle")
+                return
+
         # Build a set of symbols that cleared the trade-count floor (real participation)
         active_syms = {
             a.symbol
@@ -518,7 +529,14 @@ def scan_alpaca_movers(*, interval_min: float = 10.0) -> None:
             if int(a.trade_count) >= 10_000
         }
 
-        movers_resp = sc.get_market_movers(MarketMoversRequest(market_type="stocks", top=20))
+        with ThreadPoolExecutor(max_workers=1) as _pool:
+            try:
+                movers_resp = _pool.submit(
+                    sc.get_market_movers, MarketMoversRequest(market_type="stocks", top=20)
+                ).result(timeout=_SCREENER_TIMEOUT)
+            except _FuturesTimeout:
+                log.warning("[ALPACA-MOVERS] market_movers timed out — skipping cycle")
+                return
 
         injected: List[str] = []
         queue_set = set(_priority_scan_queue)
@@ -530,7 +548,7 @@ def scan_alpaca_movers(*, interval_min: float = 10.0) -> None:
             if len(sym) > 5:
                 continue
             # Price band: cheap enough for options chains, not so high position-sizing breaks
-            if not (5.0 <= float(m.price) <= 500.0):
+            if not (0.50 <= float(m.price) <= 500.0):
                 continue
             # Move band: meaningful but not a halt/binary-news situation
             if not (3.0 <= float(m.percent_change) <= 40.0):

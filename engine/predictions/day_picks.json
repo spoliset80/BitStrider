@@ -1,15 +1,15 @@
 {
-  "generated_at": "2026-04-21T22:26:50-04:00",
+  "generated_at": "2026-04-21T23:16:37-04:00",
   "date": "2026-04-21",
   "market_regime": "bull",
   "picks": [
     {
-      "symbol": "NTRS",
+      "symbol": "MAS",
       "action": "buy",
-      "price": 171.769,
-      "confidence": 0.9122,
+      "price": 66.77,
+      "confidence": 0.895,
       "strategy": "Sentiment",
-      "reason": "Sentiment bullish + vol x4.62 + price>20SMA"
+      "reason": "Sentiment bullish + vol x4.45 + price>20SMA"
     },
     {
       "symbol": "CAR",
@@ -20,20 +20,20 @@
       "reason": "Float rotation: 1.1x float (10.1M) | +14.8% day"
     },
     {
-      "symbol": "HPQ",
+      "symbol": "GOOGL",
       "action": "buy",
-      "price": 21.09,
+      "price": 332.29,
       "confidence": 0.82,
       "strategy": "Sweepea",
-      "reason": "Daily Sweepea pullback to 8-EMA | ATR $0.76"
+      "reason": "Daily Sweepea pullback to 8-EMA | ATR $8.21"
     },
     {
-      "symbol": "SYF",
+      "symbol": "AAPL",
       "action": "buy",
-      "price": 77.63,
+      "price": 266.17,
       "confidence": 0.82,
       "strategy": "Sweepea",
-      "reason": "Daily Sweepea pullback to 8-EMA | ATR $2.11"
+      "reason": "Daily Sweepea pullback to 8-EMA | ATR $6.14"
     }
   ]
 }
