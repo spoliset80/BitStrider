@@ -199,9 +199,9 @@ class PreopenIntelligenceScanner:
             if not provider.active:
                 continue
             try:
-                provider.apply(self, scores, market_state, priority_1, priority_2, max_watchlist, provider)
-            except Exception:
-                log.debug(f"[PREOPEN] provider failed: {provider.name}")
+                provider.apply(scores, market_state, priority_1, priority_2, max_watchlist, provider)
+            except Exception as exc:
+                log.warning(f"[PREOPEN] provider failed: {provider.name} -> {exc}")
 
     def _add_candidate(
         self,
