@@ -484,7 +484,7 @@ def scan_sympathy_and_edgar(
             last_edgar_scan = now
 
 
-def scan_alpaca_movers(*, interval_min: float = 10.0, market_state: Optional[MarketState] = None) -> None:
+def scan_alpaca_movers(*, interval_min: float = 10.0, market_state: MarketState) -> None:
     """Fetch Alpaca Most Actives + Market Movers and inject qualifying symbols
     into the priority scan queue.
 
@@ -492,8 +492,6 @@ def scan_alpaca_movers(*, interval_min: float = 10.0, market_state: Optional[Mar
     previous session, so we only run during regular market hours.
     """
     global last_alpaca_mover_scan, _priority_scan_queue
-
-    market_state = market_state or MarketState.from_now()
 
     if not market_state.is_market_open:
         return

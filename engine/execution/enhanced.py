@@ -191,7 +191,7 @@ class EnhancedExecutor:
     def _current_market_state(self) -> MarketState:
         if self.market_state is not None:
             return self.market_state
-        return MarketState.from_now()
+        raise RuntimeError("EnhancedExecutor requires market_state to be set before execution")
 
     # -- Position Cache ----------------------------------------------------
     def _find_weakest_position(self) -> Optional[str]:

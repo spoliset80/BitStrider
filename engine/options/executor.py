@@ -593,7 +593,7 @@ class OptionsExecutor:
             log.warning(f"[OPTIONS] Could not verify account tradeable status: {e}")
             return True  # allow attempt; the order itself will catch any restriction
 
-    def place_option_order(self, signal: OptionSignal, market_state: Optional[MarketState] = None) -> bool:
+    def place_option_order(self, signal: OptionSignal, market_state: MarketState) -> bool:
         """
         Production-ready order placement for ApexTrader.
         Fixes communications with Alpaca API and internal state tracking.
@@ -692,7 +692,6 @@ class OptionsExecutor:
 
         # ── 4b. Open Window / IV Gate ─────────────────────────────────────────
         # Decides naked vs spread AFTER type detection so butterflies/condors are untouched.
-        market_state = market_state or MarketState.from_now()
         _in_open_window = market_state.is_open_window
         _eff_spread_sell_strike = signal.spread_sell_strike  # may be overridden below
         _entry_iv      = signal.iv_pct   # IV% at scan time (stored on position)
