@@ -1265,9 +1265,12 @@ class OptionsExecutor:
                 self.client.post("/orders", payload)
 
             else:
-                # Single leg — use limit order at current_price * 0.97 for better fills
+                # Single leg — always use a limit order (Alpaca rejects market orders
+                # for options when no quote is available, error 40310000).
                 side = OrderSide.SELL if pos.action == "buy_to_open" else OrderSide.BUY
                 _close_limit = None
+
+                # First try: use passed-in all_positions for the mark price
                 if all_positions:
                     _lp = all_positions.get(occ_sym)
                     if _lp is not None:
@@ -1276,23 +1279,36 @@ class OptionsExecutor:
                             # Selling to close: accept 97% of mid to guarantee a fill
                             # Buying to close: pay up 3% to get out quickly
                             _close_limit = round(_cur * 0.97, 2) if side == OrderSide.SELL else round(_cur * 1.03, 2)
-                if _close_limit is not None:
-                    order_req = LimitOrderRequest(
-                        symbol=occ_sym,
-                        qty=pos.contracts,
-                        side=side,
-                        limit_price=_close_limit,
-                        time_in_force=TimeInForce.DAY,
+
+                # Second try: fetch a fresh broker quote if still no limit price
+                if _close_limit is None:
+                    try:
+                        _fresh = {p.symbol: p for p in self.client.get_all_positions()}
+                        _lp = _fresh.get(occ_sym)
+                        if _lp is not None:
+                            _cur = float(_lp.current_price)
+                            if _cur > 0.01:
+                                _close_limit = round(_cur * 0.97, 2) if side == OrderSide.SELL else round(_cur * 1.03, 2)
+                    except Exception as _fe:
+                        log.debug(f"[OPTIONS] Could not fetch fresh quote for {occ_sym}: {_fe}")
+
+                # Final fallback: near-worthless or unquoted contract — use floor limit
+                # Alpaca requires a minimum limit price of $0.05 for options.
+                if _close_limit is None:
+                    _close_limit = 0.05 if side == OrderSide.SELL else 0.50
+                    log.warning(
+                        f"[OPTIONS] No quote for {occ_sym} — limit fallback @{_close_limit:.2f} "
+                        f"({'floor sell' if side == OrderSide.SELL else 'ceiling buy'})"
                     )
-                    log.info(f"OPTIONS CLOSE (limit @{_close_limit:.2f}): {side.value.upper()} {pos.contracts}x {occ_sym}")
-                else:
-                    order_req = MarketOrderRequest(
-                        symbol=occ_sym,
-                        qty=pos.contracts,
-                        side=side,
-                        time_in_force=TimeInForce.DAY,
-                    )
-                    log.info(f"OPTIONS CLOSE (market fallback): {side.value.upper()} {pos.contracts}x {occ_sym}")
+
+                order_req = LimitOrderRequest(
+                    symbol=occ_sym,
+                    qty=pos.contracts,
+                    side=side,
+                    limit_price=_close_limit,
+                    time_in_force=TimeInForce.DAY,
+                )
+                log.info(f"OPTIONS CLOSE (limit @{_close_limit:.2f}): {side.value.upper()} {pos.contracts}x {occ_sym}")
                 self.client.submit_order(order_req)
 
             del self._positions[occ_sym]
@@ -1304,6 +1320,14 @@ class OptionsExecutor:
                 log.warning(
                     f"[OPTIONS] PDT block on close {occ_sym} — position held, will retry next session"
                 )
+            elif "40310000" in str(e):
+                # No available quote — contract is expired, halted, or worthless.
+                # There is no market to close into; remove from tracker (max loss already realized).
+                log.warning(
+                    f"[OPTIONS] No quote available to close {occ_sym} — contract likely expired/worthless. "
+                    f"Removing from tracker (max loss realized)."
+                )
+                self._positions.pop(occ_sym, None)
             else:
                 log.error(f"Options close failed for {occ_sym}: {e}", exc_info=True)
 
