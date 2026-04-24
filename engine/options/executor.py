@@ -574,6 +574,10 @@ class OptionsExecutor:
         # Short-circuit: if we already caught a 40310000 this session, don't retry.
         # The restriction is a regulatory/PDT hold — it won't clear mid-session.
         if _ACCOUNT_RESTRICTED:
+            log.warning(
+                "[OPTIONS] Account restricted (40310000 / liquidation-only) — "
+                "all new entries blocked. Restart bot or resolve via Alpaca dashboard."
+            )
             return False
         try:
             acct = self.client.get_account()
@@ -664,15 +668,8 @@ class OptionsExecutor:
 
         # 3. Budget & Contract Calculation
         total_budget, remaining = self._get_options_budget()
-        contracts = self._calc_contracts(signal, remaining)
-        # Scale contracts by signal confidence (same curve as equity: 0.50× at floor → 1.0× at 0.85+)
-        from engine.config import MIN_SIGNAL_CONFIDENCE, CONF_SCALE_MIN_MULT, CONF_SCALE_FULL_CONF
-        _conf_mult = CONF_SCALE_MIN_MULT + (1.0 - CONF_SCALE_MIN_MULT) * min(
-            1.0, max(0.0, (signal.confidence - MIN_SIGNAL_CONFIDENCE) / (CONF_SCALE_FULL_CONF - MIN_SIGNAL_CONFIDENCE))
-        )
-        contracts = max(1, int(round(contracts * _conf_mult)))
-        log.debug(f"[OPTIONS] {signal.symbol} conf={signal.confidence:.0%} → scale={_conf_mult:.2f}× → {contracts}c")
-        if contracts <= 0:
+        raw_contracts = self._calc_contracts(signal, remaining)
+        if raw_contracts <= 0:
             per_contract = signal.mid_price * CONTRACT_SIZE
             log.info(
                 f"[OPTIONS] Insufficient budget for {signal.symbol} "
@@ -680,6 +677,13 @@ class OptionsExecutor:
                 f"per_contract=${per_contract:.2f})"
             )
             return False
+        # Scale contracts by signal confidence (same curve as equity: 0.50× at floor → 1.0× at 0.85+)
+        from engine.config import MIN_SIGNAL_CONFIDENCE, CONF_SCALE_MIN_MULT, CONF_SCALE_FULL_CONF
+        _conf_mult = CONF_SCALE_MIN_MULT + (1.0 - CONF_SCALE_MIN_MULT) * min(
+            1.0, max(0.0, (signal.confidence - MIN_SIGNAL_CONFIDENCE) / (CONF_SCALE_FULL_CONF - MIN_SIGNAL_CONFIDENCE))
+        )
+        contracts = max(1, int(round(raw_contracts * _conf_mult)))
+        log.debug(f"[OPTIONS] {signal.symbol} conf={signal.confidence:.0%} → scale={_conf_mult:.2f}× → {contracts}c")
 
         # 4. Determine Strategy Type
         strat = signal.strategy.lower()

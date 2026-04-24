@@ -754,7 +754,7 @@ class MomentumCallStrategy:
 class BearPutStrategy:
     """Bear put debit spread on confirmed breakdowns.
 
-    Structure: Buy put (δ0.40 ATM/slight ITM) + Sell put 2 strikes further OTM.
+    Structure: Buy put (δ0.30 OTM) + Sell put 2 strikes further OTM.
     The short leg offsets 30-40% of the premium cost, dramatically improving R/R
     vs a naked put — critical when IV is elevated (crash/fear environment).
 
@@ -831,8 +831,8 @@ class BearPutStrategy:
                 log.debug(f"BearPut {symbol}: IV rank {chain.iv_rank:.0f} > {f["IV_RANK_PUT_MAX"]} — skip")
                 return None
 
-            # Long leg: δ0.40 (ATM/slight ITM)
-            long_row = _pick_strike(chain.puts, ctx.spot, 0.40, f)
+            # Long leg: δ0.30 (OTM)
+            long_row = _pick_strike(chain.puts, ctx.spot, 0.30, f)
             if long_row is None:
                 return None
 
@@ -2004,7 +2004,7 @@ class BreakoutRetestCallStrategy:
 class TrendPullbackSpreadStrategy:
     """Bull call debit spread on EMA-20 pullback within a 50-EMA uptrend.
 
-    Structure: Buy ITM call (delta 0.65) + Sell OTM call 2 strikes above.
+    Structure: Buy OTM call (delta 0.35) + Sell OTM call 2 strikes above.
     Risk = net debit paid.  Max profit = spread_width − net_debit.
 
     Entry requirements:
@@ -2052,8 +2052,8 @@ class TrendPullbackSpreadStrategy:
             if chain.iv_rank > f["IV_RANK_CALL_MAX"]:
                 return None
 
-            # Long leg: ITM call delta 0.65
-            long_row = _pick_strike(chain.calls, ctx.spot, 0.65, f)
+            # Long leg: OTM call delta 0.35
+            long_row = _pick_strike(chain.calls, ctx.spot, 0.35, f)
             if long_row is None:
                 return None
 
@@ -2134,6 +2134,7 @@ class TrendPullbackSpreadStrategy:
         except Exception as e:
             log.debug(f"TrendPullbackSpread {symbol}: {e}")
             return None
+
 
 
 class MeanReversionCallStrategy:
