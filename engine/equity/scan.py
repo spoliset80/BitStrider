@@ -112,7 +112,7 @@ def _prefetch_snapshots(symbols: List[str]) -> None:
         pass  # fall back to per-symbol get_bars in _passes_guardrails
 
 
-def _passes_guardrails(symbol: str, bull_regime: bool = None, market_state: Optional[MarketState] = None) -> bool:
+def _passes_guardrails(symbol: str, bull_regime: bool = None, market_state: Optional[MarketState] = None, return_reason: bool = False) -> bool:
     """Pre-scan gates: dollar-volume, RVOL, and gap-chase guard.
     Returns False to skip the symbol; never raises.
 
@@ -123,11 +123,7 @@ def _passes_guardrails(symbol: str, bull_regime: bool = None, market_state: Opti
     market_state: shared MarketState for the current scan cycle. If None,
     it will be created lazily.
     """
-    # Support return_reason argument for guardrail rejection logging
-    import inspect
-    frame = inspect.currentframe()
-    args, _, _, values = inspect.getargvalues(frame)
-    return_reason = values.get('return_reason', False)
+    # return_reason is now an explicit argument
     try:
         # ── Fast path: use batch-prefetched snapshot (no per-symbol HTTP call) ─
         _snap = _snapshot_cache.get(symbol)
@@ -139,61 +135,86 @@ def _passes_guardrails(symbol: str, bull_regime: bool = None, market_state: Opti
             price   = float(_snap.latest_trade.price)
             day_vol = float(_snap.daily_bar.volume)
             open_px = float(_snap.daily_bar.open)
+            intraday = None
         else:
             # ── Fallback: fetch 1-min intraday bars ───────────────────────────
             intraday = get_bars(symbol, "1d", "1m")
             if intraday.empty or len(intraday) < 5:
                 if return_reason:
-                    return True, None
-                return True
+                    return False, 'other'
+                return False
             price   = float(intraday["close"].iloc[-1])
             day_vol = float(intraday["volume"].sum())
             open_px = float(intraday["open"].iloc[0])
 
-        # Minimum price gate — skip penny stocks (poor fills, wide spreads)
-        if price < MIN_STOCK_PRICE:
-            _log.debug(f"[GUARDRAIL] {symbol} blocked: price {price:.2f} < MIN_STOCK_PRICE {MIN_STOCK_PRICE}")
-            if return_reason:
-                return False, 'min_price'
-            return False
-
-        # Adaptive gates using pre-intelligence (market regime, VIX)
+        # Resolve regime and VIX before adaptive gates
         vix = None
         if hasattr(market_state, 'vix') and market_state.vix is not None:
             vix = market_state.vix
         elif hasattr(market_state, 'resolve_vix'):
             vix, _, _ = market_state.resolve_vix()
         bull = bull_regime if bull_regime is not None else market_state.resolve_regime()
-        # Adaptive RVOL_MIN: higher in bull/high VIX, lower in bear/low VIX
-        base_rvol = RVOL_MIN
-        if bull:
-            if vix and vix > 25:
-                adaptive_rvol = base_rvol + 0.3  # stricter in high vol bull
-            else:
-                adaptive_rvol = base_rvol
-        else:
-            if vix and vix < 18:
-                adaptive_rvol = max(1.2, base_rvol - 0.3)  # looser in calm bear
-            else:
-                adaptive_rvol = max(1.2, base_rvol - 0.1)
 
-        # Adaptive MIN_DOLLAR_VOLUME: higher in bull/high VIX, lower in bear/low VIX
+        # Adaptive MIN_STOCK_PRICE: more flexible for current market
+        base_min_price = MIN_STOCK_PRICE
         base_dollar_vol = MIN_DOLLAR_VOLUME
+        base_rvol = RVOL_MIN
+
         if bull:
             if vix and vix > 25:
+                adaptive_min_price = base_min_price + 0.5
                 adaptive_dollar_vol = base_dollar_vol * 1.2
-            else:
+                adaptive_rvol = base_rvol + 0.3
+            elif vix and vix >= 18:
+                adaptive_min_price = base_min_price
                 adaptive_dollar_vol = base_dollar_vol
+                adaptive_rvol = max(1.2, base_rvol - 0.3)
+            elif vix and vix >= 15:
+                adaptive_min_price = base_min_price
+                adaptive_dollar_vol = base_dollar_vol * 0.9
+                adaptive_rvol = max(1.0, base_rvol - 0.5)
+            else:
+                adaptive_min_price = max(1.0, base_min_price - 0.5)
+                adaptive_dollar_vol = base_dollar_vol * 0.8
+                adaptive_rvol = max(0.9, base_rvol - 0.6)
         else:
             if vix and vix < 18:
-                adaptive_dollar_vol = base_dollar_vol * 0.7
+                adaptive_min_price = max(1.0, base_min_price - 0.7)
+                adaptive_dollar_vol = base_dollar_vol * 0.6
+                adaptive_rvol = max(0.8, base_rvol - 0.7)
             else:
-                adaptive_dollar_vol = base_dollar_vol * 0.85
+                adaptive_min_price = max(1.0, base_min_price - 0.5)
+                adaptive_dollar_vol = base_dollar_vol * 0.75
+                adaptive_rvol = max(1.0, base_rvol - 0.4)
 
-        # Dollar-volume gate (adaptive)
+        if price < adaptive_min_price:
+            _log.warning(f"[GUARDRAIL] {symbol} blocked: price {price:.2f} < adaptive_min_price {adaptive_min_price}")
+            if return_reason:
+                return False, 'min_price'
+            return False
+
+        # Adaptive RVOL_MIN: higher in bull/high VIX, lower in calm or bear conditions
+        # Use regular market hours only so extended-hours volume does not distort the pace.
+        if market_state.is_regular_hours and bull:
+            daily = get_bars(symbol, "5d", "1d")
+            if not daily.empty and len(daily) >= 2:
+                avg_daily_vol = float(daily["volume"].iloc[:-1].mean())
+                if avg_daily_vol > 0:
+                    now_et       = datetime.datetime.now(_ET)
+                    mkt_open     = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
+                    elapsed_min  = max((now_et - mkt_open).total_seconds() / 60, 1.0)
+                    elapsed_frac = min(elapsed_min / 390.0, 1.0)
+                    rvol = (day_vol / max(elapsed_frac, 0.02)) / avg_daily_vol
+                    if rvol < adaptive_rvol:
+                        _log.warning(f"[GUARDRAIL] {symbol} blocked: RVOL {rvol:.2f} < adaptive_rvol {adaptive_rvol:.2f} | day_vol={day_vol:.0f} | avg_daily_vol={avg_daily_vol:.0f}")
+                        if return_reason:
+                            return False, 'rvol'
+                        return False
+
+        # Adaptive MIN_DOLLAR_VOLUME: more flexible for current market
         dollar_vol = price * day_vol
         if dollar_vol < adaptive_dollar_vol:
-            _log.debug(f"[GUARDRAIL] {symbol} blocked: dollar volume {dollar_vol:.0f} < adaptive_dollar_vol {adaptive_dollar_vol}")
+            _log.warning(f"[GUARDRAIL] {symbol} blocked: dollar volume {dollar_vol:.0f} < adaptive_dollar_vol {adaptive_dollar_vol:.0f} | price={price:.2f} | day_vol={day_vol:.0f}")
             if return_reason:
                 return False, 'dollar_vol'
             return False
@@ -210,7 +231,7 @@ def _passes_guardrails(symbol: str, bull_regime: bool = None, market_state: Opti
                     elapsed_frac = min(elapsed_min / 390.0, 1.0)
                     rvol = (day_vol / max(elapsed_frac, 0.02)) / avg_daily_vol
                     if rvol < adaptive_rvol:
-                        _log.debug(f"[GUARDRAIL] {symbol} blocked: RVOL {rvol:.2f} < adaptive_rvol {adaptive_rvol}")
+                        _log.warning(f"[GUARDRAIL] {symbol} blocked: RVOL {rvol:.2f} < adaptive_rvol {adaptive_rvol:.2f} | day_vol={day_vol:.0f} | avg_daily_vol={avg_daily_vol:.0f}")
                         if return_reason:
                             return False, 'rvol'
                         return False

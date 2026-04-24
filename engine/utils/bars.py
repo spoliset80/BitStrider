@@ -197,7 +197,20 @@ def get_bars(symbol: str, period: str = "5d", interval: str = "15m") -> pd.DataF
     symbol = symbol.strip().upper().lstrip("$")
     log = logging.getLogger("ApexTrader")
 
-    if is_dead_ticker(symbol) and symbol != "^VIX":
+
+    # Always use yfinance for ^VIX (Alpaca does not support index symbols)
+    if symbol == "^VIX":
+        try:
+            data = _get_bars_yfinance(symbol, period, interval, log)
+            if not data.empty:
+                return data
+        except ImportError:
+            log.warning("yfinance not installed — cannot use fallback for ^VIX")
+        except Exception as e:
+            log.warning(f"^VIX: yfinance fetch failed: {e}")
+        _record_empty_bars(symbol)
+        return pd.DataFrame()
+    if is_dead_ticker(symbol):
         return pd.DataFrame()
 
     cache_key = (symbol, period, interval)
