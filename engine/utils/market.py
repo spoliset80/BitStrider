@@ -1,3 +1,14 @@
+# Allocation split logic for equity/options based on market hours
+def get_allocation_split(market_state: MarketState) -> tuple[float, float]:
+    """
+    Returns (equity_pct, options_pct) allocation based on market hours.
+    - Off hours: (1.0, 0.0) — all BP to equity
+    - Market hours: (0.3, 0.7) — 30% equity, 70% options
+    """
+    if market_state.is_regular_hours:
+        return 0.3, 0.7
+    else:
+        return 1.0, 0.0
 """
 engine.utils.market
 -------------------
