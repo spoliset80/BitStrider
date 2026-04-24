@@ -632,7 +632,6 @@ class OptionsExecutor:
             is_spread = signal.spread_sell_strike is not None and not is_butterfly and not is_condor
             is_mleg = is_butterfly or is_spread or is_condor
             cp_type = "call" if "call" in signal.option_type.lower() else "put"
-            contracts = 1  # placeholder, will be recalculated below
             # Use the same contract calculation as below
             total_budget, remaining = self._get_options_budget()
             raw_contracts = self._calc_contracts(signal, remaining)
@@ -642,7 +641,6 @@ class OptionsExecutor:
             )
             contracts = max(1, int(round(raw_contracts * _conf_mult)))
             # Build legs for the pending order
-            legs = []
             if is_condor:
                 legs = [
                     {"strike": signal.put_long_strike, "ratio_qty": 1},
@@ -664,17 +662,27 @@ class OptionsExecutor:
                 ]
             else:
                 legs = [{"strike": signal.strike, "ratio_qty": 1}]
-            extra = {"contracts": contracts, "legs": legs}
-            gross_notional = self._calculate_gross_notional(extra=extra)
+
+            # Dynamically reduce contracts to fit under 6x equity notional cap
             try:
                 acct = self.client.get_account()
                 equity = float(acct.equity)
             except Exception as e:
                 log.warning(f"[OPTIONS] Could not fetch account equity for notional check: {e}")
                 equity = 0.0
-            if equity > 0 and gross_notional > 6 * equity:
+            min_contracts = 1
+            order_accepted = False
+            while contracts >= min_contracts:
+                extra = {"contracts": contracts, "legs": legs}
+                gross_notional = self._calculate_gross_notional(extra=extra)
+                if equity > 0 and gross_notional > 6 * equity:
+                    contracts -= 1
+                    continue
+                order_accepted = True
+                break
+            if not order_accepted:
                 log.warning(
-                    f"[OPTIONS] Skipping {signal.symbol} order: gross notional after order (${gross_notional:,.2f}) exceeds 6x equity (${equity:,.2f})"
+                    f"[OPTIONS] Skipping {signal.symbol} order: even 1 contract would exceed gross notional cap (${gross_notional:,.2f} > 6x equity ${equity:,.2f})"
                 )
                 return False
         """
