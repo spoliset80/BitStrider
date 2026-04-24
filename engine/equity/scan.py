@@ -1,4 +1,5 @@
 # Adaptive equity allocation based on pre-intelligence (market regime, signal quality, or pre-market indicators)
+from engine.utils import MarketState
 def get_adaptive_equity_allocation(market_state: MarketState, avg_signal_conf: float = None, premarket_strength: float = None) -> float:
     """
     Returns adaptive position size percentage for equities based on pre-intelligence.

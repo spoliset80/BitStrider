@@ -1,3 +1,6 @@
+# ── Fix: __future__ import must be first ──
+from __future__ import annotations
+
 # Allocation split logic for equity/options based on market hours
 def get_allocation_split(market_state: MarketState) -> tuple[float, float]:
     """
@@ -9,6 +12,7 @@ def get_allocation_split(market_state: MarketState) -> tuple[float, float]:
         return 0.3, 0.7
     else:
         return 1.0, 0.0
+
 """
 engine.utils.market
 -------------------
@@ -16,8 +20,6 @@ Market-hours detection, VIX, adaptive interval calculations, and market sentimen
 
 All public functions here are re-exported from engine.utils for backward compat.
 """
-
-from __future__ import annotations
 
 import datetime
 import logging
