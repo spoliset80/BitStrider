@@ -32,6 +32,18 @@ from .discovery import get_priority_scan_queue as _get_priority_scan_queue
 
 _ET  = pytz.timezone("America/New_York")
 _log = logging.getLogger("ApexTrader")
+
+# ── Adaptive Filter State ──
+_adaptive_state = {
+    "empty_scans": 0,
+    "rvol_min": RVOL_MIN,
+    "min_conf": MIN_SIGNAL_CONFIDENCE,
+}
+_ADAPTIVE_MAX_EMPTY = 3  # Number of empty scans before relaxing
+_ADAPTIVE_MIN_RVOL = 1.2
+_ADAPTIVE_MIN_CONF = 0.60
+_ADAPTIVE_STEP_RVOL = 0.2
+_ADAPTIVE_STEP_CONF = 0.03
 from .strategies import get_strategy_instances, MomentumStrategy, TechnicalStrategy, SentimentStrategy
 from engine.utils.market import _is_bull_regime, _INVERSE_ETFS
 
@@ -111,6 +123,7 @@ def _passes_guardrails(symbol: str, bull_regime: bool = None, market_state: Opti
         # In bear regime, skip RVOL gate — breakdown volume is often distributed,
         # not the spike pattern seen in squeeze/momentum setups.
         _bull = bull_regime if bull_regime is not None else market_state.resolve_regime()
+        adaptive_rvol = _adaptive_state.get("rvol_min", RVOL_MIN)
         if market_state.is_market_open and _bull:
             daily = get_bars(symbol, "5d", "1d")
             if not daily.empty and len(daily) >= 2:
@@ -121,7 +134,7 @@ def _passes_guardrails(symbol: str, bull_regime: bool = None, market_state: Opti
                     elapsed_min  = max((now_et - mkt_open).total_seconds() / 60, 1.0)
                     elapsed_frac = min(elapsed_min / 390.0, 1.0)
                     rvol = (day_vol / max(elapsed_frac, 0.02)) / avg_daily_vol
-                    if rvol < RVOL_MIN:
+                    if rvol < adaptive_rvol:
                         return False
 
         # Gap-chase guard: skip if up >MAX_GAP_CHASE_PCT% without a tight consolidation base
@@ -305,12 +318,33 @@ def scan_universe(scan_targets: List[str], sentiment: str, market_state: MarketS
                 scan_errors += 1
 
     signals.sort(key=lambda x: x.confidence, reverse=True)
+    # Adaptive confidence filter
+    adaptive_conf = _adaptive_state.get("min_conf", MIN_SIGNAL_CONFIDENCE)
+    signals = [s for s in signals if s.confidence >= adaptive_conf]
     if LONG_ONLY_MODE:
         # Long-only enforcement: drop sell/short signals only when LONG_ONLY_MODE is active
         pre_len = len(signals)
         signals = [s for s in signals if s.action == "buy"]
         if len(signals) != pre_len:
             _log.info(f"Long-only enforced in scan_universe: dropping {pre_len-len(signals)} short signals")
+
+    # Adaptive filter logic: relax after N empty scans, reset after success
+    if len(signals) == 0:
+        _adaptive_state["empty_scans"] += 1
+        if _adaptive_state["empty_scans"] >= _ADAPTIVE_MAX_EMPTY:
+            # Relax RVOL and confidence stepwise
+            if _adaptive_state["rvol_min"] > _ADAPTIVE_MIN_RVOL:
+                _adaptive_state["rvol_min"] = max(_ADAPTIVE_MIN_RVOL, _adaptive_state["rvol_min"] - _ADAPTIVE_STEP_RVOL)
+                _log.info(f"[ADAPTIVE] Lowered RVOL_MIN to {_adaptive_state['rvol_min']:.2f}")
+            if _adaptive_state["min_conf"] > _ADAPTIVE_MIN_CONF:
+                _adaptive_state["min_conf"] = max(_ADAPTIVE_MIN_CONF, _adaptive_state["min_conf"] - _ADAPTIVE_STEP_CONF)
+                _log.info(f"[ADAPTIVE] Lowered MIN_SIGNAL_CONFIDENCE to {_adaptive_state['min_conf']:.2f}")
+    else:
+        if _adaptive_state["empty_scans"] > 0:
+            _log.info(f"[ADAPTIVE] Resetting adaptive filters after successful scan.")
+        _adaptive_state["empty_scans"] = 0
+        _adaptive_state["rvol_min"] = RVOL_MIN
+        _adaptive_state["min_conf"] = MIN_SIGNAL_CONFIDENCE
     return signals, hit_counts, scan_errors
 
 
