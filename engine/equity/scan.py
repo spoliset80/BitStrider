@@ -123,6 +123,11 @@ def _passes_guardrails(symbol: str, bull_regime: bool = None, market_state: Opti
     market_state: shared MarketState for the current scan cycle. If None,
     it will be created lazily.
     """
+    # Support return_reason argument for guardrail rejection logging
+    import inspect
+    frame = inspect.currentframe()
+    args, _, _, values = inspect.getargvalues(frame)
+    return_reason = values.get('return_reason', False)
     try:
         # ── Fast path: use batch-prefetched snapshot (no per-symbol HTTP call) ─
         _snap = _snapshot_cache.get(symbol)
@@ -138,7 +143,9 @@ def _passes_guardrails(symbol: str, bull_regime: bool = None, market_state: Opti
             # ── Fallback: fetch 1-min intraday bars ───────────────────────────
             intraday = get_bars(symbol, "1d", "1m")
             if intraday.empty or len(intraday) < 5:
-                return True  # not enough data — let strategies decide
+                if return_reason:
+                    return True, None
+                return True
             price   = float(intraday["close"].iloc[-1])
             day_vol = float(intraday["volume"].sum())
             open_px = float(intraday["open"].iloc[0])
@@ -146,6 +153,8 @@ def _passes_guardrails(symbol: str, bull_regime: bool = None, market_state: Opti
         # Minimum price gate — skip penny stocks (poor fills, wide spreads)
         if price < MIN_STOCK_PRICE:
             _log.debug(f"[GUARDRAIL] {symbol} blocked: price {price:.2f} < MIN_STOCK_PRICE {MIN_STOCK_PRICE}")
+            if return_reason:
+                return False, 'min_price'
             return False
 
         # Adaptive gates using pre-intelligence (market regime, VIX)
@@ -185,6 +194,8 @@ def _passes_guardrails(symbol: str, bull_regime: bool = None, market_state: Opti
         dollar_vol = price * day_vol
         if dollar_vol < adaptive_dollar_vol:
             _log.debug(f"[GUARDRAIL] {symbol} blocked: dollar volume {dollar_vol:.0f} < adaptive_dollar_vol {adaptive_dollar_vol}")
+            if return_reason:
+                return False, 'dollar_vol'
             return False
 
         # RVOL gate (adaptive)
@@ -200,6 +211,8 @@ def _passes_guardrails(symbol: str, bull_regime: bool = None, market_state: Opti
                     rvol = (day_vol / max(elapsed_frac, 0.02)) / avg_daily_vol
                     if rvol < adaptive_rvol:
                         _log.debug(f"[GUARDRAIL] {symbol} blocked: RVOL {rvol:.2f} < adaptive_rvol {adaptive_rvol}")
+                        if return_reason:
+                            return False, 'rvol'
                         return False
 
         # Adaptive MAX_GAP_CHASE_PCT using market regime and VIX
@@ -236,11 +249,17 @@ def _passes_guardrails(symbol: str, bull_regime: bool = None, market_state: Opti
                     bar_range = float(last_n["high"].max() - last_n["low"].min())
                     if bar_range > price * 0.02:  # range > 2% = no consolidation
                         _log.debug(f"[GUARDRAIL] {symbol} blocked: gap chase, bar range {bar_range:.2f} > 2% of price {price:.2f}")
+                        if return_reason:
+                            return False, 'gap_chase'
                         return False
 
+        if return_reason:
+            return True, None
         return True
     except Exception as e:
         _log.warning(f"Guardrail check failed for {symbol}: {e} — skipping symbol")
+        if return_reason:
+            return False, 'other'
         return False  # fail-safe: block on error, never bypass guardrails
 
 
@@ -419,8 +438,9 @@ def scan_universe(scan_targets: List[str], sentiment: str, market_state: MarketS
                 if sig:
                     signals.append(sig)
                     hit_counts[sig.strategy] = hit_counts.get(sig.strategy, 0) + 1
-            except Exception:
+            except Exception as e:
                 scan_errors += 1
+                _log.error(f"[SCAN ERROR] {sym}: {e}")
 
     # Log guardrail rejection summary
     total_rejected = sum(guardrail_rejections.values())

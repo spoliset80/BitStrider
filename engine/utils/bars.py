@@ -8,11 +8,15 @@ All public functions here are re-exported from engine.utils for backward compat.
 
 from __future__ import annotations
 
+
 import datetime
 import logging
 import threading
 import time
 from typing import Dict, Tuple
+
+# Add tenacity for retry logic
+from tenacity import retry, wait_exponential, stop_after_attempt, retry_if_exception_type
 
 import pandas as pd
 import pytz
@@ -122,6 +126,68 @@ def _normalize_df(df: pd.DataFrame) -> pd.DataFrame:
 
 # ── Core bar fetch ────────────────────────────────────────────────────────────
 
+@retry(wait=wait_exponential(multiplier=1, min=2, max=10), stop=stop_after_attempt(3),
+       retry=retry_if_exception_type(Exception))
+def _get_bars_alpaca(symbol: str, period: str, interval: str, log) -> pd.DataFrame:
+    """Fetch OHLCV bars via Alpaca only, with retry."""
+    client = get_data_client()
+    tf     = _parse_timeframe(interval)
+    days   = int(period[:-1]) if period.endswith("d") else 5
+    end_dt = datetime.datetime.now(ET)
+    start_dt = end_dt - datetime.timedelta(days=days)
+    start_iso = start_dt.astimezone(pytz.UTC).isoformat().replace("+00:00", "Z")
+    end_iso   = end_dt.astimezone(pytz.UTC).isoformat().replace("+00:00", "Z")
+
+    global _last_alpaca_bar_ts
+    elapsed = time.time() - _last_alpaca_bar_ts
+    if elapsed < _ALPACA_MIN_INTERVAL:
+        time.sleep(_ALPACA_MIN_INTERVAL - elapsed)
+
+    bars = client.get_stock_bars(StockBarsRequest(
+        symbol_or_symbols=symbol,
+        timeframe=tf,
+        start=start_iso,
+        end=end_iso,
+        feed="iex",
+    ))
+    _last_alpaca_bar_ts = time.time()
+    if symbol in bars:
+        data = _normalize_df(bars[symbol].df.reset_index())
+        if "time" in data.columns:
+            latest    = pd.to_datetime(data["time"].iloc[-1])
+            if latest.tzinfo is None:
+                latest = ET.localize(latest)
+            staleness = (datetime.datetime.now(ET) - latest).total_seconds()
+            if interval.endswith("m") and staleness > 120:
+                log.warning(f"{symbol}: Alpaca data stale ({staleness:.0f}s) — skipping")
+            else:
+                _record_ok_bars(symbol)
+                with _bar_cache_lock:
+                    _bar_cache[(symbol, period, interval)] = data
+                return data
+    return pd.DataFrame()
+
+@retry(wait=wait_exponential(multiplier=1, min=2, max=10), stop=stop_after_attempt(3),
+       retry=retry_if_exception_type(Exception))
+def _get_bars_yfinance(symbol: str, period: str, interval: str, log) -> pd.DataFrame:
+    import yfinance as yf
+    yf_interval_map = {
+        "1m": "1m", "2m": "2m", "5m": "5m", "15m": "15m",
+        "30m": "30m", "60m": "60m", "90m": "90m", "1h": "1h",
+        "1d": "1d", "5d": "5d", "1wk": "1wk", "1mo": "1mo",
+    }
+    yf_interval = yf_interval_map.get(interval, "1d")
+    yf_period   = period if period.endswith(("d", "mo", "y", "wk")) else "5d"
+    ticker = yf.Ticker(symbol)
+    df = ticker.history(period=yf_period, interval=yf_interval, auto_adjust=False)
+    if not df.empty:
+        df = _normalize_df(df.reset_index())
+        _record_ok_bars(symbol)
+        with _bar_cache_lock:
+            _bar_cache[(symbol, period, interval)] = df
+        return df
+    return pd.DataFrame()
+
 def get_bars(symbol: str, period: str = "5d", interval: str = "15m") -> pd.DataFrame:
     """Fetch OHLCV bars via Alpaca (yfinance fallback).
 
@@ -140,73 +206,24 @@ def get_bars(symbol: str, period: str = "5d", interval: str = "15m") -> pd.DataF
             log.debug(f"{symbol}: bar cache hit ({period}/{interval})")
             return _bar_cache[cache_key]
 
-    # ── Alpaca path ───────────────────────────────────────────────────────────
+    # ── Alpaca path with retry ──
     if ALPACA_AVAILABLE:
         try:
-            # Tradability is enforced by the executor at order time.
-            # Checking it here required a TradingClient round-trip per bar
-            # fetch — removed to eliminate that overhead.
-            client = get_data_client()
-            tf     = _parse_timeframe(interval)
-            days   = int(period[:-1]) if period.endswith("d") else 5
-            end_dt = datetime.datetime.now(ET)
-            start_dt = end_dt - datetime.timedelta(days=days)
-            start_iso = start_dt.astimezone(pytz.UTC).isoformat().replace("+00:00", "Z")
-            end_iso   = end_dt.astimezone(pytz.UTC).isoformat().replace("+00:00", "Z")
+            data = _get_bars_alpaca(symbol, period, interval, log)
+            if not data.empty:
+                return data
+        except Exception as e:
+            log.warning(f"{symbol}: Alpaca fetch failed: {e}")
 
-            global _last_alpaca_bar_ts
-            elapsed = time.time() - _last_alpaca_bar_ts
-            if elapsed < _ALPACA_MIN_INTERVAL:
-                time.sleep(_ALPACA_MIN_INTERVAL - elapsed)
-
-            bars = client.get_stock_bars(StockBarsRequest(
-                symbol_or_symbols=symbol,
-                timeframe=tf,
-                start=start_iso,
-                end=end_iso,
-                feed="iex",
-            ))
-            _last_alpaca_bar_ts = time.time()
-
-            if symbol in bars:
-                data = _normalize_df(bars[symbol].df.reset_index())
-                if "time" in data.columns:
-                    latest    = pd.to_datetime(data["time"].iloc[-1])
-                    if latest.tzinfo is None:
-                        latest = ET.localize(latest)
-                    staleness = (datetime.datetime.now(ET) - latest).total_seconds()
-                    if interval.endswith("m") and staleness > 120:
-                        log.warning(f"{symbol}: Alpaca data stale ({staleness:.0f}s) — skipping")
-                    else:
-                        _record_ok_bars(symbol)
-                        with _bar_cache_lock:
-                            _bar_cache[cache_key] = data
-                        return data
-        except Exception:
-            pass
-
-    # ── yfinance fallback ─────────────────────────────────────────────────────
+    # ── yfinance fallback with retry ──
     try:
-        import yfinance as yf
-        yf_interval_map = {
-            "1m": "1m", "2m": "2m", "5m": "5m", "15m": "15m",
-            "30m": "30m", "60m": "60m", "90m": "90m", "1h": "1h",
-            "1d": "1d", "5d": "5d", "1wk": "1wk", "1mo": "1mo",
-        }
-        yf_interval = yf_interval_map.get(interval, "1d")
-        yf_period   = period if period.endswith(("d", "mo", "y", "wk")) else "5d"
-        ticker = yf.Ticker(symbol)
-        df = ticker.history(period=yf_period, interval=yf_interval, auto_adjust=False)
-        if not df.empty:
-            df = _normalize_df(df.reset_index())
-            _record_ok_bars(symbol)
-            with _bar_cache_lock:
-                _bar_cache[cache_key] = df
-            return df
+        data = _get_bars_yfinance(symbol, period, interval, log)
+        if not data.empty:
+            return data
     except ImportError:
         log.warning("yfinance not installed — cannot use fallback")
-    except Exception:
-        pass
+    except Exception as e:
+        log.warning(f"{symbol}: yfinance fetch failed: {e}")
 
     _record_empty_bars(symbol)
     return pd.DataFrame()
