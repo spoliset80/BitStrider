@@ -113,10 +113,13 @@ def _passes_guardrails(symbol: str, bull_regime: bool = None, market_state: Opti
 
         # Minimum price gate — skip penny stocks (poor fills, wide spreads)
         if price < MIN_STOCK_PRICE:
+            _log.debug(f"[GUARDRAIL] {symbol} blocked: price {price:.2f} < MIN_STOCK_PRICE {MIN_STOCK_PRICE}")
             return False
 
         # Dollar-volume gate
-        if price * day_vol < MIN_DOLLAR_VOLUME:
+        dollar_vol = price * day_vol
+        if dollar_vol < MIN_DOLLAR_VOLUME:
+            _log.debug(f"[GUARDRAIL] {symbol} blocked: dollar volume {dollar_vol:.0f} < MIN_DOLLAR_VOLUME {MIN_DOLLAR_VOLUME}")
             return False
 
         # RVOL gate: only meaningful during regular market hours
@@ -135,6 +138,7 @@ def _passes_guardrails(symbol: str, bull_regime: bool = None, market_state: Opti
                     elapsed_frac = min(elapsed_min / 390.0, 1.0)
                     rvol = (day_vol / max(elapsed_frac, 0.02)) / avg_daily_vol
                     if rvol < adaptive_rvol:
+                        _log.debug(f"[GUARDRAIL] {symbol} blocked: RVOL {rvol:.2f} < adaptive_rvol {adaptive_rvol}")
                         return False
 
         # Gap-chase guard: skip if up >MAX_GAP_CHASE_PCT% without a tight consolidation base
@@ -151,6 +155,7 @@ def _passes_guardrails(symbol: str, bull_regime: bool = None, market_state: Opti
                     last_n    = intraday.iloc[-GAP_CHASE_CONSOL_BARS:]
                     bar_range = float(last_n["high"].max() - last_n["low"].min())
                     if bar_range > price * 0.02:  # range > 2% = no consolidation
+                        _log.debug(f"[GUARDRAIL] {symbol} blocked: gap chase, bar range {bar_range:.2f} > 2% of price {price:.2f}")
                         return False
 
         return True
