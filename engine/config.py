@@ -124,7 +124,18 @@ def get_options_universe(require_ti_file: bool = False) -> list:
 
     # Core liquid options names — always included first regardless of TI data.
     # These have the tightest spreads, deepest chains, and highest OI.
+
+    # Always include index tickers in paper trading mode
+    _index_tickers = ["SPX", "NDX", "RUT", "VIX"]
     _core = list(dict.fromkeys(_OPTIONS_FALLBACK_UNIVERSE))
+    try:
+        if PAPER:
+            # Prepend index tickers if not already present
+            for idx in reversed(_index_tickers):
+                if idx not in _core:
+                    _core.insert(0, idx)
+    except Exception:
+        pass
 
     ti_universe = []
     try:

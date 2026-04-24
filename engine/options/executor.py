@@ -117,8 +117,33 @@ class OptionsPosition:
     breakeven_mode: bool = False
 
 
+
 class OptionsExecutor:
     """Manages options positions within a 15% portfolio allocation."""
+
+    def _calculate_gross_notional(self, extra: Optional[dict] = None) -> float:
+        """
+        Calculate the gross notional value of all open option positions, plus an optional extra position.
+        Each leg: abs(contracts * strike * 100)
+        """
+        total = 0.0
+        # Existing positions
+        for pos in self._positions.values():
+            for leg in (pos.legs if pos.legs else [{"occ_symbol": pos.occ_symbol, "side": "buy", "ratio_qty": 1}]):
+                contracts = abs(pos.contracts) * abs(leg.get("ratio_qty", 1))
+                # Extract strike from OCC symbol (format: SYMBOLYYMMDDC|P########)
+                occ = leg["occ_symbol"]
+                m = re.match(r"^[A-Z]+\d{6}[CP](\d{8})$", occ)
+                if m:
+                    strike = int(m.group(1)) / 1000.0
+                    total += abs(contracts * strike * 100)
+        # Add extra (pending order) if provided
+        if extra:
+            for leg in extra.get("legs", []):
+                contracts = abs(extra["contracts"]) * abs(leg.get("ratio_qty", 1))
+                strike = leg["strike"]
+                total += abs(contracts * strike * 100)
+        return total
 
     def __init__(self, client: TradingClient):
         self.client = client
@@ -598,6 +623,60 @@ class OptionsExecutor:
             return True  # allow attempt; the order itself will catch any restriction
 
     def place_option_order(self, signal: OptionSignal, market_state: MarketState) -> bool:
+        # 0. Gross Notional Check (LIVE accounts only)
+        if not PAPER:
+            # Prepare legs for the pending order
+            strat = signal.strategy.lower()
+            is_butterfly = "butterfly" in strat or "butterfly" in signal.option_type.lower()
+            is_condor = "condor" in strat
+            is_spread = signal.spread_sell_strike is not None and not is_butterfly and not is_condor
+            is_mleg = is_butterfly or is_spread or is_condor
+            cp_type = "call" if "call" in signal.option_type.lower() else "put"
+            contracts = 1  # placeholder, will be recalculated below
+            # Use the same contract calculation as below
+            total_budget, remaining = self._get_options_budget()
+            raw_contracts = self._calc_contracts(signal, remaining)
+            from engine.config import MIN_SIGNAL_CONFIDENCE, CONF_SCALE_MIN_MULT, CONF_SCALE_FULL_CONF
+            _conf_mult = CONF_SCALE_MIN_MULT + (1.0 - CONF_SCALE_MIN_MULT) * min(
+                1.0, max(0.0, (signal.confidence - MIN_SIGNAL_CONFIDENCE) / (CONF_SCALE_FULL_CONF - MIN_SIGNAL_CONFIDENCE))
+            )
+            contracts = max(1, int(round(raw_contracts * _conf_mult)))
+            # Build legs for the pending order
+            legs = []
+            if is_condor:
+                legs = [
+                    {"strike": signal.put_long_strike, "ratio_qty": 1},
+                    {"strike": signal.put_short_strike, "ratio_qty": 1},
+                    {"strike": signal.call_short_strike, "ratio_qty": 1},
+                    {"strike": signal.call_long_strike, "ratio_qty": 1},
+                ]
+            elif is_butterfly:
+                legs = [
+                    {"strike": signal.butterfly_low_strike, "ratio_qty": 1},
+                    {"strike": signal.strike, "ratio_qty": 2},
+                    {"strike": signal.butterfly_high_strike, "ratio_qty": 1},
+                ]
+            elif is_spread:
+                _eff_spread_sell_strike = signal.spread_sell_strike
+                legs = [
+                    {"strike": signal.strike, "ratio_qty": 1},
+                    {"strike": _eff_spread_sell_strike, "ratio_qty": 1},
+                ]
+            else:
+                legs = [{"strike": signal.strike, "ratio_qty": 1}]
+            extra = {"contracts": contracts, "legs": legs}
+            gross_notional = self._calculate_gross_notional(extra=extra)
+            try:
+                acct = self.client.get_account()
+                equity = float(acct.equity)
+            except Exception as e:
+                log.warning(f"[OPTIONS] Could not fetch account equity for notional check: {e}")
+                equity = 0.0
+            if equity > 0 and gross_notional > 6 * equity:
+                log.warning(
+                    f"[OPTIONS] Skipping {signal.symbol} order: gross notional after order (${gross_notional:,.2f}) exceeds 6x equity (${equity:,.2f})"
+                )
+                return False
         """
         Production-ready order placement for ApexTrader.
         Fixes communications with Alpaca API and internal state tracking.
