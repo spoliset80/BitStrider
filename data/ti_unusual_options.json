@@ -1,5 +1,5 @@
 {
-  "updated": "2026-04-24T20:32:02Z",
+  "updated": "2026-04-24T20:44:37Z",
   "tickers": [
     "WIMI",
     "QCML",
@@ -35,21 +35,21 @@
     "BRCC",
     "MOG",
     "ANAB",
-    "ATOM",
     "OPTU",
-    "VYGR",
+    "INV",
+    "MEI",
     "BRAG",
-    "LPTH",
+    "SNX",
+    "ARCT",
+    "PODD",
+    "FLWS",
+    "FOSL",
+    "ENTG",
+    "ABCL",
+    "MAPS",
+    "VYGR",
     "AMPG",
-    "CRBP",
-    "LFVN",
-    "JELD",
-    "GEOS",
-    "YSS",
-    "AMSC",
-    "EH",
-    "MEDP",
-    "BIOX",
-    "OKLL"
+    "GFL",
+    "CRBP"
   ]
 }

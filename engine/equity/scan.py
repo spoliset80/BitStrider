@@ -148,18 +148,47 @@ def _passes_guardrails(symbol: str, bull_regime: bool = None, market_state: Opti
             _log.debug(f"[GUARDRAIL] {symbol} blocked: price {price:.2f} < MIN_STOCK_PRICE {MIN_STOCK_PRICE}")
             return False
 
-        # Dollar-volume gate
+        # Adaptive gates using pre-intelligence (market regime, VIX)
+        vix = None
+        if hasattr(market_state, 'vix') and market_state.vix is not None:
+            vix = market_state.vix
+        elif hasattr(market_state, 'resolve_vix'):
+            vix, _, _ = market_state.resolve_vix()
+        bull = bull_regime if bull_regime is not None else market_state.resolve_regime()
+        # Adaptive RVOL_MIN: higher in bull/high VIX, lower in bear/low VIX
+        base_rvol = RVOL_MIN
+        if bull:
+            if vix and vix > 25:
+                adaptive_rvol = base_rvol + 0.3  # stricter in high vol bull
+            else:
+                adaptive_rvol = base_rvol
+        else:
+            if vix and vix < 18:
+                adaptive_rvol = max(1.2, base_rvol - 0.3)  # looser in calm bear
+            else:
+                adaptive_rvol = max(1.2, base_rvol - 0.1)
+
+        # Adaptive MIN_DOLLAR_VOLUME: higher in bull/high VIX, lower in bear/low VIX
+        base_dollar_vol = MIN_DOLLAR_VOLUME
+        if bull:
+            if vix and vix > 25:
+                adaptive_dollar_vol = base_dollar_vol * 1.2
+            else:
+                adaptive_dollar_vol = base_dollar_vol
+        else:
+            if vix and vix < 18:
+                adaptive_dollar_vol = base_dollar_vol * 0.7
+            else:
+                adaptive_dollar_vol = base_dollar_vol * 0.85
+
+        # Dollar-volume gate (adaptive)
         dollar_vol = price * day_vol
-        if dollar_vol < MIN_DOLLAR_VOLUME:
-            _log.debug(f"[GUARDRAIL] {symbol} blocked: dollar volume {dollar_vol:.0f} < MIN_DOLLAR_VOLUME {MIN_DOLLAR_VOLUME}")
+        if dollar_vol < adaptive_dollar_vol:
+            _log.debug(f"[GUARDRAIL] {symbol} blocked: dollar volume {dollar_vol:.0f} < adaptive_dollar_vol {adaptive_dollar_vol}")
             return False
 
-        # RVOL gate: only meaningful during regular market hours
-        # In bear regime, skip RVOL gate — breakdown volume is often distributed,
-        # not the spike pattern seen in squeeze/momentum setups.
-        _bull = bull_regime if bull_regime is not None else market_state.resolve_regime()
-        adaptive_rvol = _adaptive_state.get("rvol_min", RVOL_MIN)
-        if market_state.is_market_open and _bull:
+        # RVOL gate (adaptive)
+        if market_state.is_market_open and bull:
             daily = get_bars(symbol, "5d", "1d")
             if not daily.empty and len(daily) >= 2:
                 avg_daily_vol = float(daily["volume"].iloc[:-1].mean())
@@ -173,10 +202,29 @@ def _passes_guardrails(symbol: str, bull_regime: bool = None, market_state: Opti
                         _log.debug(f"[GUARDRAIL] {symbol} blocked: RVOL {rvol:.2f} < adaptive_rvol {adaptive_rvol}")
                         return False
 
-        # Gap-chase guard: skip if up >MAX_GAP_CHASE_PCT% without a tight consolidation base
+        # Adaptive MAX_GAP_CHASE_PCT using market regime and VIX
+        vix = None
+        if hasattr(market_state, 'vix') and market_state.vix is not None:
+            vix = market_state.vix
+        elif hasattr(market_state, 'resolve_vix'):
+            vix, _, _ = market_state.resolve_vix()
+        bull = bull_regime if bull_regime is not None else market_state.resolve_regime()
+        base_gap = MAX_GAP_CHASE_PCT
+        if bull:
+            if vix and vix > 25:
+                adaptive_gap = min(20.0, base_gap + 5.0)
+            else:
+                adaptive_gap = base_gap
+        else:
+            if vix and vix < 18:
+                adaptive_gap = max(10.0, base_gap - 5.0)
+            else:
+                adaptive_gap = max(12.0, base_gap - 3.0)
+
+        # Gap-chase guard: skip if up >adaptive_gap% without a tight consolidation base
         if open_px > 0:
             day_gain = ((price - open_px) / open_px) * 100
-            if day_gain > MAX_GAP_CHASE_PCT:
+            if day_gain > adaptive_gap:
                 # When 1-min bars are available, require tight recent consolidation.
                 # With snapshot-only data, skip the consolidation check (conservative:
                 # allows the signal — strategy-level filters apply next).
@@ -204,17 +252,21 @@ def get_scan_targets(excluded: Set[str] = None) -> List[str]:
 
     delisted = set(_cfg.DELISTED_STOCKS)
 
+
     # PRIMARY: latest captured TI tickers from ti_primary.json.
     # FALLBACK: active TI tickers from universe.json tiers 1+2.
     ti_primary = [s for s in _get_ti_primary() if s not in delisted]
 
-    # FALLBACK: static config lists — used only when TI universe is empty.
+    # Universe health check
     _MIN_TI = 5
-    if len(ti_primary) < _MIN_TI:
-        _log.warning(
-            f"TI primary universe too small ({len(ti_primary)}) — falling back to static config lists"
-        )
+    if len(ti_primary) == 0:
+        _log.error("[UNIVERSE HEALTH] ti_primary.json is empty! No tickers to scan. Check data pipeline.")
+    elif len(ti_primary) < _MIN_TI:
+        _log.warning(f"[UNIVERSE HEALTH] ti_primary.json too small ({len(ti_primary)}). Falling back to static config lists.")
         p1, p2, _ = _cfg.get_dynamic_universe()
+        # Alert if static lists are also empty
+        if len(p1) + len(p2) == 0:
+            _log.error("[UNIVERSE HEALTH] Static universe lists are empty! No tickers to scan. Check config/universe sources.")
     else:
         p1, p2 = ti_primary, []
 
@@ -312,14 +364,28 @@ def scan_universe(scan_targets: List[str], sentiment: str, market_state: MarketS
     regime_str  = "bull" if bull_regime else "bear"
     strats = get_strategy_instances(bull_regime)
 
+
     signals = []
     hit_counts = {}
     scan_errors = 0
+    guardrail_rejections = {
+        'dollar_vol': 0,
+        'rvol': 0,
+        'gap_chase': 0,
+        'min_price': 0,
+        'other': 0
+    }
 
     def _scan_one(symbol: str):
         # Dead-ticker check already done in get_scan_targets() — skip here.
         # Pass pre-computed regime into guardrails to avoid re-calling _is_bull_regime()
-        if not _passes_guardrails(symbol, bull_regime=bull_regime, market_state=market_state):
+        # Custom: get rejection reason from _passes_guardrails
+        passed, reason = _passes_guardrails(symbol, bull_regime=bull_regime, market_state=market_state, return_reason=True)
+        if not passed:
+            if reason in guardrail_rejections:
+                guardrail_rejections[reason] += 1
+            else:
+                guardrail_rejections['other'] += 1
             return None
 
         candidates = []
@@ -342,6 +408,8 @@ def scan_universe(scan_targets: List[str], sentiment: str, market_state: MarketS
             return None
         return max(candidates, key=lambda s: s.confidence)
 
+
+
     with ThreadPoolExecutor(max_workers=SCAN_WORKERS) as pool:
         future_map = {pool.submit(_scan_one, sym): sym for sym in scan_targets}
         for future in as_completed(future_map):
@@ -354,10 +422,47 @@ def scan_universe(scan_targets: List[str], sentiment: str, market_state: MarketS
             except Exception:
                 scan_errors += 1
 
+    # Log guardrail rejection summary
+    total_rejected = sum(guardrail_rejections.values())
+    if total_rejected > 0:
+        _log.info(f"[GUARDRAIL SUMMARY] Rejected: {total_rejected} | DollarVol: {guardrail_rejections['dollar_vol']} | RVOL: {guardrail_rejections['rvol']} | GapChase: {guardrail_rejections['gap_chase']} | MinPrice: {guardrail_rejections['min_price']} | Other: {guardrail_rejections['other']}")
+
     signals.sort(key=lambda x: x.confidence, reverse=True)
-    # Adaptive confidence filter
-    adaptive_conf = _adaptive_state.get("min_conf", MIN_SIGNAL_CONFIDENCE)
+    # Adaptive confidence filter using pre-intelligence (market regime, VIX)
+    vix = None
+    if hasattr(market_state, 'vix') and market_state.vix is not None:
+        vix = market_state.vix
+    elif hasattr(market_state, 'resolve_vix'):
+        vix, _, _ = market_state.resolve_vix()
+    bull = market_state.resolve_regime()
+    base_conf = MIN_SIGNAL_CONFIDENCE
+    if bull:
+        if vix and vix > 25:
+            adaptive_conf = min(0.80, base_conf + 0.05)  # stricter in high-vol bull
+        else:
+            adaptive_conf = base_conf
+    else:
+        if vix and vix < 18:
+            adaptive_conf = max(0.65, base_conf - 0.05)  # looser in calm bear
+        else:
+            adaptive_conf = max(0.68, base_conf - 0.02)
     signals = [s for s in signals if s.confidence >= adaptive_conf]
+
+    # Dynamic sector/industry weighting cap
+    # Limit to max 3 signals per sector (can be tuned)
+    from collections import defaultdict
+    sector_cap = 3
+    sector_counts = defaultdict(int)
+    filtered_signals = []
+    for sig in signals:
+        sector = getattr(sig, 'sector', None)
+        if sector is None:
+            filtered_signals.append(sig)  # If no sector info, allow
+            continue
+        if sector_counts[sector] < sector_cap:
+            filtered_signals.append(sig)
+            sector_counts[sector] += 1
+    signals = filtered_signals
     if LONG_ONLY_MODE:
         # Long-only enforcement: drop sell/short signals only when LONG_ONLY_MODE is active
         pre_len = len(signals)
