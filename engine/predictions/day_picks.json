@@ -1,31 +1,47 @@
 {
-  "generated_at": "2026-04-21T23:46:56-04:00",
-  "date": "2026-04-21",
+  "generated_at": "2026-04-24T21:03:09-04:00",
+  "date": "2026-04-24",
   "market_regime": "bull",
   "picks": [
     {
-      "symbol": "MAS",
+      "symbol": "ANAB",
       "action": "buy",
-      "price": 66.77,
-      "confidence": 0.895,
-      "strategy": "Sentiment",
-      "reason": "Sentiment bullish + vol x4.45 + price>20SMA"
+      "price": 59.02,
+      "confidence": 0.8398,
+      "strategy": "Momentum",
+      "reason": "Strong momentum (11.0%) + volume x8.2 + above SMA20"
     },
     {
-      "symbol": "CAR",
+      "symbol": "ELPW",
       "action": "buy",
-      "price": 714.0,
-      "confidence": 0.8346,
-      "strategy": "FloatRotation",
-      "reason": "Float rotation: 1.1x float (10.1M) | +14.8% day"
-    },
-    {
-      "symbol": "SYF",
-      "action": "buy",
-      "price": 77.63,
+      "price": 3.62,
       "confidence": 0.82,
       "strategy": "Sweepea",
-      "reason": "Daily Sweepea pullback to 8-EMA | ATR $2.11"
+      "reason": "Daily Sweepea pullback to 20-EMA | ATR $0.52"
+    },
+    {
+      "symbol": "HLX",
+      "action": "buy",
+      "price": 9.89,
+      "confidence": 0.82,
+      "strategy": "Sweepea",
+      "reason": "Daily Sweepea pullback to 8-EMA | ATR $0.37"
+    },
+    {
+      "symbol": "KN",
+      "action": "buy",
+      "price": 30.61,
+      "confidence": 0.82,
+      "strategy": "Sweepea",
+      "reason": "Daily Sweepea pullback to 8-EMA | ATR $1.14"
+    },
+    {
+      "symbol": "CSL",
+      "action": "buy",
+      "price": 360.07,
+      "confidence": 0.82,
+      "strategy": "Sweepea",
+      "reason": "Daily Sweepea pullback to 8-EMA | ATR $14.74"
     }
   ]
 }

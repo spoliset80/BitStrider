@@ -1,6 +1,6 @@
 """
 Standalone options flow — scan full universe, print all signals, NO orders placed.
-Usage:  apextrader\Scripts\python.exe scripts\_run_options_scan.py
+Usage:  apextrader\\Scripts\\python.exe scripts\\_run_options_scan.py
 """
 import sys, os, warnings
 from pathlib import Path
@@ -21,12 +21,17 @@ logging.basicConfig(
 logging.getLogger("engine.options.strategies").setLevel(logging.WARNING)
 
 from engine.options.strategies import scan_options_universe
+from engine.utils import MarketState
 
 print("=" * 70)
 print("OPTIONS FLOW — full universe scan (no orders placed)")
 print("=" * 70)
 
-signals = scan_options_universe(held_positions={}, existing_option_symbols=set())
+signals = scan_options_universe(
+    held_positions={},
+    existing_option_symbols=set(),
+    market_state=MarketState.from_now(),
+)
 
 if not signals:
     print("\n  No signals this cycle.\n")

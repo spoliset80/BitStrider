@@ -1,3 +1,5 @@
+import threading
+import time
 """
 ApexTrader - Options Executor (Level 3 Account / Alpaca)
 Manages opening, monitoring, and closing options positions via the
@@ -47,6 +49,7 @@ from engine.config import (
     OPTIONS_TRAIL_DRAWDOWN_PCT,
     API_KEY, API_SECRET, PAPER,
 )
+from engine.utils import MarketState
 from .strategies import OptionSignal, CONTRACT_SIZE, record_stop_cooldown
 
 log = logging.getLogger("ApexTrader.Options")
@@ -116,8 +119,89 @@ class OptionsPosition:
     breakeven_mode: bool = False
 
 
+
+
 class OptionsExecutor:
     """Manages options positions within a 15% portfolio allocation."""
+
+    # Adaptive limit order retry config
+    _ORDER_RETRY_TIMEOUT = 180  # seconds (3 min)
+    _ORDER_MAX_RETRIES = 2
+    _ORDER_RETRY_STEP = 0.01    # 1% more aggressive each retry
+
+    def _adaptive_limit_retry(self, order_id, side, orig_limit, symbol, contracts, occ_sym, is_mleg, payload, retry_count=0):
+        """After timeout, cancel and resubmit limit order at more aggressive price, up to max retries."""
+        log.info(f"[OPTIONS][RETRY] Started retry thread for {symbol} order {order_id} (retry {retry_count})")
+        if retry_count >= self._ORDER_MAX_RETRIES:
+            log.info(f"[OPTIONS][RETRY] Max retries reached for {symbol} order {order_id}, giving up.")
+            return
+        log.info(f"[OPTIONS][RETRY] Waiting {self._ORDER_RETRY_TIMEOUT}s before checking order {order_id} for {symbol}")
+        time.sleep(self._ORDER_RETRY_TIMEOUT)
+        # Check if order is still open
+        open_orders = self.client.get_orders(status="OPEN")
+        log.debug(f"[OPTIONS][RETRY] Open orders after timeout: {[getattr(o, 'id', None) for o in open_orders]}")
+        order = next((o for o in open_orders if getattr(o, "id", None) == order_id), None)
+        if order is None:
+            log.info(f"[OPTIONS][RETRY] Order {order_id} for {symbol} not found (likely filled or canceled externally), no retry needed.")
+            return
+        filled_qty = getattr(order, "filled_qty", 0)
+        log.info(f"[OPTIONS][RETRY] Order {order_id} for {symbol} still open after timeout. Filled qty: {filled_qty}, Contracts: {contracts}")
+        if filled_qty >= contracts:
+            log.info(f"[OPTIONS][RETRY] Order {order_id} for {symbol} fully filled, no retry needed.")
+            return
+        # Cancel and resubmit at more aggressive price
+        log.info(f"[OPTIONS][RETRY] Cancelling order {order_id} for {symbol} (unfilled qty: {contracts - filled_qty})")
+        self.client.cancel_order_by_id(order_id)
+        if side == "buy":
+            new_limit = round(orig_limit * (1 + self._ORDER_RETRY_STEP * (retry_count + 1)), 2)
+        else:
+            new_limit = round(orig_limit * (1 - self._ORDER_RETRY_STEP * (retry_count + 1)), 2)
+        log.info(f"[OPTIONS][RETRY] Retrying {symbol} order at more aggressive limit: {new_limit} (retry {retry_count+1})")
+        if is_mleg:
+            payload["limit_price"] = str(new_limit)
+            resp = self.client.post("/orders", payload)
+            new_order_id = getattr(resp, "id", None)
+            log.info(f"[OPTIONS][RETRY] Submitted new MLEG order for {symbol}: {new_order_id}")
+            if new_order_id:
+                threading.Thread(target=self._adaptive_limit_retry, args=(new_order_id, side, new_limit, symbol, contracts, occ_sym, is_mleg, payload, retry_count+1), daemon=True).start()
+        else:
+            from engine.broker.etrade_client import LimitOrderRequest, OrderSide, TimeInForce
+            order_req = LimitOrderRequest(
+                symbol=occ_sym,
+                qty=contracts,
+                side=OrderSide.BUY if side == "buy" else OrderSide.SELL,
+                limit_price=new_limit,
+                time_in_force=TimeInForce.DAY
+            )
+            resp = self.client.submit_order(order_req)
+            new_order_id = getattr(resp, "id", None)
+            log.info(f"[OPTIONS][RETRY] Submitted new SINGLE order for {symbol}: {new_order_id}")
+            if new_order_id:
+                threading.Thread(target=self._adaptive_limit_retry, args=(new_order_id, side, new_limit, symbol, contracts, occ_sym, is_mleg, payload, retry_count+1), daemon=True).start()
+
+    def _calculate_gross_notional(self, extra: Optional[dict] = None) -> float:
+        """
+        Calculate the gross notional value of all open option positions, plus an optional extra position.
+        Each leg: abs(contracts * strike * 100)
+        """
+        total = 0.0
+        # Existing positions
+        for pos in self._positions.values():
+            for leg in (pos.legs if pos.legs else [{"occ_symbol": pos.occ_symbol, "side": "buy", "ratio_qty": 1}]):
+                contracts = abs(pos.contracts) * abs(leg.get("ratio_qty", 1))
+                # Extract strike from OCC symbol (format: SYMBOLYYMMDDC|P########)
+                occ = leg["occ_symbol"]
+                m = re.match(r"^[A-Z]+\d{6}[CP](\d{8})$", occ)
+                if m:
+                    strike = int(m.group(1)) / 1000.0
+                    total += abs(contracts * strike * 100)
+        # Add extra (pending order) if provided
+        if extra:
+            for leg in extra.get("legs", []):
+                contracts = abs(extra["contracts"]) * abs(leg.get("ratio_qty", 1))
+                strike = leg["strike"]
+                total += abs(contracts * strike * 100)
+        return total
 
     def __init__(self, client: TradingClient):
         self.client = client
@@ -573,6 +657,10 @@ class OptionsExecutor:
         # Short-circuit: if we already caught a 40310000 this session, don't retry.
         # The restriction is a regulatory/PDT hold — it won't clear mid-session.
         if _ACCOUNT_RESTRICTED:
+            log.warning(
+                "[OPTIONS] Account restricted (40310000 / liquidation-only) — "
+                "all new entries blocked. Restart bot or resolve via Alpaca dashboard."
+            )
             return False
         try:
             acct = self.client.get_account()
@@ -592,7 +680,69 @@ class OptionsExecutor:
             log.warning(f"[OPTIONS] Could not verify account tradeable status: {e}")
             return True  # allow attempt; the order itself will catch any restriction
 
-    def place_option_order(self, signal: OptionSignal) -> bool:
+    def place_option_order(self, signal: OptionSignal, market_state: MarketState) -> bool:
+        # 0. Gross Notional Check (LIVE accounts only)
+        if not PAPER:
+            # Prepare legs for the pending order
+            strat = signal.strategy.lower()
+            is_butterfly = "butterfly" in strat or "butterfly" in signal.option_type.lower()
+            is_condor = "condor" in strat
+            is_spread = signal.spread_sell_strike is not None and not is_butterfly and not is_condor
+            is_mleg = is_butterfly or is_spread or is_condor
+            cp_type = "call" if "call" in signal.option_type.lower() else "put"
+            # Use the same contract calculation as below
+            total_budget, remaining = self._get_options_budget()
+            raw_contracts = self._calc_contracts(signal, remaining)
+            from engine.config import MIN_SIGNAL_CONFIDENCE, CONF_SCALE_MIN_MULT, CONF_SCALE_FULL_CONF
+            _conf_mult = CONF_SCALE_MIN_MULT + (1.0 - CONF_SCALE_MIN_MULT) * min(
+                1.0, max(0.0, (signal.confidence - MIN_SIGNAL_CONFIDENCE) / (CONF_SCALE_FULL_CONF - MIN_SIGNAL_CONFIDENCE))
+            )
+            contracts = max(1, int(round(raw_contracts * _conf_mult)))
+            # Build legs for the pending order
+            if is_condor:
+                legs = [
+                    {"strike": signal.put_long_strike, "ratio_qty": 1},
+                    {"strike": signal.put_short_strike, "ratio_qty": 1},
+                    {"strike": signal.call_short_strike, "ratio_qty": 1},
+                    {"strike": signal.call_long_strike, "ratio_qty": 1},
+                ]
+            elif is_butterfly:
+                legs = [
+                    {"strike": signal.butterfly_low_strike, "ratio_qty": 1},
+                    {"strike": signal.strike, "ratio_qty": 2},
+                    {"strike": signal.butterfly_high_strike, "ratio_qty": 1},
+                ]
+            elif is_spread:
+                _eff_spread_sell_strike = signal.spread_sell_strike
+                legs = [
+                    {"strike": signal.strike, "ratio_qty": 1},
+                    {"strike": _eff_spread_sell_strike, "ratio_qty": 1},
+                ]
+            else:
+                legs = [{"strike": signal.strike, "ratio_qty": 1}]
+
+            # Dynamically reduce contracts to fit under 6x equity notional cap
+            try:
+                acct = self.client.get_account()
+                equity = float(acct.equity)
+            except Exception as e:
+                log.warning(f"[OPTIONS] Could not fetch account equity for notional check: {e}")
+                equity = 0.0
+            min_contracts = 1
+            order_accepted = False
+            while contracts >= min_contracts:
+                extra = {"contracts": contracts, "legs": legs}
+                gross_notional = self._calculate_gross_notional(extra=extra)
+                if equity > 0 and gross_notional > 6 * equity:
+                    contracts -= 1
+                    continue
+                order_accepted = True
+                break
+            if not order_accepted:
+                log.warning(
+                    f"[OPTIONS] Skipping {signal.symbol} order: even 1 contract would exceed gross notional cap (${gross_notional:,.2f} > 6x equity ${equity:,.2f})"
+                )
+                return False
         """
         Production-ready order placement for ApexTrader.
         Fixes communications with Alpaca API and internal state tracking.
@@ -663,15 +813,8 @@ class OptionsExecutor:
 
         # 3. Budget & Contract Calculation
         total_budget, remaining = self._get_options_budget()
-        contracts = self._calc_contracts(signal, remaining)
-        # Scale contracts by signal confidence (same curve as equity: 0.50× at floor → 1.0× at 0.85+)
-        from engine.config import MIN_SIGNAL_CONFIDENCE, CONF_SCALE_MIN_MULT, CONF_SCALE_FULL_CONF
-        _conf_mult = CONF_SCALE_MIN_MULT + (1.0 - CONF_SCALE_MIN_MULT) * min(
-            1.0, max(0.0, (signal.confidence - MIN_SIGNAL_CONFIDENCE) / (CONF_SCALE_FULL_CONF - MIN_SIGNAL_CONFIDENCE))
-        )
-        contracts = max(1, int(round(contracts * _conf_mult)))
-        log.debug(f"[OPTIONS] {signal.symbol} conf={signal.confidence:.0%} → scale={_conf_mult:.2f}× → {contracts}c")
-        if contracts <= 0:
+        raw_contracts = self._calc_contracts(signal, remaining)
+        if raw_contracts <= 0:
             per_contract = signal.mid_price * CONTRACT_SIZE
             log.info(
                 f"[OPTIONS] Insufficient budget for {signal.symbol} "
@@ -679,6 +822,13 @@ class OptionsExecutor:
                 f"per_contract=${per_contract:.2f})"
             )
             return False
+        # Scale contracts by signal confidence (same curve as equity: 0.50× at floor → 1.0× at 0.85+)
+        from engine.config import MIN_SIGNAL_CONFIDENCE, CONF_SCALE_MIN_MULT, CONF_SCALE_FULL_CONF
+        _conf_mult = CONF_SCALE_MIN_MULT + (1.0 - CONF_SCALE_MIN_MULT) * min(
+            1.0, max(0.0, (signal.confidence - MIN_SIGNAL_CONFIDENCE) / (CONF_SCALE_FULL_CONF - MIN_SIGNAL_CONFIDENCE))
+        )
+        contracts = max(1, int(round(raw_contracts * _conf_mult)))
+        log.debug(f"[OPTIONS] {signal.symbol} conf={signal.confidence:.0%} → scale={_conf_mult:.2f}× → {contracts}c")
 
         # 4. Determine Strategy Type
         strat = signal.strategy.lower()
@@ -691,8 +841,7 @@ class OptionsExecutor:
 
         # ── 4b. Open Window / IV Gate ─────────────────────────────────────────
         # Decides naked vs spread AFTER type detection so butterflies/condors are untouched.
-        from engine.utils import is_open_window
-        _in_open_window = is_open_window()
+        _in_open_window = market_state.is_open_window
         _eff_spread_sell_strike = signal.spread_sell_strike  # may be overridden below
         _entry_iv      = signal.iv_pct   # IV% at scan time (stored on position)
         _is_naked_entry = False
@@ -851,7 +1000,10 @@ class OptionsExecutor:
                 }
 
                 log.debug(f"[OPTIONS] Submitting MLEG {signal.symbol}: {json.dumps(payload)}")
-                self.client.post("/orders", payload)
+                resp = self.client.post("/orders", payload)
+                order_id = getattr(resp, "id", None)
+                if order_id:
+                    threading.Thread(target=self._adaptive_limit_retry, args=(order_id, "buy" if "buy" in signal.action else "sell", float(payload["limit_price"]), signal.symbol, contracts, "", True, payload, 0), daemon=True).start()
 
             # ── CASE B: SINGLE OPTION (Standard) ─────────────────────────────
             else:
@@ -864,7 +1016,10 @@ class OptionsExecutor:
                     time_in_force=TimeInForce.DAY
                 )
                 log.debug(f"[OPTIONS] Submitting SINGLE {occ_sym}")
-                self.client.submit_order(order_req)
+                resp = self.client.submit_order(order_req)
+                order_id = getattr(resp, "id", None)
+                if order_id:
+                    threading.Thread(target=self._adaptive_limit_retry, args=(order_id, "buy" if "buy" in signal.action else "sell", float(limit_price), signal.symbol, contracts, occ_sym, False, None, 0), daemon=True).start()
 
             # 5. Tracking — store all leg OCC symbols for strategy-agnostic close/monitor
             primary_occ = _alpaca_option_symbol(signal.symbol, signal.expiry, cp_type, signal.strike)
@@ -1265,9 +1420,12 @@ class OptionsExecutor:
                 self.client.post("/orders", payload)
 
             else:
-                # Single leg — use limit order at current_price * 0.97 for better fills
+                # Single leg — always use a limit order (Alpaca rejects market orders
+                # for options when no quote is available, error 40310000).
                 side = OrderSide.SELL if pos.action == "buy_to_open" else OrderSide.BUY
                 _close_limit = None
+
+                # First try: use passed-in all_positions for the mark price
                 if all_positions:
                     _lp = all_positions.get(occ_sym)
                     if _lp is not None:
@@ -1276,23 +1434,36 @@ class OptionsExecutor:
                             # Selling to close: accept 97% of mid to guarantee a fill
                             # Buying to close: pay up 3% to get out quickly
                             _close_limit = round(_cur * 0.97, 2) if side == OrderSide.SELL else round(_cur * 1.03, 2)
-                if _close_limit is not None:
-                    order_req = LimitOrderRequest(
-                        symbol=occ_sym,
-                        qty=pos.contracts,
-                        side=side,
-                        limit_price=_close_limit,
-                        time_in_force=TimeInForce.DAY,
+
+                # Second try: fetch a fresh broker quote if still no limit price
+                if _close_limit is None:
+                    try:
+                        _fresh = {p.symbol: p for p in self.client.get_all_positions()}
+                        _lp = _fresh.get(occ_sym)
+                        if _lp is not None:
+                            _cur = float(_lp.current_price)
+                            if _cur > 0.01:
+                                _close_limit = round(_cur * 0.97, 2) if side == OrderSide.SELL else round(_cur * 1.03, 2)
+                    except Exception as _fe:
+                        log.debug(f"[OPTIONS] Could not fetch fresh quote for {occ_sym}: {_fe}")
+
+                # Final fallback: near-worthless or unquoted contract — use floor limit
+                # Alpaca requires a minimum limit price of $0.05 for options.
+                if _close_limit is None:
+                    _close_limit = 0.05 if side == OrderSide.SELL else 0.50
+                    log.warning(
+                        f"[OPTIONS] No quote for {occ_sym} — limit fallback @{_close_limit:.2f} "
+                        f"({'floor sell' if side == OrderSide.SELL else 'ceiling buy'})"
                     )
-                    log.info(f"OPTIONS CLOSE (limit @{_close_limit:.2f}): {side.value.upper()} {pos.contracts}x {occ_sym}")
-                else:
-                    order_req = MarketOrderRequest(
-                        symbol=occ_sym,
-                        qty=pos.contracts,
-                        side=side,
-                        time_in_force=TimeInForce.DAY,
-                    )
-                    log.info(f"OPTIONS CLOSE (market fallback): {side.value.upper()} {pos.contracts}x {occ_sym}")
+
+                order_req = LimitOrderRequest(
+                    symbol=occ_sym,
+                    qty=pos.contracts,
+                    side=side,
+                    limit_price=_close_limit,
+                    time_in_force=TimeInForce.DAY,
+                )
+                log.info(f"OPTIONS CLOSE (limit @{_close_limit:.2f}): {side.value.upper()} {pos.contracts}x {occ_sym}")
                 self.client.submit_order(order_req)
 
             del self._positions[occ_sym]
@@ -1304,6 +1475,14 @@ class OptionsExecutor:
                 log.warning(
                     f"[OPTIONS] PDT block on close {occ_sym} — position held, will retry next session"
                 )
+            elif "40310000" in str(e):
+                # No available quote — contract is expired, halted, or worthless.
+                # There is no market to close into; remove from tracker (max loss already realized).
+                log.warning(
+                    f"[OPTIONS] No quote available to close {occ_sym} — contract likely expired/worthless. "
+                    f"Removing from tracker (max loss realized)."
+                )
+                self._positions.pop(occ_sym, None)
             else:
                 log.error(f"Options close failed for {occ_sym}: {e}", exc_info=True)
 

@@ -7,12 +7,22 @@ Extracted from main.py to keep the main entry point lean.
 from __future__ import annotations
 
 import concurrent.futures
+import datetime
 import logging
 import time
+from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Dict
+from typing import Callable, Dict, List, Optional
 
-from engine.utils import get_trending_tickers, filter_trending_momentum, get_finnhub_trending_tickers, check_sentiment_gate
+from engine.utils import (
+    MarketState,
+    get_bars,
+    get_premarket_bars,
+    get_trending_tickers,
+    filter_trending_momentum,
+    get_finnhub_trending_tickers,
+    check_sentiment_gate,
+)
 from engine.config import PRIORITY_1_MOMENTUM as _P1, PRIORITY_2_ESTABLISHED as _P2
 from engine.ti.ti import get_scans, is_valid_ti_ticker, scrape_tradeideas
 
@@ -35,10 +45,10 @@ last_edgar_scan:           float      = 0.0
 # get_scan_targets() pops these to the front so they are guaranteed to be scanned.
 _priority_scan_queue:      List[str]  = []
 last_alpaca_mover_scan:    float      = 0.0
-_ti_future                            = None
 _ti_started_at:            float      = 0.0
 _ti_warned_running:        bool       = False
 _ti_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+_ti_future: Optional[concurrent.futures.Future] = None
 
 
 def get_priority_scan_queue() -> List[str]:
@@ -49,6 +59,391 @@ def get_priority_scan_queue() -> List[str]:
     """
     return list(_priority_scan_queue)
 
+
+@dataclass
+class PreopenSignalProvider:
+    name: str
+    apply: Callable[["PreopenIntelligenceScanner", dict[str, dict], MarketState, list, list, int, "PreopenSignalProvider"], None]
+    weight: float = 1.0
+    active: bool = True
+    description: str = ""
+
+
+class PreopenIntelligenceScanner:
+    def __init__(self) -> None:
+        self.last_scan: float = 0.0
+        self.watchlist: List[dict] = []
+        self.providers: List[PreopenSignalProvider] = []
+        self.use_regime_gating: bool = True
+        self.use_sentiment_gating: bool = True
+        self.signal_performance: Dict[str, Dict[str, float]] = {}
+        self._register_default_providers()
+
+    def get_watchlist(self) -> List[str]:
+        return [item["symbol"] for item in self.watchlist]
+
+    def register_provider(self, provider: PreopenSignalProvider) -> None:
+        self.providers.append(provider)
+
+    def clear_providers(self) -> None:
+        self.providers.clear()
+
+    def set_providers(self, providers: List[PreopenSignalProvider]) -> None:
+        self.providers = list(providers)
+
+    def get_provider_metrics(self) -> Dict[str, Dict[str, float]]:
+        return {name: dict(metrics) for name, metrics in self.signal_performance.items()}
+
+    def _get_provider_weight(self, name: str) -> float:
+        for provider in self.providers:
+            if provider.name == name:
+                return provider.weight
+        return 1.0
+
+    def adjust_provider_weights(self) -> None:
+        for provider in self.providers:
+            metrics = self.signal_performance.get(provider.name, {})
+            hits = metrics.get("hits", 0.0)
+            contributions = metrics.get("contributions", 1.0)
+            if contributions > 0:
+                provider.weight = max(0.25, min(2.0, hits / contributions if contributions else 1.0))
+
+    def record_provider_outcome(self, provider_name: str, symbol: str, success: bool) -> None:
+        perf = self.signal_performance.setdefault(provider_name, {"runs": 0.0, "contributions": 0.0, "hits": 0.0})
+        perf["runs"] += 1.0
+        if success:
+            perf["hits"] += 1.0
+
+    def scan(
+        self,
+        *,
+        enabled: bool,
+        interval_min: float,
+        market_state: MarketState,
+        priority_1: list,
+        priority_2: list,
+        max_watchlist: int = 20,
+        use_regime_gating: bool = True,
+        use_sentiment_gating: bool = True,
+    ) -> None:
+        """Build a scored pre-open watchlist and inject high-priority tickers.
+
+        This is meant for closed-market / pre-open cycles where the bot can
+        proactively gather event-driven ideas and churn signals before the next
+        live scan.
+        """
+        if not enabled:
+            return
+
+        self.use_regime_gating = use_regime_gating
+        self.use_sentiment_gating = use_sentiment_gating
+
+        now = time.time()
+        if (now - self.last_scan) < (interval_min * 60):
+            return
+        self.last_scan = now
+
+        if market_state.is_market_open:
+            return
+
+        scores: dict[str, dict] = {}
+        self._run_providers(scores, market_state, priority_1, priority_2, max_watchlist)
+        self.watchlist = self._build_watchlist(scores, max_watchlist)
+
+        self._inject_watchlist_to_priority_queue(priority_1, priority_2)
+        self._log_watchlist_summary(market_state)
+
+    def _register_default_providers(self) -> None:
+        self.providers = [
+            PreopenSignalProvider(
+                name="trending",
+                apply=self._provider_trending,
+                description="Live momentum feed from external trending sources",
+            ),
+            PreopenSignalProvider(
+                name="finnhub",
+                apply=self._provider_finnhub,
+                description="Finnhub trending and stock momentum candidates",
+            ),
+            PreopenSignalProvider(
+                name="priority_queue",
+                apply=self._provider_priority_queue,
+                description="Existing high-priority tickers from sympathy/EDGAR/scan backlog",
+            ),
+            PreopenSignalProvider(
+                name="universe_seed",
+                apply=self._provider_universe_seed,
+                description="Fallback universe seeds for robustness and coverage",
+            ),
+            PreopenSignalProvider(
+                name="sentiment",
+                apply=self._provider_sentiment,
+                description="News sentiment gate and regime-aligned signal boost",
+            ),
+            PreopenSignalProvider(
+                name="premarket",
+                apply=self._provider_premarket,
+                description="Pre-market gap and volume scoring for overnight churn",
+            ),
+        ]
+
+    def _run_providers(
+        self,
+        scores: dict[str, dict],
+        market_state: MarketState,
+        priority_1: list,
+        priority_2: list,
+        max_watchlist: int,
+    ) -> None:
+        for provider in self.providers:
+            if not provider.active:
+                continue
+            try:
+                provider.apply(scores, market_state, priority_1, priority_2, max_watchlist, provider)
+            except Exception as exc:
+                log.warning(f"[PREOPEN] provider failed: {provider.name} -> {exc}")
+
+    def _add_candidate(
+        self,
+        scores: dict[str, dict],
+        symbol: str,
+        weight: float,
+        reason: str,
+        provider_name: Optional[str] = None,
+    ) -> None:
+        if not is_valid_ti_ticker(symbol):
+            return
+        if symbol not in scores:
+            scores[symbol] = {
+                "symbol": symbol,
+                "score": 0.0,
+                "reasons": set(),
+                "source_weight": 0.0,
+            }
+        scores[symbol]["score"] += weight
+        scores[symbol]["reasons"].add(reason)
+        if provider_name is not None:
+            perf = self.signal_performance.setdefault(
+                provider_name,
+                {"runs": 0.0, "contributions": 0.0, "hits": 0.0},
+            )
+            perf["contributions"] += abs(weight)
+
+    def _provider_trending(
+        self,
+        scores: dict[str, dict],
+        market_state: MarketState,
+        priority_1: list,
+        priority_2: list,
+        max_watchlist: int,
+        provider: PreopenSignalProvider,
+    ) -> None:
+        try:
+            trending = get_trending_tickers(15)
+        except Exception:
+            trending = []
+        for sym in trending:
+            self._add_candidate(scores, sym, 1.0 * provider.weight, "trending", provider_name=provider.name)
+
+    def _provider_finnhub(
+        self,
+        scores: dict[str, dict],
+        market_state: MarketState,
+        priority_1: list,
+        priority_2: list,
+        max_watchlist: int,
+        provider: PreopenSignalProvider,
+    ) -> None:
+        try:
+            finn_tickers = get_finnhub_trending_tickers()
+        except Exception:
+            finn_tickers = []
+        for sym in finn_tickers:
+            self._add_candidate(scores, sym, 0.8 * provider.weight, "finnhub", provider_name=provider.name)
+
+    def _provider_priority_queue(
+        self,
+        scores: dict[str, dict],
+        market_state: MarketState,
+        priority_1: list,
+        priority_2: list,
+        max_watchlist: int,
+        provider: PreopenSignalProvider,
+    ) -> None:
+        for sym in _priority_scan_queue:
+            self._add_candidate(scores, sym, 1.5 * provider.weight, "priority-queue", provider_name=provider.name)
+
+    def _provider_universe_seed(
+        self,
+        scores: dict[str, dict],
+        market_state: MarketState,
+        priority_1: list,
+        priority_2: list,
+        max_watchlist: int,
+        provider: PreopenSignalProvider,
+    ) -> None:
+        for sym in priority_1 + priority_2:
+            if sym in scores:
+                continue
+            if len(scores) >= max_watchlist * 3:
+                break
+            self._add_candidate(scores, sym, 0.1 * provider.weight, "universe-seed", provider_name=provider.name)
+
+    def _provider_sentiment(
+        self,
+        scores: dict[str, dict],
+        market_state: MarketState,
+        priority_1: list,
+        priority_2: list,
+        max_watchlist: int,
+        provider: PreopenSignalProvider,
+    ) -> None:
+        sentiment_cache: dict[str, tuple[bool, float]] = {}
+
+        for symbol in list(scores.keys()):
+            if symbol in sentiment_cache:
+                allow, bullish_pct = sentiment_cache[symbol]
+            else:
+                allow, bullish_pct = check_sentiment_gate(symbol)
+                sentiment_cache[symbol] = (allow, bullish_pct)
+
+            if allow:
+                self._add_candidate(scores, symbol, 0.25 * provider.weight, "news-bullish", provider_name=provider.name)
+                if market_state.resolve_sentiment() == "bull":
+                    self._add_candidate(scores, symbol, 0.1 * provider.weight, "sentiment-aligned", provider_name=provider.name)
+            else:
+                penalty = 0.4 if self.use_sentiment_gating else 0.15
+                self._add_candidate(
+                    scores,
+                    symbol,
+                    -penalty * provider.weight,
+                    "sentiment-block" if self.use_sentiment_gating else "news-bearish",
+                    provider_name=provider.name,
+                )
+                if self.use_sentiment_gating and market_state.resolve_sentiment() == "bear":
+                    self._add_candidate(scores, symbol, -0.1 * provider.weight, "bearish-regime-penalty", provider_name=provider.name)
+
+    def _provider_premarket(
+        self,
+        scores: dict[str, dict],
+        market_state: MarketState,
+        priority_1: list,
+        priority_2: list,
+        max_watchlist: int,
+        provider: PreopenSignalProvider,
+    ) -> None:
+        ranked = sorted(scores.values(), key=lambda d: d["score"], reverse=True)
+        premkt_candidates = [item["symbol"] for item in ranked[: max_watchlist * 2]]
+        for symbol in premkt_candidates:
+            self._score_premarket(symbol, scores, provider)
+
+    def _score_premarket(self, symbol: str, scores: dict[str, dict], provider: PreopenSignalProvider) -> None:
+        try:
+            pm = get_premarket_bars(symbol)
+            if pm.empty:
+                return
+            t = pm["time"]
+            if t.dt.tz is None:
+                t = t.dt.tz_localize(datetime.timezone.utc).dt.tz_convert("America/New_York")
+            else:
+                t = t.dt.tz_convert("America/New_York")
+            premkt = pm[(t.dt.hour < 9) | ((t.dt.hour == 9) & (t.dt.minute < 30))]
+            if premkt.empty:
+                return
+
+            daily = get_bars(symbol, "2d", "1d")
+            if daily.empty or len(daily) < 2:
+                return
+
+            prev_close = float(daily["close"].iloc[-2])
+            last_price = float(premkt["close"].iloc[-1])
+            gap_pct = ((last_price - prev_close) / prev_close) * 100 if prev_close > 0 else 0.0
+            pm_volume = float(premkt["volume"].sum())
+            avg_daily_vol = float(daily["volume"].iloc[-2:-1].mean()) if len(daily) >= 2 else 0.0
+            pm_vol_pct = (pm_volume / max(avg_daily_vol, 1.0)) * 100
+
+            if gap_pct >= 1.0 and pm_vol_pct >= 10.0:
+                self._add_candidate(scores, symbol, 0.5 * provider.weight, f"pre-market gap +{gap_pct:.1f}%", provider_name=provider.name)
+            elif gap_pct >= 0.5 and pm_vol_pct >= 5.0:
+                self._add_candidate(scores, symbol, 0.25 * provider.weight, f"pre-market gap +{gap_pct:.1f}%", provider_name=provider.name)
+            if pm_vol_pct >= 15.0:
+                self._add_candidate(scores, symbol, 0.2 * provider.weight, f"PM vol {pm_vol_pct:.0f}%", provider_name=provider.name)
+        except Exception:
+            return
+
+    def _build_watchlist(self, scores: dict[str, dict], max_watchlist: int) -> List[dict]:
+        ranked = sorted(scores.values(), key=lambda d: d["score"], reverse=True)
+        return ranked[:max_watchlist]
+
+    def _inject_watchlist_to_priority_queue(self, priority_1: list, priority_2: list) -> None:
+        added = []
+        qset = set(_priority_scan_queue)
+        for item in self.watchlist:
+            sym = item["symbol"]
+            if sym in qset or sym in priority_1 or sym in priority_2:
+                continue
+            _priority_scan_queue.append(sym)
+            qset.add(sym)
+            added.append(sym)
+        if added:
+            log.info(f"[PREOPEN] Injected {len(added)} pre-open watchlist tickers into priority queue")
+
+    def _log_watchlist_summary(self, market_state: MarketState) -> None:
+        sentiment_label = "bull" if market_state.resolve_sentiment() == "bull" else "bear"
+        if not self.watchlist:
+            log.info("[PREOPEN] Intelligence watchlist produced no candidates")
+            return
+
+        top_list = []
+        for item in self.watchlist[:10]:
+            reasons = ", ".join(sorted(item["reasons"]))
+            top_list.append(f"{item['symbol']}({item['score']:.2f}:{reasons})")
+
+        log.info(
+            f"[PREOPEN] Intelligence watchlist ({sentiment_label}, "
+            f"regime={market_state.regime}): top {len(self.watchlist)} "
+            f"tickers → {', '.join(top_list)}"
+        )
+
+        if self.signal_performance:
+            provider_stats = []
+            for name, metrics in self.signal_performance.items():
+                provider_stats.append(
+                    f"{name}=w{self._get_provider_weight(name):.2f}/"
+                    f"{int(metrics.get('hits', 0))}/{int(metrics.get('contributions', 0))}"
+                )
+            log.info(f"[PREOPEN] Provider performance → {', '.join(provider_stats)}")
+
+
+_preopen_intelligence_scanner = PreopenIntelligenceScanner()
+
+
+def get_preopen_watchlist() -> List[str]:
+    """Return the current pre-open intelligence watchlist."""
+    return _preopen_intelligence_scanner.get_watchlist()
+
+
+def scan_preopen_intelligence(
+    *,
+    enabled: bool,
+    interval_min: float,
+    market_state: MarketState,
+    priority_1: list,
+    priority_2: list,
+    max_watchlist: int = 20,
+    use_regime_gating: bool = True,
+    use_sentiment_gating: bool = True,
+) -> None:
+    return _preopen_intelligence_scanner.scan(
+        enabled=enabled,
+        interval_min=interval_min,
+        market_state=market_state,
+        priority_1=priority_1,
+        priority_2=priority_2,
+        max_watchlist=max_watchlist,
+        use_regime_gating=use_regime_gating,
+        use_sentiment_gating=use_sentiment_gating,
+    )
 
 # ── Trending scan ──────────────────────────────────────────────────────────
 
@@ -324,7 +719,7 @@ def scan_tradeideas_universe(
         scrape_tradeideas,
         update_config=update_config,
         chrome_profile=ti_profile,
-        select_30min=True,
+        select_minutes=15,
         scan_keys=["marketscope360", "highshortfloat"],
         remote_debug_port=remote_debug_port,
     )
@@ -405,7 +800,7 @@ def scan_tradeideas_unusual_options(
         scrape_tradeideas,
         update_config=update_config,
         chrome_profile=ti_profile,
-        select_30min=True,
+        select_minutes=15,
         scan_keys=["unusualoptionsvolume"],
         remote_debug_port=remote_debug_port,
     )
@@ -484,7 +879,7 @@ def scan_sympathy_and_edgar(
             last_edgar_scan = now
 
 
-def scan_alpaca_movers(*, interval_min: float = 10.0) -> None:
+def scan_alpaca_movers(*, interval_min: float = 10.0, market_state: MarketState) -> None:
     """Fetch Alpaca Most Actives + Market Movers and inject qualifying symbols
     into the priority scan queue.
 
@@ -493,9 +888,7 @@ def scan_alpaca_movers(*, interval_min: float = 10.0) -> None:
     """
     global last_alpaca_mover_scan, _priority_scan_queue
 
-    from engine.utils import is_market_open
-
-    if not is_market_open():
+    if not market_state.is_market_open:
         return
 
     now = time.time()
@@ -569,7 +962,7 @@ def scan_alpaca_movers(*, interval_min: float = 10.0) -> None:
         if injected:
             log.info(f"[ALPACA-MOVERS] {len(injected)} gainers queued for scan: {injected}")
         else:
-            log.debug("[ALPACA-MOVERS] No gainers passed filters this cycle")
+            log.info("[ALPACA-MOVERS] No gainers passed filters this cycle")
 
     except Exception as exc:
         log.warning(f"[ALPACA-MOVERS] Screener fetch failed: {exc}")

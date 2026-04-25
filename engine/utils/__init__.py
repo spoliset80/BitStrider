@@ -28,6 +28,7 @@ from engine.utils.bars import (
 )
 
 from engine.utils.market import (
+    MarketState,
     is_bull_regime,
     _is_bull_regime,
     INVERSE_ETFS,
@@ -68,7 +69,7 @@ __all__ = [
     "get_data_client", "get_option_data_client",
     "get_bars", "get_bars_batch", "get_price", "get_premarket_bars", "get_finnhub_bars",
     "calc_rsi", "calc_macd", "calculate_atr",
-    "is_market_open", "is_regular_hours", "is_options_lull_hours", "is_open_window",
+    "MarketState", "is_market_open", "is_regular_hours", "is_options_lull_hours", "is_open_window",
     "get_vix", "check_vix_roc_filter",
     "get_vix_interval", "get_market_hours_interval", "get_position_tuning_interval",
     "get_market_sentiment", "get_live_holdings",

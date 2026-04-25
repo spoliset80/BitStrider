@@ -41,7 +41,7 @@ except ImportError:
     _YF_AVAILABLE = False
 import pytz
 from engine.options._options_today import _calc_iv_rank
-from engine.utils import get_bars, calc_rsi, get_option_data_client, ALPACA_AVAILABLE
+from engine.utils import MarketState, get_bars, calc_rsi, get_option_data_client, ALPACA_AVAILABLE
 from engine.config import (
     OPTIONS_ENABLED,
     OPTIONS_DTE_MIN,
@@ -64,8 +64,10 @@ from engine.config import (
     MEMORY_WARN_MB,
     get_options_universe,
 )
-from engine.utils.market import _is_bull_regime, _INVERSE_ETFS
+from engine.utils.market import _INVERSE_ETFS, _is_bull_regime
 from engine.utils.bars import calculate_atr as _calc_atr14_base
+
+_market_state: Optional[MarketState] = None
 
 def _calc_atr14(bars, period: int = 14) -> float:
     from engine.utils.bars import calculate_atr
@@ -583,9 +585,11 @@ def _fetch_bar_context(symbol: str) -> Optional[_BarCtx]:
     # ── Intraday overlay ───────────────────────────────────────────────────
     # During market hours fetch 1-min bars for today to get live spot & volume.
     # Outside market hours fall back to the daily close (unchanged behaviour).
-    from engine.utils import is_market_open
+    if _market_state is None:
+        raise RuntimeError("Options strategy scan requires market_state to be provided")
     _intraday_ok = False
-    if is_market_open():
+    is_open = _market_state.is_market_open
+    if is_open:
         try:
             intraday = get_bars(symbol, "1d", "1m")
             if not intraday.empty and len(intraday) >= 2:
@@ -750,7 +754,7 @@ class MomentumCallStrategy:
 class BearPutStrategy:
     """Bear put debit spread on confirmed breakdowns.
 
-    Structure: Buy put (δ0.40 ATM/slight ITM) + Sell put 2 strikes further OTM.
+    Structure: Buy put (δ0.30 OTM) + Sell put 2 strikes further OTM.
     The short leg offsets 30-40% of the premium cost, dramatically improving R/R
     vs a naked put — critical when IV is elevated (crash/fear environment).
 
@@ -827,8 +831,8 @@ class BearPutStrategy:
                 log.debug(f"BearPut {symbol}: IV rank {chain.iv_rank:.0f} > {f["IV_RANK_PUT_MAX"]} — skip")
                 return None
 
-            # Long leg: δ0.40 (ATM/slight ITM)
-            long_row = _pick_strike(chain.puts, ctx.spot, 0.40, f)
+            # Long leg: δ0.30 (OTM)
+            long_row = _pick_strike(chain.puts, ctx.spot, 0.30, f)
             if long_row is None:
                 return None
 
@@ -2000,7 +2004,7 @@ class BreakoutRetestCallStrategy:
 class TrendPullbackSpreadStrategy:
     """Bull call debit spread on EMA-20 pullback within a 50-EMA uptrend.
 
-    Structure: Buy ITM call (delta 0.65) + Sell OTM call 2 strikes above.
+    Structure: Buy OTM call (delta 0.35) + Sell OTM call 2 strikes above.
     Risk = net debit paid.  Max profit = spread_width − net_debit.
 
     Entry requirements:
@@ -2048,8 +2052,8 @@ class TrendPullbackSpreadStrategy:
             if chain.iv_rank > f["IV_RANK_CALL_MAX"]:
                 return None
 
-            # Long leg: ITM call delta 0.65
-            long_row = _pick_strike(chain.calls, ctx.spot, 0.65, f)
+            # Long leg: OTM call delta 0.35
+            long_row = _pick_strike(chain.calls, ctx.spot, 0.35, f)
             if long_row is None:
                 return None
 
@@ -2130,6 +2134,7 @@ class TrendPullbackSpreadStrategy:
         except Exception as e:
             log.debug(f"TrendPullbackSpread {symbol}: {e}")
             return None
+
 
 
 class MeanReversionCallStrategy:
@@ -2241,6 +2246,7 @@ class MeanReversionCallStrategy:
 def scan_options_universe(
     held_positions: Dict[str, int],
     existing_option_symbols: set,
+    market_state: MarketState,
 ) -> List[OptionSignal]:
     """Scan the options-eligible universe and return A+ ranked signals.
 
@@ -2264,6 +2270,9 @@ def scan_options_universe(
         return []
 
     # Strategies call _get_filters() per scan() — no global refresh needed here
+
+    global _market_state
+    _market_state = market_state
 
     ti_universe = get_options_universe()
     if not ti_universe:

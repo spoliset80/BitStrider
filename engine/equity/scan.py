@@ -1,3 +1,35 @@
+# Adaptive equity allocation based on pre-intelligence (market regime, signal quality, or pre-market indicators)
+from engine.utils import MarketState
+def get_adaptive_equity_allocation(market_state: MarketState, avg_signal_conf: float = None, premarket_strength: float = None) -> float:
+    """
+    Returns adaptive position size percentage for equities based on pre-intelligence.
+    - In strong bull regime or high signal confidence, increase allocation.
+    - In bear regime or weak signals, decrease allocation.
+    - Optionally, use premarket_strength (0-1) if available.
+    """
+    from engine.config import POSITION_SIZE_PCT
+    from engine.utils.market import get_allocation_split
+    base = POSITION_SIZE_PCT
+    equity_pct, _ = get_allocation_split(market_state)
+    base *= equity_pct
+    # Example logic: scale up in bull, down in bear
+    if hasattr(market_state, 'resolve_regime'):
+        bull = market_state.resolve_regime()
+        if bull:
+            base *= 1.2  # 20% more aggressive in bull
+        else:
+            base *= 0.8  # 20% more conservative in bear
+    # If average signal confidence is provided, scale further
+    if avg_signal_conf is not None:
+        if avg_signal_conf > 0.85:
+            base *= 1.15
+        elif avg_signal_conf < 0.75:
+            base *= 0.85
+    # If premarket_strength is provided (0-1), scale linearly between 0.8x and 1.2x
+    if premarket_strength is not None:
+        base *= (0.8 + 0.4 * premarket_strength)
+    # Clamp to reasonable bounds (e.g., 3% to 15%)
+    return max(3.0, min(base, 15.0))
 """ApexTrader scan nucleus.
 
 Contains reusable scanning functions for main loop and run_top3 tools.
@@ -7,7 +39,7 @@ import datetime
 import logging
 import pytz
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import List, Dict, Tuple, Set
+from typing import List, Dict, Tuple, Set, Optional
 
 from engine import config as _cfg
 from engine.config import (
@@ -24,7 +56,7 @@ from engine.config import (
     GAP_CHASE_CONSOL_BARS,
     BEAR_SHORT_UNIVERSE,
 )
-from engine.utils import clear_bar_cache, get_bars, is_market_open, is_dead_ticker
+from engine.utils import MarketState, clear_bar_cache, get_bars, is_dead_ticker
 from engine.utils.bars import get_data_client as _get_data_client
 from alpaca.data import StockSnapshotRequest as _StockSnapshotRequest
 from .universe import get_tier as _get_tier_live, get_latest_batch as _get_latest_batch, get_ti_primary as _get_ti_primary
@@ -32,6 +64,18 @@ from .discovery import get_priority_scan_queue as _get_priority_scan_queue
 
 _ET  = pytz.timezone("America/New_York")
 _log = logging.getLogger("ApexTrader")
+
+# ── Adaptive Filter State ──
+_adaptive_state = {
+    "empty_scans": 0,
+    "rvol_min": RVOL_MIN,
+    "min_conf": MIN_SIGNAL_CONFIDENCE,
+}
+_ADAPTIVE_MAX_EMPTY = 3  # Number of empty scans before relaxing
+_ADAPTIVE_MIN_RVOL = 1.2
+_ADAPTIVE_MIN_CONF = 0.60
+_ADAPTIVE_STEP_RVOL = 0.2
+_ADAPTIVE_STEP_CONF = 0.03
 from .strategies import get_strategy_instances, MomentumStrategy, TechnicalStrategy, SentimentStrategy
 from engine.utils.market import _is_bull_regime, _INVERSE_ETFS
 
@@ -68,14 +112,18 @@ def _prefetch_snapshots(symbols: List[str]) -> None:
         pass  # fall back to per-symbol get_bars in _passes_guardrails
 
 
-def _passes_guardrails(symbol: str, bull_regime: bool = None) -> bool:
+def _passes_guardrails(symbol: str, bull_regime: bool = None, market_state: Optional[MarketState] = None, return_reason: bool = False) -> bool:
     """Pre-scan gates: dollar-volume, RVOL, and gap-chase guard.
     Returns False to skip the symbol; never raises.
 
     bull_regime: pass the pre-computed regime from scan_universe() to avoid
     a concurrent re-fetch of _is_bull_regime() inside each worker thread.
     If None, falls back to calling _is_bull_regime() directly.
+
+    market_state: shared MarketState for the current scan cycle. If None,
+    it will be created lazily.
     """
+    # return_reason is now an explicit argument
     try:
         # ── Fast path: use batch-prefetched snapshot (no per-symbol HTTP call) ─
         _snap = _snapshot_cache.get(symbol)
@@ -87,28 +135,67 @@ def _passes_guardrails(symbol: str, bull_regime: bool = None) -> bool:
             price   = float(_snap.latest_trade.price)
             day_vol = float(_snap.daily_bar.volume)
             open_px = float(_snap.daily_bar.open)
+            intraday = None
         else:
             # ── Fallback: fetch 1-min intraday bars ───────────────────────────
             intraday = get_bars(symbol, "1d", "1m")
             if intraday.empty or len(intraday) < 5:
-                return True  # not enough data — let strategies decide
+                if return_reason:
+                    return False, 'other'
+                return False
             price   = float(intraday["close"].iloc[-1])
             day_vol = float(intraday["volume"].sum())
             open_px = float(intraday["open"].iloc[0])
 
-        # Minimum price gate — skip penny stocks (poor fills, wide spreads)
-        if price < MIN_STOCK_PRICE:
+        # Resolve regime and VIX before adaptive gates
+        vix = None
+        if hasattr(market_state, 'vix') and market_state.vix is not None:
+            vix = market_state.vix
+        elif hasattr(market_state, 'resolve_vix'):
+            vix, _, _ = market_state.resolve_vix()
+        bull = bull_regime if bull_regime is not None else market_state.resolve_regime()
+
+        # Adaptive MIN_STOCK_PRICE: more flexible for current market
+        base_min_price = MIN_STOCK_PRICE
+        base_dollar_vol = MIN_DOLLAR_VOLUME
+        base_rvol = RVOL_MIN
+
+        if bull:
+            if vix and vix > 25:
+                adaptive_min_price = base_min_price + 0.5
+                adaptive_dollar_vol = base_dollar_vol * 1.2
+                adaptive_rvol = base_rvol + 0.3
+            elif vix and vix >= 18:
+                adaptive_min_price = base_min_price
+                adaptive_dollar_vol = base_dollar_vol
+                adaptive_rvol = max(1.2, base_rvol - 0.3)
+            elif vix and vix >= 15:
+                adaptive_min_price = base_min_price
+                adaptive_dollar_vol = base_dollar_vol * 0.9
+                adaptive_rvol = max(1.0, base_rvol - 0.5)
+            else:
+                adaptive_min_price = max(1.0, base_min_price - 0.5)
+                adaptive_dollar_vol = base_dollar_vol * 0.8
+                adaptive_rvol = max(0.9, base_rvol - 0.6)
+        else:
+            if vix and vix < 18:
+                adaptive_min_price = max(1.0, base_min_price - 0.7)
+                adaptive_dollar_vol = base_dollar_vol * 0.6
+                adaptive_rvol = max(0.8, base_rvol - 0.7)
+            else:
+                adaptive_min_price = max(1.0, base_min_price - 0.5)
+                adaptive_dollar_vol = base_dollar_vol * 0.75
+                adaptive_rvol = max(1.0, base_rvol - 0.4)
+
+        if price < adaptive_min_price:
+            _log.warning(f"[GUARDRAIL] {symbol} blocked: price {price:.2f} < adaptive_min_price {adaptive_min_price}")
+            if return_reason:
+                return False, 'min_price'
             return False
 
-        # Dollar-volume gate
-        if price * day_vol < MIN_DOLLAR_VOLUME:
-            return False
-
-        # RVOL gate: only meaningful during regular market hours
-        # In bear regime, skip RVOL gate — breakdown volume is often distributed,
-        # not the spike pattern seen in squeeze/momentum setups.
-        _bull = bull_regime if bull_regime is not None else _is_bull_regime()
-        if is_market_open() and _bull:
+        # Adaptive RVOL_MIN: higher in bull/high VIX, lower in calm or bear conditions
+        # Use regular market hours only so extended-hours volume does not distort the pace.
+        if market_state.is_regular_hours and bull:
             daily = get_bars(symbol, "5d", "1d")
             if not daily.empty and len(daily) >= 2:
                 avg_daily_vol = float(daily["volume"].iloc[:-1].mean())
@@ -118,13 +205,60 @@ def _passes_guardrails(symbol: str, bull_regime: bool = None) -> bool:
                     elapsed_min  = max((now_et - mkt_open).total_seconds() / 60, 1.0)
                     elapsed_frac = min(elapsed_min / 390.0, 1.0)
                     rvol = (day_vol / max(elapsed_frac, 0.02)) / avg_daily_vol
-                    if rvol < RVOL_MIN:
+                    if rvol < adaptive_rvol:
+                        _log.warning(f"[GUARDRAIL] {symbol} blocked: RVOL {rvol:.2f} < adaptive_rvol {adaptive_rvol:.2f} | day_vol={day_vol:.0f} | avg_daily_vol={avg_daily_vol:.0f}")
+                        if return_reason:
+                            return False, 'rvol'
                         return False
 
-        # Gap-chase guard: skip if up >MAX_GAP_CHASE_PCT% without a tight consolidation base
+        # Adaptive MIN_DOLLAR_VOLUME: more flexible for current market
+        dollar_vol = price * day_vol
+        if dollar_vol < adaptive_dollar_vol:
+            _log.warning(f"[GUARDRAIL] {symbol} blocked: dollar volume {dollar_vol:.0f} < adaptive_dollar_vol {adaptive_dollar_vol:.0f} | price={price:.2f} | day_vol={day_vol:.0f}")
+            if return_reason:
+                return False, 'dollar_vol'
+            return False
+
+        # RVOL gate (adaptive)
+        if market_state.is_market_open and bull:
+            daily = get_bars(symbol, "5d", "1d")
+            if not daily.empty and len(daily) >= 2:
+                avg_daily_vol = float(daily["volume"].iloc[:-1].mean())
+                if avg_daily_vol > 0:
+                    now_et       = datetime.datetime.now(_ET)
+                    mkt_open     = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
+                    elapsed_min  = max((now_et - mkt_open).total_seconds() / 60, 1.0)
+                    elapsed_frac = min(elapsed_min / 390.0, 1.0)
+                    rvol = (day_vol / max(elapsed_frac, 0.02)) / avg_daily_vol
+                    if rvol < adaptive_rvol:
+                        _log.warning(f"[GUARDRAIL] {symbol} blocked: RVOL {rvol:.2f} < adaptive_rvol {adaptive_rvol:.2f} | day_vol={day_vol:.0f} | avg_daily_vol={avg_daily_vol:.0f}")
+                        if return_reason:
+                            return False, 'rvol'
+                        return False
+
+        # Adaptive MAX_GAP_CHASE_PCT using market regime and VIX
+        vix = None
+        if hasattr(market_state, 'vix') and market_state.vix is not None:
+            vix = market_state.vix
+        elif hasattr(market_state, 'resolve_vix'):
+            vix, _, _ = market_state.resolve_vix()
+        bull = bull_regime if bull_regime is not None else market_state.resolve_regime()
+        base_gap = MAX_GAP_CHASE_PCT
+        if bull:
+            if vix and vix > 25:
+                adaptive_gap = min(20.0, base_gap + 5.0)
+            else:
+                adaptive_gap = base_gap
+        else:
+            if vix and vix < 18:
+                adaptive_gap = max(10.0, base_gap - 5.0)
+            else:
+                adaptive_gap = max(12.0, base_gap - 3.0)
+
+        # Gap-chase guard: skip if up >adaptive_gap% without a tight consolidation base
         if open_px > 0:
             day_gain = ((price - open_px) / open_px) * 100
-            if day_gain > MAX_GAP_CHASE_PCT:
+            if day_gain > adaptive_gap:
                 # When 1-min bars are available, require tight recent consolidation.
                 # With snapshot-only data, skip the consolidation check (conservative:
                 # allows the signal — strategy-level filters apply next).
@@ -135,11 +269,18 @@ def _passes_guardrails(symbol: str, bull_regime: bool = None) -> bool:
                     last_n    = intraday.iloc[-GAP_CHASE_CONSOL_BARS:]
                     bar_range = float(last_n["high"].max() - last_n["low"].min())
                     if bar_range > price * 0.02:  # range > 2% = no consolidation
+                        _log.debug(f"[GUARDRAIL] {symbol} blocked: gap chase, bar range {bar_range:.2f} > 2% of price {price:.2f}")
+                        if return_reason:
+                            return False, 'gap_chase'
                         return False
 
+        if return_reason:
+            return True, None
         return True
     except Exception as e:
         _log.warning(f"Guardrail check failed for {symbol}: {e} — skipping symbol")
+        if return_reason:
+            return False, 'other'
         return False  # fail-safe: block on error, never bypass guardrails
 
 
@@ -151,17 +292,21 @@ def get_scan_targets(excluded: Set[str] = None) -> List[str]:
 
     delisted = set(_cfg.DELISTED_STOCKS)
 
+
     # PRIMARY: latest captured TI tickers from ti_primary.json.
     # FALLBACK: active TI tickers from universe.json tiers 1+2.
     ti_primary = [s for s in _get_ti_primary() if s not in delisted]
 
-    # FALLBACK: static config lists — used only when TI universe is empty.
+    # Universe health check
     _MIN_TI = 5
-    if len(ti_primary) < _MIN_TI:
-        _log.warning(
-            f"TI primary universe too small ({len(ti_primary)}) — falling back to static config lists"
-        )
+    if len(ti_primary) == 0:
+        _log.error("[UNIVERSE HEALTH] ti_primary.json is empty! No tickers to scan. Check data pipeline.")
+    elif len(ti_primary) < _MIN_TI:
+        _log.warning(f"[UNIVERSE HEALTH] ti_primary.json too small ({len(ti_primary)}). Falling back to static config lists.")
         p1, p2, _ = _cfg.get_dynamic_universe()
+        # Alert if static lists are also empty
+        if len(p1) + len(p2) == 0:
+            _log.error("[UNIVERSE HEALTH] Static universe lists are empty! No tickers to scan. Check config/universe sources.")
     else:
         p1, p2 = ti_primary, []
 
@@ -244,7 +389,7 @@ def get_scan_targets(excluded: Set[str] = None) -> List[str]:
     return targets
 
 
-def scan_universe(scan_targets: List[str], sentiment: str) -> Tuple[List, Dict[str, int], int]:
+def scan_universe(scan_targets: List[str], sentiment: str, market_state: MarketState) -> Tuple[List, Dict[str, int], int]:
     clear_bar_cache()
 
     # Batch-prefetch stock snapshots for all scan targets in one API call.
@@ -255,18 +400,32 @@ def scan_universe(scan_targets: List[str], sentiment: str) -> Tuple[List, Dict[s
     # Compute regime ONCE here before spawning workers — avoids a thread race where
     # multiple workers concurrently hit the 15-min TTL expiry and each make a
     # separate get_bars("SPY") call to refresh the shared _regime_cache dict.
-    bull_regime = _is_bull_regime()
+    bull_regime = market_state.resolve_regime()
     regime_str  = "bull" if bull_regime else "bear"
     strats = get_strategy_instances(bull_regime)
+
 
     signals = []
     hit_counts = {}
     scan_errors = 0
+    guardrail_rejections = {
+        'dollar_vol': 0,
+        'rvol': 0,
+        'gap_chase': 0,
+        'min_price': 0,
+        'other': 0
+    }
 
     def _scan_one(symbol: str):
         # Dead-ticker check already done in get_scan_targets() — skip here.
         # Pass pre-computed regime into guardrails to avoid re-calling _is_bull_regime()
-        if not _passes_guardrails(symbol, bull_regime=bull_regime):
+        # Custom: get rejection reason from _passes_guardrails
+        passed, reason = _passes_guardrails(symbol, bull_regime=bull_regime, market_state=market_state, return_reason=True)
+        if not passed:
+            if reason in guardrail_rejections:
+                guardrail_rejections[reason] += 1
+            else:
+                guardrail_rejections['other'] += 1
             return None
 
         candidates = []
@@ -289,6 +448,8 @@ def scan_universe(scan_targets: List[str], sentiment: str) -> Tuple[List, Dict[s
             return None
         return max(candidates, key=lambda s: s.confidence)
 
+
+
     with ThreadPoolExecutor(max_workers=SCAN_WORKERS) as pool:
         future_map = {pool.submit(_scan_one, sym): sym for sym in scan_targets}
         for future in as_completed(future_map):
@@ -298,16 +459,75 @@ def scan_universe(scan_targets: List[str], sentiment: str) -> Tuple[List, Dict[s
                 if sig:
                     signals.append(sig)
                     hit_counts[sig.strategy] = hit_counts.get(sig.strategy, 0) + 1
-            except Exception:
+            except Exception as e:
                 scan_errors += 1
+                _log.error(f"[SCAN ERROR] {sym}: {e}")
+
+    # Log guardrail rejection summary
+    total_rejected = sum(guardrail_rejections.values())
+    if total_rejected > 0:
+        _log.info(f"[GUARDRAIL SUMMARY] Rejected: {total_rejected} | DollarVol: {guardrail_rejections['dollar_vol']} | RVOL: {guardrail_rejections['rvol']} | GapChase: {guardrail_rejections['gap_chase']} | MinPrice: {guardrail_rejections['min_price']} | Other: {guardrail_rejections['other']}")
 
     signals.sort(key=lambda x: x.confidence, reverse=True)
+    # Adaptive confidence filter using pre-intelligence (market regime, VIX)
+    vix = None
+    if hasattr(market_state, 'vix') and market_state.vix is not None:
+        vix = market_state.vix
+    elif hasattr(market_state, 'resolve_vix'):
+        vix, _, _ = market_state.resolve_vix()
+    bull = market_state.resolve_regime()
+    base_conf = MIN_SIGNAL_CONFIDENCE
+    if bull:
+        if vix and vix > 25:
+            adaptive_conf = min(0.80, base_conf + 0.05)  # stricter in high-vol bull
+        else:
+            adaptive_conf = base_conf
+    else:
+        if vix and vix < 18:
+            adaptive_conf = max(0.65, base_conf - 0.05)  # looser in calm bear
+        else:
+            adaptive_conf = max(0.68, base_conf - 0.02)
+    signals = [s for s in signals if s.confidence >= adaptive_conf]
+
+    # Dynamic sector/industry weighting cap
+    # Limit to max 3 signals per sector (can be tuned)
+    from collections import defaultdict
+    sector_cap = 3
+    sector_counts = defaultdict(int)
+    filtered_signals = []
+    for sig in signals:
+        sector = getattr(sig, 'sector', None)
+        if sector is None:
+            filtered_signals.append(sig)  # If no sector info, allow
+            continue
+        if sector_counts[sector] < sector_cap:
+            filtered_signals.append(sig)
+            sector_counts[sector] += 1
+    signals = filtered_signals
     if LONG_ONLY_MODE:
         # Long-only enforcement: drop sell/short signals only when LONG_ONLY_MODE is active
         pre_len = len(signals)
         signals = [s for s in signals if s.action == "buy"]
         if len(signals) != pre_len:
             _log.info(f"Long-only enforced in scan_universe: dropping {pre_len-len(signals)} short signals")
+
+    # Adaptive filter logic: relax after N empty scans, reset after success
+    if len(signals) == 0:
+        _adaptive_state["empty_scans"] += 1
+        if _adaptive_state["empty_scans"] >= _ADAPTIVE_MAX_EMPTY:
+            # Relax RVOL and confidence stepwise
+            if _adaptive_state["rvol_min"] > _ADAPTIVE_MIN_RVOL:
+                _adaptive_state["rvol_min"] = max(_ADAPTIVE_MIN_RVOL, _adaptive_state["rvol_min"] - _ADAPTIVE_STEP_RVOL)
+                _log.info(f"[ADAPTIVE] Lowered RVOL_MIN to {_adaptive_state['rvol_min']:.2f}")
+            if _adaptive_state["min_conf"] > _ADAPTIVE_MIN_CONF:
+                _adaptive_state["min_conf"] = max(_ADAPTIVE_MIN_CONF, _adaptive_state["min_conf"] - _ADAPTIVE_STEP_CONF)
+                _log.info(f"[ADAPTIVE] Lowered MIN_SIGNAL_CONFIDENCE to {_adaptive_state['min_conf']:.2f}")
+    else:
+        if _adaptive_state["empty_scans"] > 0:
+            _log.info(f"[ADAPTIVE] Resetting adaptive filters after successful scan.")
+        _adaptive_state["empty_scans"] = 0
+        _adaptive_state["rvol_min"] = RVOL_MIN
+        _adaptive_state["min_conf"] = MIN_SIGNAL_CONFIDENCE
     return signals, hit_counts, scan_errors
 
 

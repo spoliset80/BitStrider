@@ -124,7 +124,18 @@ def get_options_universe(require_ti_file: bool = False) -> list:
 
     # Core liquid options names — always included first regardless of TI data.
     # These have the tightest spreads, deepest chains, and highest OI.
+
+    # Always include index tickers in paper trading mode
+    _index_tickers = ["SPX", "NDX", "RUT", "VIX"]
     _core = list(dict.fromkeys(_OPTIONS_FALLBACK_UNIVERSE))
+    try:
+        if PAPER:
+            # Prepend index tickers if not already present
+            for idx in reversed(_index_tickers):
+                if idx not in _core:
+                    _core.insert(0, idx)
+    except Exception:
+        pass
 
     ti_universe = []
     try:
@@ -382,6 +393,10 @@ TRADEIDEAS_HEADLESS                              = __import__('os').getenv('TRAD
 TRADEIDEAS_CHROME_PROFILE                        = __import__('os').getenv('TRADEIDEAS_CHROME_PROFILE', '')
 TRADEIDEAS_BROWSER                                = __import__('os').getenv('TRADEIDEAS_BROWSER', 'edge')
 TRADEIDEAS_UPDATE_CONFIG_FILE                     = True
+# Wait this many seconds for the startup Trade Ideas capture before the first scan.
+# Default 90s preserves fresh TI tickers for the initial universe. Set to 0 only
+# for advanced starts where background TI loading is acceptable.
+STARTUP_TI_CAPTURE_TIMEOUT_S                     = int(__import__('os').getenv('STARTUP_TI_CAPTURE_TIMEOUT_S', '90'))
 TI_PRIMARY_SCAN_BATCH_LIMIT                       = int(__import__('os').getenv('TI_PRIMARY_SCAN_BATCH_LIMIT', '50'))
 
 # Sector sympathy scanner — injects peer tickers when a leader stock fires
@@ -391,6 +406,11 @@ SECTOR_SYMPATHY_INTERVAL_MIN = int(os.getenv("SECTOR_SYMPATHY_INTERVAL_MIN", "15
 # EDGAR 8-K feed scanner — injects tickers from material event filings (free, no auth)
 USE_EDGAR_SCANNER            = os.getenv("USE_EDGAR_SCANNER",    "true").lower() in ("1", "true", "yes")
 EDGAR_SCANNER_INTERVAL_MIN   = int(os.getenv("EDGAR_SCANNER_INTERVAL_MIN",   "10"))
+USE_PREOPEN_INTELLIGENCE     = os.getenv("USE_PREOPEN_INTELLIGENCE", "true").lower() in ("1", "true", "yes")
+PREOPEN_INTELLIGENCE_SCAN_INTERVAL_MIN = int(os.getenv("PREOPEN_INTELLIGENCE_SCAN_INTERVAL_MIN", "15"))
+PREOPEN_INTELLIGENCE_MAX_TICKERS = int(os.getenv("PREOPEN_INTELLIGENCE_MAX_TICKERS", "20"))
+PREOPEN_USE_REGIME_GATING    = os.getenv("PREOPEN_USE_REGIME_GATING", "true").lower() in ("1", "true", "yes")
+PREOPEN_USE_SENTIMENT_GATING = os.getenv("PREOPEN_USE_SENTIMENT_GATING", "true").lower() in ("1", "true", "yes")
 
 # ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 # Daily Limits
@@ -599,10 +619,10 @@ BEAR_BREAKDOWN = {
 # ─────────────────────────────────────────────────────────────────
 # Golden Ratio Scanner Guardrails
 # ─────────────────────────────────────────────────────────────────
-RVOL_MIN                 = 2.0         # Require relative volume ≥ 2x before entering
-MIN_STOCK_PRICE          = 3.0         # Skip penny stocks below $3 (poor fill quality, high spread)
+RVOL_MIN                 = 1.5         # Require relative volume ≥ 1.5x before entering
+MIN_STOCK_PRICE          = 2.0         # Skip penny stocks below $2 (poor fill quality, high spread)
 ALPACA_MOVER_SCAN_INTERVAL_MIN = 10   # Re-poll Alpaca screener every 10 min (resets at market open)
-MIN_DOLLAR_VOLUME        = 20_000_000  # Skip illiquid setups: price × day_vol < $20M
+MIN_DOLLAR_VOLUME        = 1_000_000   # Skip illiquid setups: price × day_vol < $1M
 MAX_GAP_CHASE_PCT        = 15.0       # Skip if already up >15% without consolidation
 GAP_CHASE_CONSOL_BARS    = 5          # Number of 1-min bars to check for tight base
 USE_MARKET_REGIME_FILTER = True       # SPY below 200-day MA → cut signals to 1

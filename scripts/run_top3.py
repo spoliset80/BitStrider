@@ -10,8 +10,8 @@ sys.path.insert(0, os.path.dirname(__file__))
 
 # ── Step 1: Fresh TI scrape ──────────────────────────────────────
 from engine.ti.capture_tradeideas import scrape_tradeideas
-print("Step 1/3: Scraping Trade Ideas (30min)...")
-scrape_tradeideas(update_config=True, headless=True, select_30min=True)
+print("Step 1/3: Scraping Trade Ideas (15min)...")
+scrape_tradeideas(update_config=True, headless=True, select_minutes=15)
 
 # ── Step 2: Reload config & scan ────────────────────────────────
 import importlib
@@ -19,11 +19,12 @@ import engine.config as cfg
 importlib.reload(cfg)
 
 from engine.equity.scan import scan_universe, get_scan_targets
+from engine.utils import MarketState
 
 targets = get_scan_targets()
 print(f"Step 2/3: Scanning {len(targets)} symbols across 7 strategies...")
 
-signals, hit_counts, scan_errors = scan_universe(targets, "neutral")
+signals, hit_counts, scan_errors = scan_universe(targets, "neutral", MarketState.from_now())
 
 if scan_errors:
     print(f"Scan errors: {scan_errors}")

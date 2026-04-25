@@ -780,6 +780,11 @@ def scrape_tradeideas(
     _killer = _ti_thread.Thread(target=_hard_kill, daemon=True)
     _killer.start()
 
+    if select_minutes is None:
+        select_minutes = 15
+    if select_30min:
+        select_minutes = 30
+
     try:
         if scan_keys is not None:
             scan_keys = set(scan_keys)
