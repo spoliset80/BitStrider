@@ -719,7 +719,7 @@ def scan_tradeideas_universe(
         scrape_tradeideas,
         update_config=update_config,
         chrome_profile=ti_profile,
-        select_30min=True,
+        select_minutes=15,
         scan_keys=["marketscope360", "highshortfloat"],
         remote_debug_port=remote_debug_port,
     )
@@ -800,7 +800,7 @@ def scan_tradeideas_unusual_options(
         scrape_tradeideas,
         update_config=update_config,
         chrome_profile=ti_profile,
-        select_30min=True,
+        select_minutes=15,
         scan_keys=["unusualoptionsvolume"],
         remote_debug_port=remote_debug_port,
     )

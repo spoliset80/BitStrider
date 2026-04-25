@@ -10,8 +10,8 @@ sys.path.insert(0, os.path.dirname(__file__))
 
 # ── Step 1: Fresh TI scrape ──────────────────────────────────────
 from engine.ti.capture_tradeideas import scrape_tradeideas
-print("Step 1/3: Scraping Trade Ideas (30min)...")
-scrape_tradeideas(update_config=True, headless=True, select_30min=True)
+print("Step 1/3: Scraping Trade Ideas (15min)...")
+scrape_tradeideas(update_config=True, headless=True, select_minutes=15)
 
 # ── Step 2: Reload config & scan ────────────────────────────────
 import importlib
