@@ -1,47 +1,15 @@
 {
-  "generated_at": "2026-04-24T21:03:09-04:00",
-  "date": "2026-04-24",
+  "generated_at": "2026-04-27T10:32:36-04:00",
+  "date": "2026-04-27",
   "market_regime": "bull",
   "picks": [
     {
-      "symbol": "ANAB",
+      "symbol": "XOMA",
       "action": "buy",
-      "price": 59.02,
-      "confidence": 0.8398,
-      "strategy": "Momentum",
-      "reason": "Strong momentum (11.0%) + volume x8.2 + above SMA20"
-    },
-    {
-      "symbol": "ELPW",
-      "action": "buy",
-      "price": 3.62,
-      "confidence": 0.82,
-      "strategy": "Sweepea",
-      "reason": "Daily Sweepea pullback to 20-EMA | ATR $0.52"
-    },
-    {
-      "symbol": "HLX",
-      "action": "buy",
-      "price": 9.89,
-      "confidence": 0.82,
-      "strategy": "Sweepea",
-      "reason": "Daily Sweepea pullback to 8-EMA | ATR $0.37"
-    },
-    {
-      "symbol": "KN",
-      "action": "buy",
-      "price": 30.61,
-      "confidence": 0.82,
-      "strategy": "Sweepea",
-      "reason": "Daily Sweepea pullback to 8-EMA | ATR $1.14"
-    },
-    {
-      "symbol": "CSL",
-      "action": "buy",
-      "price": 360.07,
-      "confidence": 0.82,
-      "strategy": "Sweepea",
-      "reason": "Daily Sweepea pullback to 8-EMA | ATR $14.74"
+      "price": 41.3722,
+      "confidence": 0.8216,
+      "strategy": "GapBreakout",
+      "reason": "Gap up 9.2% from $37.90 | volume x3.4"
     }
   ]
 }

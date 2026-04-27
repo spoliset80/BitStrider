@@ -293,9 +293,13 @@ def get_scan_targets(excluded: Set[str] = None) -> List[str]:
     delisted = set(_cfg.DELISTED_STOCKS)
 
 
+
     # PRIMARY: latest captured TI tickers from ti_primary.json.
     # FALLBACK: active TI tickers from universe.json tiers 1+2.
     ti_primary = [s for s in _get_ti_primary() if s not in delisted]
+
+    # Always initialize p1 and p2 to avoid UnboundLocalError
+    p1, p2 = [], []
 
     # Universe health check
     _MIN_TI = 5
