@@ -196,20 +196,53 @@ def _passes_guardrails(symbol: str, bull_regime: bool = None, market_state: Opti
         # Adaptive RVOL_MIN: higher in bull/high VIX, lower in calm or bear conditions
         # Use regular market hours only so extended-hours volume does not distort the pace.
         if market_state.is_regular_hours and bull:
-            daily = get_bars(symbol, "5d", "1d")
-            if not daily.empty and len(daily) >= 2:
-                avg_daily_vol = float(daily["volume"].iloc[:-1].mean())
-                if avg_daily_vol > 0:
-                    now_et       = datetime.datetime.now(_ET)
-                    mkt_open     = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
-                    elapsed_min  = max((now_et - mkt_open).total_seconds() / 60, 1.0)
-                    elapsed_frac = min(elapsed_min / 390.0, 1.0)
-                    rvol = (day_vol / max(elapsed_frac, 0.02)) / avg_daily_vol
+            # Fetch today's 1-min bars and previous 5 days' 1-min bars
+            today_intraday = get_bars(symbol, "1d", "1m")
+            past_intraday = get_bars(symbol, "6d", "1m")
+            now_et = datetime.datetime.now(_ET)
+            mkt_open = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
+            elapsed_min = int(max((now_et - mkt_open).total_seconds() / 60, 1))
+            elapsed_min = min(elapsed_min, 390)
+            fallback_rvol = False
+            if today_intraday.empty or past_intraday.empty or len(today_intraday) < 5 or len(past_intraday) < 390*2:
+                _log.warning(f"[RVOL@TIME FALLBACK] {symbol}: insufficient intraday data for RVOL@TIME, using legacy RVOL logic.")
+                fallback_rvol = True
+            else:
+                # Today's volume up to now
+                today_vol = float(today_intraday["volume"].iloc[:elapsed_min].sum())
+                # For each of the previous 5 days, sum volume up to the same minute
+                avg_vols = []
+                for d in range(1, 6):
+                    day_start = -elapsed_min - 390 * d
+                    day_end = -390 * (d - 1)
+                    if day_end == 0:
+                        day_slice = past_intraday["volume"].iloc[day_start:]
+                    else:
+                        day_slice = past_intraday["volume"].iloc[day_start:day_end]
+                    if len(day_slice) == elapsed_min:
+                        avg_vols.append(float(day_slice.sum()))
+                if avg_vols:
+                    avg_intraday_vol = sum(avg_vols) / len(avg_vols)
+                    rvol = today_vol / max(avg_intraday_vol, 1)
+                    _log.info(f"[RVOL@TIME DEBUG] {symbol}: today_vol={today_vol:.0f}, avg_intraday_vol={avg_intraday_vol:.0f}, elapsed_min={elapsed_min}, rvol={rvol:.3f}, adaptive_rvol={adaptive_rvol:.2f}")
                     if rvol < adaptive_rvol:
-                        _log.warning(f"[GUARDRAIL] {symbol} blocked: RVOL {rvol:.2f} < adaptive_rvol {adaptive_rvol:.2f} | day_vol={day_vol:.0f} | avg_daily_vol={avg_daily_vol:.0f}")
+                        _log.warning(f"[GUARDRAIL] {symbol} blocked: RVOL@TIME {rvol:.2f} < adaptive_rvol {adaptive_rvol:.2f} | today_vol={today_vol:.0f} | avg_intraday_vol={avg_intraday_vol:.0f}")
                         if return_reason:
                             return False, 'rvol'
                         return False
+                else:
+                    _log.warning(f"[RVOL@TIME FALLBACK] {symbol}: not enough valid days for RVOL@TIME, using legacy RVOL logic.")
+                    fallback_rvol = True
+            # Time-weighted dollar volume guardrail
+            elapsed_frac = elapsed_min / 390.0
+            tw_dollar_vol = adaptive_dollar_vol * max(elapsed_frac, 0.05)
+            dollar_vol = price * day_vol
+            _log.info(f"[DOLLAR_VOL@TIME DEBUG] {symbol}: dollar_vol={dollar_vol:.0f}, tw_dollar_vol={tw_dollar_vol:.0f}, elapsed_min={elapsed_min}, elapsed_frac={elapsed_frac:.3f}")
+            if dollar_vol < tw_dollar_vol:
+                _log.warning(f"[GUARDRAIL] {symbol} blocked: dollar volume {dollar_vol:.0f} < tw_dollar_vol {tw_dollar_vol:.0f} | price={price:.2f} | day_vol={day_vol:.0f}")
+                if return_reason:
+                    return False, 'dollar_vol'
+                return False
 
         # Adaptive MIN_DOLLAR_VOLUME: more flexible for current market
         dollar_vol = price * day_vol
