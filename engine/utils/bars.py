@@ -143,18 +143,32 @@ def _get_bars_alpaca(symbol: str, period: str, interval: str, log) -> pd.DataFra
     if elapsed < _ALPACA_MIN_INTERVAL:
         time.sleep(_ALPACA_MIN_INTERVAL - elapsed)
 
-    bars = client.get_stock_bars(StockBarsRequest(
-        symbol_or_symbols=symbol,
-        timeframe=tf,
-        start=start_iso,
-        end=end_iso,
-        feed="iex",
-    ))
+    # Use 'sip' feed if available (paid plan), else fallback to 'iex'
+    try:
+        bars = client.get_stock_bars(StockBarsRequest(
+            symbol_or_symbols=symbol,
+            timeframe=tf,
+            start=start_iso,
+            end=end_iso,
+            feed="sip",
+        ))
+    except Exception as e:
+        # Suppress SIP feed failure log noise (use debug level)
+        log.debug(f"{symbol}: Alpaca SIP feed failed ({e}), retrying with IEX feed.")
+        bars = client.get_stock_bars(StockBarsRequest(
+            symbol_or_symbols=symbol,
+            timeframe=tf,
+            start=start_iso,
+            end=end_iso,
+            feed="iex",
+        ))
     _last_alpaca_bar_ts = time.time()
     if symbol in bars:
         data = _normalize_df(bars[symbol].df.reset_index())
-        if "time" in data.columns:
-            latest    = pd.to_datetime(data["time"].iloc[-1])
+        if not data.empty and "time" in data.columns:
+            # Forward-fill missing bars (close, volume, etc.)
+            data = data.ffill()
+            latest = pd.to_datetime(data["time"].iloc[-1])
             if latest.tzinfo is None:
                 latest = ET.localize(latest)
             staleness = (datetime.datetime.now(ET) - latest).total_seconds()
@@ -165,6 +179,8 @@ def _get_bars_alpaca(symbol: str, period: str, interval: str, log) -> pd.DataFra
                 with _bar_cache_lock:
                     _bar_cache[(symbol, period, interval)] = data
                 return data
+        else:
+            log.warning(f"{symbol}: Alpaca returned empty or malformed data.")
     return pd.DataFrame()
 
 @retry(wait=wait_exponential(multiplier=1, min=2, max=10), stop=stop_after_attempt(3),

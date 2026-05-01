@@ -197,15 +197,45 @@ def _passes_guardrails(symbol: str, bull_regime: bool = None, market_state: Opti
         # Use regular market hours only so extended-hours volume does not distort the pace.
         if market_state.is_regular_hours and bull:
             # Fetch today's 1-min bars and previous 5 days' 1-min bars
-            today_intraday = get_bars(symbol, "1d", "1m")
-            past_intraday = get_bars(symbol, "6d", "1m")
+            from engine.utils.bars import _get_bars_yfinance
+            import logging
+            log = logging.getLogger("ApexTrader")
+            today_intraday = _get_bars_yfinance(symbol, "1d", "1m", log)
+            past_intraday = _get_bars_yfinance(symbol, "6d", "1m", log)
+            # Fallback to Alpaca if yfinance is missing/incomplete
+            if today_intraday.empty or len(today_intraday) < 5:
+                log.info(f"[RVOL FALLBACK] {symbol}: yfinance intraday bars missing/incomplete, trying Alpaca fallback.")
+                today_intraday = get_bars(symbol, "1d", "1m")
+            if past_intraday.empty or len(past_intraday) < 390*2:
+                log.info(f"[RVOL FALLBACK] {symbol}: yfinance past intraday bars missing/incomplete, trying Alpaca fallback.")
+                past_intraday = get_bars(symbol, "6d", "1m")
             now_et = datetime.datetime.now(_ET)
             mkt_open = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
             elapsed_min = int(max((now_et - mkt_open).total_seconds() / 60, 1))
             elapsed_min = min(elapsed_min, 390)
             fallback_rvol = False
             if today_intraday.empty or past_intraday.empty or len(today_intraday) < 5 or len(past_intraday) < 390*2:
-                _log.warning(f"[RVOL@TIME FALLBACK] {symbol}: insufficient intraday data for RVOL@TIME, using legacy RVOL logic.")
+                # Fallback: use fractional legacy RVOL logic
+                now_et = datetime.datetime.now(_ET)
+                mkt_open = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
+                elapsed_min = int(max((now_et - mkt_open).total_seconds() / 60, 1))
+                elapsed_min = min(elapsed_min, 390)
+                elapsed_frac = elapsed_min / 390.0
+                # Get average daily volume from last 5 days
+                daily = get_bars(symbol, "5d", "1d")
+                if not daily.empty and len(daily) >= 2:
+                    avg_daily_vol = float(daily["volume"].iloc[:-1].mean())
+                else:
+                    avg_daily_vol = 1.0
+                today_vol = float(day_vol)
+                denom = avg_daily_vol * max(elapsed_frac, 0.02)
+                rvol_fallback = today_vol / denom if denom > 0 else 0.0
+                _log.warning(f"[RVOL@TIME FALLBACK] {symbol}: insufficient intraday data for RVOL@TIME, using fractional legacy RVOL logic. today_vol={today_vol:.0f}, avg_daily_vol={avg_daily_vol:.0f}, elapsed_frac={elapsed_frac:.3f}, denom={denom:.0f}, rvol_fallback={rvol_fallback:.3f}, adaptive_rvol={adaptive_rvol:.2f}")
+                if rvol_fallback < adaptive_rvol:
+                    _log.warning(f"[GUARDRAIL] {symbol} blocked: RVOL_FALLBACK {rvol_fallback:.2f} < adaptive_rvol {adaptive_rvol:.2f} | today_vol={today_vol:.0f} | denom={denom:.0f}")
+                    if return_reason:
+                        return False, 'rvol'
+                    return False
                 fallback_rvol = True
             else:
                 # Today's volume up to now
@@ -235,11 +265,13 @@ def _passes_guardrails(symbol: str, bull_regime: bool = None, market_state: Opti
                     fallback_rvol = True
             # Time-weighted dollar volume guardrail
             elapsed_frac = elapsed_min / 390.0
-            tw_dollar_vol = adaptive_dollar_vol * max(elapsed_frac, 0.05)
+            # If using IEX feed (Free Tier), scale down threshold to 65%
+            iex_scaling = 0.65
+            tw_dollar_vol = adaptive_dollar_vol * max(elapsed_frac, 0.05) * iex_scaling
             dollar_vol = price * day_vol
-            _log.info(f"[DOLLAR_VOL@TIME DEBUG] {symbol}: dollar_vol={dollar_vol:.0f}, tw_dollar_vol={tw_dollar_vol:.0f}, elapsed_min={elapsed_min}, elapsed_frac={elapsed_frac:.3f}")
+            _log.info(f"[DOLLAR_VOL@TIME DEBUG] {symbol}: dollar_vol={dollar_vol:.0f}, tw_dollar_vol={tw_dollar_vol:.0f} (IEX scaled), elapsed_min={elapsed_min}, elapsed_frac={elapsed_frac:.3f}")
             if dollar_vol < tw_dollar_vol:
-                _log.warning(f"[GUARDRAIL] {symbol} blocked: dollar volume {dollar_vol:.0f} < tw_dollar_vol {tw_dollar_vol:.0f} | price={price:.2f} | day_vol={day_vol:.0f}")
+                _log.warning(f"[GUARDRAIL] {symbol} blocked: dollar volume {dollar_vol:.0f} < tw_dollar_vol {tw_dollar_vol:.0f} (IEX scaled) | price={price:.2f} | day_vol={day_vol:.0f}")
                 if return_reason:
                     return False, 'dollar_vol'
                 return False
