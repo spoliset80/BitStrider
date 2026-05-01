@@ -238,7 +238,7 @@ def _passes_guardrails(symbol: str, bull_regime: bool = None, market_state: Opti
                 iex_feed = _get_feed_used(symbol) == "iex"
                 rvol_threshold = adaptive_rvol * (_IEX_THRESHOLD_SCALE if iex_feed else 1.0)
                 _log.warning(f"[RVOL@TIME FALLBACK] {symbol}: insufficient intraday data for RVOL@TIME, using fractional legacy RVOL logic. today_vol={today_vol:.0f}, avg_daily_vol={avg_daily_vol:.0f}, elapsed_frac={elapsed_frac:.3f}, denom={denom:.0f}, rvol_fallback={rvol_fallback:.3f}, adaptive_rvol={adaptive_rvol:.2f} (iex_scale={iex_feed})")
-                if rvol_fallback < rvol_threshold:
+                if not iex_feed and rvol_fallback < rvol_threshold:
                     _log.warning(f"[GUARDRAIL] {symbol} blocked: RVOL_FALLBACK {rvol_fallback:.2f} < rvol_threshold {rvol_threshold:.2f} (adaptive={adaptive_rvol:.2f} iex_scale={iex_feed}) | today_vol={today_vol:.0f} | denom={denom:.0f}")
                     if return_reason:
                         return False, 'rvol'
@@ -264,7 +264,7 @@ def _passes_guardrails(symbol: str, bull_regime: bool = None, market_state: Opti
                     iex_feed = _get_feed_used(symbol) == "iex"
                     rvol_threshold = adaptive_rvol * (_IEX_THRESHOLD_SCALE if iex_feed else 1.0)
                     _log.info(f"[RVOL@TIME DEBUG] {symbol}: today_vol={today_vol:.0f}, avg_intraday_vol={avg_intraday_vol:.0f}, elapsed_min={elapsed_min}, rvol={rvol:.3f}, rvol_threshold={rvol_threshold:.2f} (adaptive={adaptive_rvol:.2f} iex_scale={iex_feed})")
-                    if rvol < rvol_threshold:
+                    if not iex_feed and rvol < rvol_threshold:
                         _log.warning(f"[GUARDRAIL] {symbol} blocked: RVOL@TIME {rvol:.2f} < rvol_threshold {rvol_threshold:.2f} (adaptive={adaptive_rvol:.2f} iex_scale={iex_feed}) | today_vol={today_vol:.0f} | avg_intraday_vol={avg_intraday_vol:.0f}")
                         if return_reason:
                             return False, 'rvol'
@@ -309,7 +309,7 @@ def _passes_guardrails(symbol: str, bull_regime: bool = None, market_state: Opti
                     rvol = (day_vol / max(elapsed_frac, 0.02)) / avg_daily_vol
                     iex_feed = _get_feed_used(symbol) == "iex"
                     rvol_threshold = adaptive_rvol * (_IEX_THRESHOLD_SCALE if iex_feed else 1.0)
-                    if rvol < rvol_threshold:
+                    if not iex_feed and rvol < rvol_threshold:
                         _log.warning(f"[GUARDRAIL] {symbol} blocked: RVOL {rvol:.2f} < rvol_threshold {rvol_threshold:.2f} (adaptive={adaptive_rvol:.2f} iex_scale={iex_feed}) | day_vol={day_vol:.0f} | avg_daily_vol={avg_daily_vol:.0f}")
                         if return_reason:
                             return False, 'rvol'

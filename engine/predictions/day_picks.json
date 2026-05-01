@@ -1,15 +1,47 @@
 {
-  "generated_at": "2026-05-01T11:12:23-04:00",
+  "generated_at": "2026-05-01T14:52:21-04:00",
   "date": "2026-05-01",
   "market_regime": "bull",
   "picks": [
     {
-      "symbol": "CERS",
+      "symbol": "UONE",
       "action": "buy",
-      "price": 2.555,
+      "price": 7.0,
       "confidence": 0.92,
       "strategy": "Sentiment",
-      "reason": "Sentiment bullish + vol x12.56 + price>20SMA"
+      "reason": "Sentiment bullish + vol x6.05 + price>20SMA"
+    },
+    {
+      "symbol": "AIRS",
+      "action": "buy",
+      "price": 3.265,
+      "confidence": 0.82,
+      "strategy": "Sweepea",
+      "reason": "Daily Sweepea pullback to 8-EMA | ATR $0.27"
+    },
+    {
+      "symbol": "AGH",
+      "action": "buy",
+      "price": 4.895,
+      "confidence": 0.82,
+      "strategy": "Sweepea",
+      "reason": "Daily Sweepea pullback to 8-EMA | ATR $0.36"
+    },
+    {
+      "symbol": "ACCO",
+      "action": "buy",
+      "price": 3.9053,
+      "confidence": 0.7317,
+      "strategy": "Sentiment",
+      "reason": "Sentiment bullish + vol x2.82 + price>20SMA"
+    },
+    {
+      "symbol": "TEAM",
+      "action": "buy",
+      "price": 88.07,
+      "confidence": 0.7263,
+      "strategy": "Sentiment",
+      "reason": "Sentiment bullish + vol x2.76 + price>20SMA"
     }
   ]
 }
