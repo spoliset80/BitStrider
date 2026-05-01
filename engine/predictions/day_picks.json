@@ -1,47 +1,15 @@
 {
-  "generated_at": "2026-05-01T08:49:04-04:00",
+  "generated_at": "2026-05-01T10:07:17-04:00",
   "date": "2026-05-01",
   "market_regime": "bull",
   "picks": [
     {
-      "symbol": "HASI",
+      "symbol": "SCL",
       "action": "buy",
-      "price": 41.95,
+      "price": 49.95,
       "confidence": 0.92,
       "strategy": "Sentiment",
-      "reason": "Sentiment bullish + vol x5.97 + price>20SMA"
-    },
-    {
-      "symbol": "EGO",
-      "action": "buy",
-      "price": 30.74,
-      "confidence": 0.8464,
-      "strategy": "Sentiment",
-      "reason": "Sentiment bullish + vol x3.96 + price>20SMA"
-    },
-    {
-      "symbol": "APD",
-      "action": "buy",
-      "price": 300.15,
-      "confidence": 0.7557,
-      "strategy": "Sentiment",
-      "reason": "Sentiment bullish + vol x3.06 + price>20SMA"
-    },
-    {
-      "symbol": "CWH",
-      "action": "buy",
-      "price": 8.195,
-      "confidence": 0.7315,
-      "strategy": "Sentiment",
-      "reason": "Sentiment bullish + vol x2.82 + price>20SMA"
-    },
-    {
-      "symbol": "GPN",
-      "action": "buy",
-      "price": 71.96,
-      "confidence": 0.7315,
-      "strategy": "Sentiment",
-      "reason": "Sentiment bullish + vol x2.81 + price>20SMA"
+      "reason": "Sentiment bullish + vol x7.94 + price>20SMA"
     }
   ]
 }
