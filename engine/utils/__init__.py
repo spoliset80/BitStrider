@@ -14,6 +14,7 @@ Submodules:
 from engine.utils.bars import (
     ALPACA_AVAILABLE,
     clear_bar_cache,
+    get_feed_used,
     is_dead_ticker,
     get_data_client,
     get_option_data_client,

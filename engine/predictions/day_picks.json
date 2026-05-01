@@ -1,15 +1,15 @@
 {
-  "generated_at": "2026-05-01T10:07:17-04:00",
+  "generated_at": "2026-05-01T11:12:23-04:00",
   "date": "2026-05-01",
   "market_regime": "bull",
   "picks": [
     {
-      "symbol": "SCL",
+      "symbol": "CERS",
       "action": "buy",
-      "price": 49.95,
+      "price": 2.555,
       "confidence": 0.92,
       "strategy": "Sentiment",
-      "reason": "Sentiment bullish + vol x7.94 + price>20SMA"
+      "reason": "Sentiment bullish + vol x12.56 + price>20SMA"
     }
   ]
 }

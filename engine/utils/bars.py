@@ -44,6 +44,15 @@ _last_alpaca_bar_ts: float = 0.0
 _data_client = None
 _option_data_client = None
 
+# ── Feed tracking ────────────────────────────────────────────────────────────
+# _sip_available: set False on first SIP subscription error so subsequent
+# calls skip the doomed SIP request entirely (saves one failed HTTP call
+# per symbol per cycle).
+_sip_available: bool = True
+# _last_feed_used: records which feed succeeded per symbol in this cycle.
+# Cleared by clear_bar_cache() at the start of each scan cycle.
+_last_feed_used: Dict[str, str] = {}
+
 # ── Dead ticker suppression (disabled — all tickers eligible) ─────────────────
 _DEAD_TICKER_THRESHOLD = 999_999
 _dead_ticker_hits: Dict[str, int] = {}
@@ -68,9 +77,19 @@ def is_dead_ticker(symbol: str) -> bool:
 
 def clear_bar_cache() -> None:
     """Flush the per-cycle bar cache. Call once at the start of each scan cycle."""
-    global _bar_cache
+    global _bar_cache, _last_feed_used
     with _bar_cache_lock:
         _bar_cache = {}
+        _last_feed_used = {}
+
+
+def get_feed_used(symbol: str) -> str:
+    """Return the data feed used for the last bar fetch of *symbol* this cycle.
+
+    Returns 'sip' or 'iex'. Defaults to 'iex' when unknown (conservative —
+    IEX-adjusted thresholds are applied if the feed is uncertain).
+    """
+    return _last_feed_used.get(symbol.strip().upper(), "iex")
 
 
 # ── Alpaca client singletons ──────────────────────────────────────────────────
@@ -138,23 +157,40 @@ def _get_bars_alpaca(symbol: str, period: str, interval: str, log) -> pd.DataFra
     start_iso = start_dt.astimezone(pytz.UTC).isoformat().replace("+00:00", "Z")
     end_iso   = end_dt.astimezone(pytz.UTC).isoformat().replace("+00:00", "Z")
 
-    global _last_alpaca_bar_ts
+    global _last_alpaca_bar_ts, _sip_available
     elapsed = time.time() - _last_alpaca_bar_ts
     if elapsed < _ALPACA_MIN_INTERVAL:
         time.sleep(_ALPACA_MIN_INTERVAL - elapsed)
 
-    # Use 'sip' feed if available (paid plan), else fallback to 'iex'
-    try:
-        bars = client.get_stock_bars(StockBarsRequest(
-            symbol_or_symbols=symbol,
-            timeframe=tf,
-            start=start_iso,
-            end=end_iso,
-            feed="sip",
-        ))
-    except Exception as e:
-        # Suppress SIP feed failure log noise (use debug level)
-        log.debug(f"{symbol}: Alpaca SIP feed failed ({e}), retrying with IEX feed.")
+    # Use SIP feed if subscription allows, otherwise IEX.
+    # Once a subscription error is detected, _sip_available is latched False
+    # for the remainder of the session to skip the wasted SIP request.
+    feed_used = "iex"
+    if _sip_available:
+        try:
+            bars = client.get_stock_bars(StockBarsRequest(
+                symbol_or_symbols=symbol,
+                timeframe=tf,
+                start=start_iso,
+                end=end_iso,
+                feed="sip",
+            ))
+            feed_used = "sip"
+        except Exception as e:
+            err_str = str(e)
+            if "subscription does not permit" in err_str:
+                _sip_available = False
+                log.warning("[FEED] SIP data subscription unavailable — switching to IEX feed for all symbols this session")
+            else:
+                log.debug(f"{symbol}: Alpaca SIP feed failed ({e}), retrying with IEX feed.")
+            bars = client.get_stock_bars(StockBarsRequest(
+                symbol_or_symbols=symbol,
+                timeframe=tf,
+                start=start_iso,
+                end=end_iso,
+                feed="iex",
+            ))
+    else:
         bars = client.get_stock_bars(StockBarsRequest(
             symbol_or_symbols=symbol,
             timeframe=tf,
@@ -163,6 +199,7 @@ def _get_bars_alpaca(symbol: str, period: str, interval: str, log) -> pd.DataFra
             feed="iex",
         ))
     _last_alpaca_bar_ts = time.time()
+    _last_feed_used[symbol] = feed_used
     if symbol in bars:
         data = _normalize_df(bars[symbol].df.reset_index())
         if not data.empty and "time" in data.columns:
