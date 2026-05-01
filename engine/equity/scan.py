@@ -62,7 +62,7 @@ from engine.utils.bars import get_data_client as _get_data_client, get_feed_used
 # IEX (free) feed captures roughly 50% of consolidated volume vs SIP.
 # When IEX data is used, scale RVOL and dollar-vol thresholds down by this
 # factor so genuine movers are not incorrectly filtered out.
-_IEX_THRESHOLD_SCALE = 0.50
+_IEX_THRESHOLD_SCALE = 0.15
 from alpaca.data import StockSnapshotRequest as _StockSnapshotRequest
 from .universe import get_tier as _get_tier_live, get_latest_batch as _get_latest_batch, get_ti_primary as _get_ti_primary
 from .discovery import get_priority_scan_queue as _get_priority_scan_queue
