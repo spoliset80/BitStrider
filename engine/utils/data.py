@@ -130,76 +130,83 @@ def filter_trending_momentum(
 
 
 def get_finnhub_trending_tickers() -> List[str]:
-    """Return trending tickers from Seeking Alpha (primary) or yfinance (fallback).
+    """Return trending tickers from Seeking Alpha. SA-only — no fallback.
 
-    Seeking Alpha `/news/v2/list-trending` is queried first.  When SA is
-    unavailable or returns nothing, a lightweight yfinance sector-mover scan
-    is used as the fallback.  The function never raises.
+    Uses SA `/news/v2/list-trending`. Returns [] when SA is unreachable or
+    the circuit breaker is open.  The function never raises.
     """
     log = logging.getLogger("ApexTrader")
-
-    # ── Primary: Seeking Alpha trending ──────────────────────────────────────
     try:
         from engine.data.seeking_alpha import get_sa_trending_tickers
         tickers = get_sa_trending_tickers(size=40)
         if tickers:
             log.debug(f"[SA] Trending via Seeking Alpha: {len(tickers)} tickers")
-            return tickers
+        return tickers
     except Exception as e:
         log.debug(f"[SA] get_sa_trending_tickers failed: {e}")
-
-    # ── Fallback: yfinance most-active screener ───────────────────────────────
-    try:
-        import yfinance as _yf
-        screener = _yf.screen("most_actives", count=20)
-        symbols = [q.get("symbol", "") for q in screener.get("quotes", [])
-                   if q.get("symbol", "").isalpha() and len(q.get("symbol", "")) <= 5]
-        if symbols:
-            log.debug(f"[SA-fb] yfinance most_actives fallback: {len(symbols)} tickers")
-            return symbols
-    except Exception as e:
-        log.debug(f"[SA-fb] yfinance screener fallback failed: {e}")
-
-    return []
+        return []
 
 
 def check_sentiment_gate(ticker: str) -> Tuple[bool, float]:
-    """Return (passes_gate, bullish_pct) for *ticker*.
+    """Return (passes_gate, bullish_pct) for *ticker*. SA-only — no fallback.
 
     Resolution order:
       1. Seeking Alpha quant rating  — most authoritative (analyst consensus).
       2. Seeking Alpha news headlines — when SA key present but rating missing.
-      3. yfinance recommendations    — SA unavailable / key absent.
-      4. Allow-by-default (True, 0.5) — complete failure so no trade is blocked
-         by a data outage.
+      3. Allow-by-default (True, 0.5) — SA unreachable / circuit breaker open,
+         so no trade is blocked by a data outage.
     """
-    from engine.config import SENTIMENT_BULLISH_THRESHOLD
     log = logging.getLogger("ApexTrader")
 
     # ── 1 & 2: Seeking Alpha ─────────────────────────────────────────────────
     try:
         from engine.data.seeking_alpha import sa_sentiment_gate
-        from engine.config import SEEKING_ALPHA_API_KEY
-        if SEEKING_ALPHA_API_KEY:
-            passes, bpct = sa_sentiment_gate(ticker)
-            log.debug(f"[SA] check_sentiment_gate({ticker}): passes={passes} pct={bpct:.2f}")
-            return passes, bpct
+        passes, bpct = sa_sentiment_gate(ticker)
+        log.debug(f"[SA] check_sentiment_gate({ticker}): passes={passes} pct={bpct:.2f}")
+        return passes, bpct
     except Exception as e:
         log.debug(f"[SA] sentiment gate failed for {ticker}: {e}")
 
-    # ── 3: yfinance analyst recommendations ─────────────────────────────────
-    try:
-        import yfinance as _yf
-        info = _yf.Ticker(ticker).info
-        rec = str(info.get("recommendationKey", "")).lower()
-        if rec in ("strong_buy", "buy"):
-            return True, 0.80
-        if rec in ("hold", ""):
-            return True, 0.50   # hold = allow, neutral confidence
-        if rec in ("underperform", "sell", "strong_sell"):
-            return False, 0.20
-    except Exception as e:
-        log.debug(f"[SENTIMENT-fb] yfinance fallback failed for {ticker}: {e}")
-
-    # ── 4: allow by default ───────────────────────────────────────────────────
+    # ── 3: allow by default (SA unavailable) ─────────────────────────────────
     return True, 0.5
+
+
+def get_sa_market_movers() -> dict:
+    """Return SA v2 day-watch market movers.
+
+    Keys: top_gainers, top_losers, most_active, sp500_gainers, sp500_losers,
+          cap400_gainers, cap400_losers  (each a List[str] of tickers).
+    Returns {} on failure.
+    """
+    try:
+        from engine.data.seeking_alpha import get_sa_day_watch
+        return get_sa_day_watch()
+    except Exception:
+        return {}
+
+
+def get_sa_factor_grades(ticker: str) -> Optional[dict]:
+    """Return SA v2 factor grades for *ticker*.
+
+    Keys: momentum_category, growth_category, eps_revisions_category,
+          profitability_category, value_category  (scale ~1–12, higher = stronger).
+    Returns None on failure.
+    """
+    try:
+        from engine.data.seeking_alpha import get_sa_metrics_grades
+        return get_sa_metrics_grades(ticker)
+    except Exception:
+        return None
+
+
+def get_sa_market_outlook() -> dict:
+    """Return SA v2 market outlook parsed sentiment.
+
+    Keys: bullish_pct, bearish_pct, sentiment ("bullish"|"bearish"|"neutral"), titles.
+    Returns {} on failure.
+    """
+    try:
+        from engine.data.seeking_alpha import get_sa_market_outlook as _impl
+        return _impl()
+    except Exception:
+        return {}

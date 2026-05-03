@@ -36,6 +36,7 @@ from .utils import (
     setup_logging,
     MarketState,
     get_finnhub_trending_tickers,
+    get_market_sentiment,
     get_market_hours_interval,
     get_position_tuning_interval,
     get_vix_interval,
@@ -94,6 +95,8 @@ def _build_context() -> AppContext:
     crypto = None
     if cfg.CRYPTO_ENABLED:
         crypto = CryptoTrader(client, api_key=cfg.API_KEY, api_secret=cfg.API_SECRET)
+        # Prune CRYPTO_UNIVERSE to pairs Alpaca currently marks as tradeable
+        cfg.CRYPTO_UNIVERSE = crypto.fetch_tradeable_universe(cfg.CRYPTO_UNIVERSE)
         log.info(
             f"Crypto trading ENABLED — universe: {cfg.CRYPTO_UNIVERSE} "
             f"| pos_pct={cfg.CRYPTO_POSITION_PCT}% | TP={cfg.CRYPTO_TP_PCT}% | SL={cfg.CRYPTO_SL_PCT}%"
@@ -503,11 +506,18 @@ def scan_and_trade(ctx: AppContext) -> None:
     ctx.market_state = MarketState.from_now()
     ctx.market_state.resolve_regime()
 
-    # ── Weekend: crypto-only, skip all equity / options logic ────────────────
-    if not ctx.market_state.weekday:
+    # ── Weekend / FORCE_CRYPTO: crypto-only, skip all equity / options logic ──
+    _is_weekend = not ctx.market_state.weekday
+    if _is_weekend or cfg.FORCE_CRYPTO:
         if cfg.CRYPTO_ENABLED:
-            log.info("[SYSTEM] Weekend — running CRYPTO-ONLY cycle (equity/options suspended)")
+            if cfg.FORCE_CRYPTO and not _is_weekend:
+                log.info("[SYSTEM] FORCE_CRYPTO=true — running crypto cycle on weekday")
+            else:
+                log.info("[SYSTEM] Weekend — running CRYPTO-ONLY cycle (equity/options suspended)")
             _run_crypto_cycle(ctx)
+            if _is_weekend:
+                return  # weekends: stop here, no equity
+            # weekday FORCE_CRYPTO: fall through to equity/options below
         else:
             log.info("[SYSTEM] Weekend — equity market closed, CRYPTO_ENABLED=false, nothing to do")
         return
@@ -540,6 +550,28 @@ def scan_and_trade(ctx: AppContext) -> None:
     _session.check_quarterly(ctx.client, cfg.USE_QUARTERLY_TARGET, cfg.QUARTERLY_PROFIT_TARGET_PCT)
 
     sentiment = market_state.resolve_sentiment()
+
+    # ── SA v2: blend market_outlook into sentiment ────────────────────────────
+    # If SA outlook strongly disagrees with local sentiment, prefer SA (more data).
+    # If SA is unavailable the local sentiment is unchanged.
+    try:
+        from engine.data.seeking_alpha import get_sa_market_outlook
+        sa_outlook = get_sa_market_outlook()
+        if sa_outlook:
+            sa_sent = sa_outlook.get("sentiment", "neutral")
+            bull_pct = sa_outlook.get("bullish_pct", 0.5)
+            # Only override when SA is confident (>65%) and disagrees
+            if bull_pct >= 0.65 and sentiment != "bullish":
+                sentiment = "bullish"
+                log.info(f"[SA2] Sentiment overridden → bullish (SA outlook {bull_pct:.0%} bull)")
+            elif bull_pct <= 0.35 and sentiment != "bearish":
+                sentiment = "bearish"
+                log.info(f"[SA2] Sentiment overridden → bearish (SA outlook {bull_pct:.0%} bull)")
+            else:
+                log.info(f"[SA2] Market outlook: {sa_sent} ({bull_pct:.0%} bull) — local={sentiment}")
+    except Exception:
+        pass
+
     log.info(f"[SCAN] Market sentiment: {sentiment}")
 
     ctx.executor.update_stale_orders()

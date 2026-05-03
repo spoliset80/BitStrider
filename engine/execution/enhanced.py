@@ -852,6 +852,11 @@ class EnhancedExecutor:
             if re.match(r'^[A-Z]+\d{6}[CP]\d{8}$', sym):
                 continue
 
+            # Skip crypto positions — Alpaca does not support TRAILING_STOP for crypto
+            # (error 40010001). Crypto risk is managed by CryptoTrader's own SL logic.
+            if getattr(pos, 'asset_class', '') == 'crypto':
+                continue
+
             # Primary guard: don't add orders if symbol already has any active order
             if sym in covered:
                 continue

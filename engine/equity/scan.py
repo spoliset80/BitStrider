@@ -472,6 +472,24 @@ def get_scan_targets(excluded: Set[str] = None) -> List[str]:
         if len(targets) < SCAN_MAX_SYMBOLS:
             _push(p1_slice + p2_slice, limit=SCAN_MAX_SYMBOLS)
 
+    # ── SA v2: inject day-watch movers + leading stories as scan targets ──────
+    # These are market-wide high-conviction movers SA tracks in real-time.
+    # Added last so they fill any remaining capacity without displacing TI/priority tickers.
+    if len(targets) < SCAN_MAX_SYMBOLS:
+        try:
+            from engine.data.seeking_alpha import get_sa_day_watch, get_sa_leading_story
+            dw = get_sa_day_watch()
+            if dw:
+                sa_tickers = (
+                    dw.get("top_gainers", [])[:8]
+                    + dw.get("sp500_gainers", [])[:5]
+                    + dw.get("most_active", [])[:5]
+                    + get_sa_leading_story()[:3]
+                )
+                _push(sa_tickers, limit=SCAN_MAX_SYMBOLS)
+        except Exception:
+            pass
+
     return targets
 
 

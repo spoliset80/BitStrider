@@ -722,6 +722,28 @@ class MomentumCallStrategy:
             conf += min(0.04, (rr - f["MIN_RR"]) * 0.02)
             if ctx.spot > prior_5d_high:
                 conf += 0.03   # genuine breakout bonus
+
+            # SA v2 metrics-grades momentum boost (up to +0.05)
+            try:
+                from engine.data.seeking_alpha import get_sa_metrics_grades
+                grades = get_sa_metrics_grades(symbol)
+                if grades:
+                    mom  = grades.get("momentum_category", 0)
+                    epsr = grades.get("eps_revisions_category", 0)
+                    # momentum_category scale ~1-12; >=8 is strong
+                    if mom >= 8:
+                        conf += 0.03
+                    elif mom >= 6:
+                        conf += 0.015
+                    # positive EPS revisions confirm bullish thesis
+                    if epsr >= 8:
+                        conf += 0.02
+                    elif epsr >= 6:
+                        conf += 0.01
+                    log.debug(f"[SA2] {symbol} grades boost: mom={mom} epsr={epsr} conf_adj={conf:.3f}")
+            except Exception:
+                pass
+
             confidence = round(min(0.97, conf), 3)
 
             return OptionSignal(
@@ -895,6 +917,21 @@ class BearPutStrategy:
                 conf += 0.04
             if ctx.spot < prior_5d_low:
                 conf += 0.03
+            # SA v2 metrics-grades: bearish setup confirmed by low value/growth grades
+            try:
+                from engine.data.seeking_alpha import get_sa_metrics_grades
+                grades = get_sa_metrics_grades(symbol)
+                if grades:
+                    val  = grades.get("value_category",  0)
+                    grw  = grades.get("growth_category", 0)
+                    mom  = grades.get("momentum_category", 0)
+                    if val <= 3:   conf += 0.04   # deeply over-valued
+                    elif val <= 5: conf += 0.02
+                    if grw <= 3:   conf += 0.03   # deteriorating growth
+                    elif grw <= 5: conf += 0.015
+                    if mom <= 4:   conf += 0.02   # weak momentum — breakdown confirmation
+            except Exception:
+                pass
             confidence = round(min(0.97, conf), 3)
 
             return OptionSignal(
@@ -1368,13 +1405,12 @@ def _fetch_squeeze_fundamentals(symbol: str) -> Optional[Dict]:
 
 
 def _fetch_squeeze_rs(symbol: str) -> Optional[float]:
-    """Fetch 13-week price return relative to S&P 500 (daily-cached).
+    """Fetch relative strength proxy from Seeking Alpha quant rating (daily-cached).
 
-    Resolution order:
-      1. yfinance   — compute 13-week cumulative return of *symbol* vs SPY.
-      2. SA quant   — treat rating >= 3.5 as positive RS proxy (+10) when
-                      price history is unavailable.
-      3. Finnhub    — legacy fallback (requires FINNHUB_API_KEY).
+    SA quant rating [1,5] is mapped to an RS proxy score [-20, +20]:
+      5 (StrongBuy) → +20   3 (Hold) → 0   1 (StrongSell) → -20
+
+    Returns None when SA is unreachable or the circuit breaker is open.
     """
     today = datetime.date.today()
     if symbol in _squeeze_rs_cache:
@@ -1382,70 +1418,19 @@ def _fetch_squeeze_rs(symbol: str) -> Optional[float]:
         if cached_date == today:
             return rs
 
-    # ── 1. yfinance 13-week relative return ───────────────────────────────────
-    try:
-        import yfinance as _yf
-        import pandas as _pd
-
-        prices = _yf.download(
-            [symbol, "SPY"],
-            period="4mo",      # fetch extra buffer so we always have 13 weeks
-            progress=False,
-            auto_adjust=True,
-        )["Close"]
-
-        if isinstance(prices, _pd.Series):
-            # single-ticker return from download — shouldn't happen but guard it
-            raise ValueError("expected multi-ticker frame")
-
-        sym_col = symbol.upper()
-        if sym_col not in prices.columns or "SPY" not in prices.columns:
-            raise ValueError(f"missing columns: {list(prices.columns)}")
-
-        # keep last 65 trading days ≈ 13 calendar weeks
-        prices = prices.dropna().iloc[-65:]
-        if len(prices) < 10:
-            raise ValueError("insufficient price history")
-
-        sym_ret = (prices[sym_col].iloc[-1] / prices[sym_col].iloc[0] - 1) * 100
-        spy_ret = (prices["SPY"].iloc[-1]    / prices["SPY"].iloc[0]    - 1) * 100
-        rs = float(sym_ret - spy_ret)
-        _squeeze_rs_cache[symbol] = (today, rs)
-        return rs
-    except Exception as _e:
-        import logging as _log
-        _log.getLogger("ApexTrader").debug(f"[RS] yfinance fallback failed for {symbol}: {_e}")
-
-    # ── 2. SA quant rating as RS proxy ────────────────────────────────────────
     try:
         from engine.data.seeking_alpha import get_sa_quant_rating
+        import logging as _log
         rating = get_sa_quant_rating(symbol)
         if rating is not None:
             # map rating [1,5] → RS proxy [-20, +20]
             rs = (rating - 3.0) * 10.0
             _squeeze_rs_cache[symbol] = (today, rs)
+            _log.getLogger("ApexTrader").debug(f"[RS] {symbol} SA quant→RS: rating={rating:.2f} rs={rs:.1f}")
             return rs
-    except Exception:
-        pass
-
-    # ── 3. Finnhub legacy fallback ────────────────────────────────────────────
-    try:
-        from engine.config import FINNHUB_API_KEY
-        if FINNHUB_API_KEY:
-            import requests as _req
-            r = _req.get(
-                "https://finnhub.io/api/v1/stock/metric",
-                params={"symbol": symbol, "metric": "all", "token": FINNHUB_API_KEY},
-                timeout=5,
-            )
-            metric = r.json().get("metric", {})
-            rs = metric.get("priceRelativeToS&P50013Week")
-            if rs is not None:
-                rs = float(rs)
-                _squeeze_rs_cache[symbol] = (today, rs)
-                return rs
-    except Exception:
-        pass
+    except Exception as _e:
+        import logging as _log
+        _log.getLogger("ApexTrader").debug(f"[RS] SA quant rating failed for {symbol}: {_e}")
 
     return None
 

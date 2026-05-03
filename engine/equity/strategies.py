@@ -65,6 +65,32 @@ def _calc_atr14(bars: pd.DataFrame, period: int = 14) -> float:
 from engine.utils.market import _is_bull_regime  # canonical regime function — shared across all strategy modules
 
 
+# ── SA Metrics Boost ──────────────────────────────────────────────────────────
+# Shared helper: apply SA v2 metrics-grades confidence boost to any buy signal.
+# max_boost caps total addition to avoid over-weighting SA on noisy data.
+def _sa_metrics_boost(symbol: str, confidence: float, max_boost: float = 0.08) -> float:
+    """Return confidence + SA metrics-grades boost (capped at max_boost)."""
+    try:
+        from engine.data.seeking_alpha import get_sa_metrics_grades
+        grades = get_sa_metrics_grades(symbol)
+        if not grades:
+            return confidence
+        boost = 0.0
+        mom  = grades.get("momentum_category",      0)
+        epsr = grades.get("eps_revisions_category", 0)
+        prof = grades.get("profitability_category", 0)
+        grw  = grades.get("growth_category",        0)
+        if mom  >= 8:  boost += 0.03
+        elif mom >= 6: boost += 0.015
+        if epsr >= 8:  boost += 0.02
+        elif epsr >= 6: boost += 0.01
+        if prof >= 8:  boost += 0.015
+        if grw  >= 8:  boost += 0.015
+        return min(confidence + min(boost, max_boost), 0.97)
+    except Exception:
+        return confidence
+
+
 # ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 # Sweepea Strategy
 # ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
@@ -113,6 +139,7 @@ class SweepeaStrategy:
                             is_htf   = True
                             htf_note = f" | HTF +{gain_4w_pct:.0f}% / 4w"
                     conf = 0.88 if is_htf else 0.82
+                    conf = _sa_metrics_boost(symbol, conf)
                     return Signal(
                         symbol, "buy", float(cur["close"]), conf,
                         f"Daily Sweepea pullback to {ema_lbl}{htf_note} | ATR ${atr14:.2f}",
@@ -216,6 +243,7 @@ class SweepeaStrategy:
 
         _is_inv = symbol in _INVERSE_ETFS
         if bull_pin and (_is_bull_regime() or _is_inv):
+            bull_conf = _sa_metrics_boost(symbol, bull_conf)
             return Signal(symbol, "buy",  float(cur["close"]), bull_conf,
                           f"Liquidity sweep + bullish pinbar | wick {lower_wick_ratio:.0f}% | vol x{vol_ratio:.1f}", "Sweepea")
         # Shorts are globally disabled
@@ -301,6 +329,7 @@ class TrendBreakerStrategy:
         confidence = 0.78 + min((vol_ratio - 3.0) * 0.025, 0.12)
         if is_high_short_float(symbol):
             confidence = min(confidence + 0.07, 0.95)
+        confidence = _sa_metrics_boost(symbol, confidence)
 
         return Signal(
             symbol, "buy", price, round(confidence, 2),
@@ -334,6 +363,7 @@ class SentimentStrategy:
 
         if market_sentiment == "bullish":
             if price > sma20:
+                confidence = _sa_metrics_boost(symbol, confidence)
                 return Signal(
                     symbol, "buy", price, confidence,
                     f"Sentiment bullish + vol x{vol_ratio:.2f} + price>20SMA", "Sentiment",
@@ -447,6 +477,8 @@ class TechnicalStrategy:
         buy_threshold = 0.38 if is_inverse else 0.50
         if score >= buy_threshold:
             conf = max(score, 0.73) if is_inverse else score
+            if not is_inverse:
+                conf = _sa_metrics_boost(symbol, conf)
             return Signal(symbol, "buy", price, conf, ", ".join(reasons), "Technical",
                           atr_stop=_atr14 * ATR_STOP_MULTIPLIER if _atr14 > 0 else None)
         elif not LONG_ONLY_MODE and score <= -0.45:
@@ -503,6 +535,7 @@ class MomentumStrategy:
                 and vol_ratio >= MOMENTUM["volume_surge"]
                 and price > sma20):
             confidence = min(0.73 + (momentum / 100), 0.95)
+            confidence = _sa_metrics_boost(symbol, confidence)
             return Signal(symbol, "buy", price, confidence,
                           f"Strong momentum ({momentum:.1f}%) + volume x{vol_ratio:.1f} + above SMA20", "Momentum")
 
@@ -575,6 +608,7 @@ class GapBreakoutStrategy:
 
         atr14 = _calc_atr14(daily)
         confidence = min(0.73 + (gap_pct / 100), 0.95)
+        confidence = _sa_metrics_boost(symbol, confidence)
         return Signal(
             symbol, "buy", price, confidence,
             f"Gap up {gap_pct:.1f}% from ${prior_close:.2f} | volume x{vol_ratio:.1f}",

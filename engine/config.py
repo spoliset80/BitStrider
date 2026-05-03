@@ -431,12 +431,28 @@ PREOPEN_USE_SENTIMENT_GATING = os.getenv("PREOPEN_USE_SENTIMENT_GATING", "true")
 # When enabled the bot runs crypto-only on Saturday + Sunday and skips
 # all equity / options logic for those two days.
 CRYPTO_ENABLED          = os.getenv("CRYPTO_ENABLED", "true").lower() in ("1", "true", "yes")
+# Force crypto to run on weekdays too (for testing). Set FORCE_CRYPTO=true in .env.
+FORCE_CRYPTO            = os.getenv("FORCE_CRYPTO", "false").lower() in ("1", "true", "yes")
 
 # Universe: Alpaca crypto pairs (slash format: "BTC/USD")
+# Full Alpaca-supported list (stablecoins USDC/USDT/USDG excluded — no signal value)
 CRYPTO_UNIVERSE: list = [
     p.strip() for p in os.getenv(
         "CRYPTO_UNIVERSE",
-        "BTC/USD,ETH/USD,SOL/USD,AVAX/USD,LINK/USD,DOGE/USD,XRP/USD,LTC/USD,BCH/USD",
+        # ── Majors ──────────────────────────────────────────────
+        "BTC/USD,ETH/USD,"
+        # ── Layer-1 Ecosystems ───────────────────────────────────
+        "SOL/USD,ADA/USD,AVAX/USD,DOT/USD,LINK/USD,LTC/USD,BCH/USD,XTZ/USD,XRP/USD,POL/USD,"
+        # ── DeFi Infrastructure ──────────────────────────────────
+        "RENDER/USD,FIL/USD,GRT/USD,ARB/USD,LDO/USD,"
+        # ── DeFi / DEX tokens ────────────────────────────────────
+        "AAVE/USD,UNI/USD,SUSHI/USD,YFI/USD,CRV/USD,ONDO/USD,HYPE/USD,SKY/USD,"
+        # ── Engagement ───────────────────────────────────────────
+        "BAT/USD,"
+        # ── Gold-backed ──────────────────────────────────────────
+        "PAXG/USD,"
+        # ── Community / Meme ─────────────────────────────────────
+        "DOGE/USD,SHIB/USD,BONK/USD,PEPE/USD,WIF/USD,TRUMP/USD",
     ).split(",") if p.strip()
 ]
 

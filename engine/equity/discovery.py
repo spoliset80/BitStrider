@@ -185,6 +185,11 @@ class PreopenIntelligenceScanner:
                 apply=self._provider_premarket,
                 description="Pre-market gap and volume scoring for overnight churn",
             ),
+            PreopenSignalProvider(
+                name="sa_day_watch",
+                apply=self._provider_sa_day_watch,
+                description="SA v2 day-watch market movers and leading stories",
+            ),
         ]
 
     def _run_providers(
@@ -388,6 +393,48 @@ class PreopenIntelligenceScanner:
         if added:
             log.info(f"[PREOPEN] Injected {len(added)} pre-open watchlist tickers into priority queue")
 
+    def _provider_sa_day_watch(
+        self,
+        scores: dict[str, dict],
+        market_state: MarketState,
+        priority_1: list,
+        priority_2: list,
+        max_watchlist: int,
+        provider: PreopenSignalProvider,
+    ) -> None:
+        try:
+            from engine.data.seeking_alpha import get_sa_day_watch, get_sa_leading_story, get_sa_market_outlook
+            dw = get_sa_day_watch()
+            if not dw:
+                return
+
+            # Boost weight in bull regime; reduce slightly in bear
+            regime_mult = 1.1 if getattr(market_state, "regime", "bull") == "bull" else 0.8
+
+            for sym in dw.get("top_gainers", [])[:10]:
+                self._add_candidate(scores, sym, 1.3 * provider.weight * regime_mult,
+                                    "SA-top-gainer", provider_name=provider.name)
+            for sym in dw.get("sp500_gainers", [])[:8]:
+                self._add_candidate(scores, sym, 1.1 * provider.weight * regime_mult,
+                                    "SA-sp500-gainer", provider_name=provider.name)
+            for sym in dw.get("most_active", [])[:8]:
+                self._add_candidate(scores, sym, 0.9 * provider.weight * regime_mult,
+                                    "SA-most-active", provider_name=provider.name)
+
+            for sym in get_sa_leading_story()[:5]:
+                self._add_candidate(scores, sym, 1.0 * provider.weight * regime_mult,
+                                    "SA-leading-story", provider_name=provider.name)
+
+            # Market outlook: log for visibility; also reduces weight of all SA signals in bear
+            outlook = get_sa_market_outlook()
+            if outlook:
+                log.info(
+                    f"[PREOPEN][SA2] market_outlook={outlook.get('sentiment','?')} "
+                    f"bull={outlook.get('bullish_pct',0):.0%}"
+                )
+        except Exception as _e:
+            log.debug(f"[PREOPEN] sa_day_watch provider error: {_e}")
+
     def _log_watchlist_summary(self, market_state: MarketState) -> None:
         sentiment_label = "bull" if market_state.resolve_sentiment() == "bull" else "bear"
         if not self.watchlist:
@@ -495,6 +542,26 @@ def scan_trending_stocks(
             tickers = get_finnhub_trending_tickers()
             if tickers:
                 all_tickers.extend(tickers)
+
+        # ── SA v2: day-watch market movers + leading stories ─────────────────
+        try:
+            from engine.data.seeking_alpha import get_sa_day_watch, get_sa_leading_story
+            dw = get_sa_day_watch()
+            if dw:
+                # most_active and S&P 500 gainers are the most actionable
+                for key in ("most_active", "sp500_gainers", "top_gainers"):
+                    all_tickers.extend(dw.get(key, []))
+                log.debug(
+                    f"[SA2] day_watch injected: most_active={len(dw.get('most_active',[]))}"
+                    f" sp500_gainers={len(dw.get('sp500_gainers',[]))}"
+                    f" top_gainers={len(dw.get('top_gainers',[]))}"
+                )
+            story_tickers = get_sa_leading_story()
+            if story_tickers:
+                all_tickers.extend(story_tickers)
+                log.debug(f"[SA2] leading_story injected: {len(story_tickers)} tickers")
+        except Exception as _sa2_e:
+            log.debug(f"[SA2] day_watch/leading_story error: {_sa2_e}")
 
         unique = list(set(all_tickers))
 

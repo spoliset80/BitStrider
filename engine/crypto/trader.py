@@ -140,6 +140,38 @@ class CryptoTrader:
         # Lazily cached data client (avoids constructing a new one every price fetch)
         self._data_client = None
 
+    # ── Dynamic universe discovery ────────────────────────────────────────────
+
+    def fetch_tradeable_universe(self, configured: List[str]) -> List[str]:
+        """Query Alpaca for all currently tradeable crypto assets and intersect
+        with *configured* (CRYPTO_UNIVERSE).  Returns *configured* unchanged if
+        the API call fails so the bot always has a usable universe.
+
+        Symbols returned by Alpaca use the slash-free form ('BTCUSD'); we
+        normalise to 'BTC/USD' via _normalize_symbol before intersecting.
+        """
+        try:
+            from alpaca.trading.requests import GetAssetsRequest
+            from alpaca.trading.enums import AssetClass
+
+            req = GetAssetsRequest(asset_class=AssetClass.CRYPTO)
+            assets = self._client.get_all_assets(req)
+            tradeable = {
+                _normalize_symbol(a.symbol)
+                for a in assets
+                if a.tradable
+            }
+            # Keep only pairs that are both configured AND live on Alpaca
+            result = [s for s in configured if s in tradeable]
+            removed = [s for s in configured if s not in tradeable]
+            if removed:
+                log.warning(f"[CRYPTO] Removed non-tradeable pairs: {removed}")
+            log.info(f"[CRYPTO] Tradeable universe ({len(result)}): {result}")
+            return result if result else configured
+        except Exception as e:
+            log.warning(f"[CRYPTO] fetch_tradeable_universe failed, using config list: {e}")
+            return configured
+
     @staticmethod
     def _alpaca_sym(symbol: str) -> str:
         """Convert 'BTC/USD' → 'BTCUSD' (Alpaca trading API format)."""
@@ -504,11 +536,32 @@ class CryptoTrader:
 
 # Map of Alpaca's slash-free internal symbol names → canonical "BASE/USD" form.
 _CRYPTO_SYM_MAP: dict = {
-    "BTCUSD": "BTC/USD", "ETHUSD": "ETH/USD", "SOLUSD": "SOL/USD",
-    "AVAXUSD": "AVAX/USD", "LINKUSD": "LINK/USD", "MATICUSD": "MATIC/USD",
-    "ADAUSD": "ADA/USD", "DOTUSD": "DOT/USD", "DOGEUSD": "DOGE/USD",
-    "XRPUSD": "XRP/USD", "LTCUSD": "LTC/USD", "BCHUSD": "BCH/USD",
-    "UNIUSD": "UNI/USD", "AAVEUSD": "AAVE/USD",
+    # ── Majors ──────────────────────────────────────────────────
+    "BTCUSD":    "BTC/USD",    "ETHUSD":    "ETH/USD",
+    # ── Layer-1 Ecosystems ───────────────────────────────────────
+    "SOLUSD":    "SOL/USD",    "ADAUSD":    "ADA/USD",
+    "AVAXUSD":   "AVAX/USD",   "DOTUSD":    "DOT/USD",
+    "LINKUSD":   "LINK/USD",   "LTCUSD":    "LTC/USD",
+    "BCHUSD":    "BCH/USD",    "XTZUSD":    "XTZ/USD",
+    "XRPUSD":    "XRP/USD",    "POLUSD":    "POL/USD",
+    "MATICUSD":  "POL/USD",    # legacy alias → POL
+    # ── DeFi Infrastructure ──────────────────────────────────────
+    "RENDERUSD": "RENDER/USD", "FILUSD":    "FIL/USD",
+    "GRTUSD":    "GRT/USD",    "ARBUSD":    "ARB/USD",
+    "LDOUSD":    "LDO/USD",
+    # ── DeFi / DEX tokens ────────────────────────────────────────
+    "AAVEUSD":   "AAVE/USD",   "UNIUSD":    "UNI/USD",
+    "SUSHIUSD":  "SUSHI/USD",  "YFIUSD":    "YFI/USD",
+    "CRVUSD":    "CRV/USD",    "ONDOUSD":   "ONDO/USD",
+    "HYPEUSD":   "HYPE/USD",   "SKYUSD":    "SKY/USD",
+    # ── Engagement ───────────────────────────────────────────────
+    "BATUSD":    "BAT/USD",
+    # ── Gold-backed ──────────────────────────────────────────────
+    "PAXGUSD":   "PAXG/USD",
+    # ── Community / Meme ─────────────────────────────────────────
+    "DOGEUSD":   "DOGE/USD",   "SHIBUSD":   "SHIB/USD",
+    "BONKUSD":   "BONK/USD",   "PEPEUSD":   "PEPE/USD",
+    "WIFUSD":    "WIF/USD",    "TRUMPUSD":  "TRUMP/USD",
 }
 
 

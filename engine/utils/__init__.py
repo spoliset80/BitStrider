@@ -62,6 +62,9 @@ from engine.utils.data import (
     filter_trending_momentum,
     get_finnhub_trending_tickers,
     check_sentiment_gate,
+    get_sa_market_movers,
+    get_sa_factor_grades,
+    get_sa_market_outlook,
 )
 
 __all__ = [
@@ -80,4 +83,5 @@ __all__ = [
     "setup_logging", "get_finnhub_client",
     "get_trending_tickers", "filter_trending_momentum",
     "get_finnhub_trending_tickers", "check_sentiment_gate",
+    "get_sa_market_movers", "get_sa_factor_grades", "get_sa_market_outlook",
 ]
