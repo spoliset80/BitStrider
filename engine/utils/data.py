@@ -91,7 +91,17 @@ def get_finnhub_client():
 # ── Trending discovery ────────────────────────────────────────────────────────
 
 def get_trending_tickers(max_results: int = 20) -> List[str]:
-    """Trending ticker discovery. Returns empty list — external screener removed."""
+    """Return trending tickers from Seeking Alpha (primary) or yfinance.
+
+    This is the fallback used by equity discovery when live trending is enabled.
+    The function never raises and returns at most *max_results* symbols.
+    """
+    try:
+        tickers = get_finnhub_trending_tickers()
+        if tickers:
+            return tickers[:max_results]
+    except Exception:
+        pass
     return []
 
 
@@ -120,73 +130,76 @@ def filter_trending_momentum(
 
 
 def get_finnhub_trending_tickers() -> List[str]:
-    """Parse Finnhub general news for mentioned ticker symbols."""
-    from engine.config import FINNHUB_API_KEY
+    """Return trending tickers from Seeking Alpha (primary) or yfinance (fallback).
+
+    Seeking Alpha `/news/v2/list-trending` is queried first.  When SA is
+    unavailable or returns nothing, a lightweight yfinance sector-mover scan
+    is used as the fallback.  The function never raises.
+    """
     log = logging.getLogger("ApexTrader")
-    if not FINNHUB_API_KEY:
-        log.warning("FINNHUB_API_KEY not set — skipping Finnhub trending")
-        return []
+
+    # ── Primary: Seeking Alpha trending ──────────────────────────────────────
     try:
-        import requests
-        resp = requests.get(
-            f"https://finnhub.io/api/v1/news?category=general&token={FINNHUB_API_KEY}",
-            timeout=10,
-        )
-        resp.raise_for_status()
-        symbols: set = set()
-        for item in resp.json()[:50]:
-            for s in item.get("related", "").split(","):
-                s = s.strip().upper()
-                if s and s.isalpha() and 1 <= len(s) <= 5:
-                    symbols.add(s)
-        return list(symbols)
+        from engine.data.seeking_alpha import get_sa_trending_tickers
+        tickers = get_sa_trending_tickers(size=40)
+        if tickers:
+            log.debug(f"[SA] Trending via Seeking Alpha: {len(tickers)} tickers")
+            return tickers
     except Exception as e:
-        log.error(f"get_finnhub_trending_tickers failed: {e}")
-        return []
+        log.debug(f"[SA] get_sa_trending_tickers failed: {e}")
+
+    # ── Fallback: yfinance most-active screener ───────────────────────────────
+    try:
+        import yfinance as _yf
+        screener = _yf.screen("most_actives", count=20)
+        symbols = [q.get("symbol", "") for q in screener.get("quotes", [])
+                   if q.get("symbol", "").isalpha() and len(q.get("symbol", "")) <= 5]
+        if symbols:
+            log.debug(f"[SA-fb] yfinance most_actives fallback: {len(symbols)} tickers")
+            return symbols
+    except Exception as e:
+        log.debug(f"[SA-fb] yfinance screener fallback failed: {e}")
+
+    return []
 
 
 def check_sentiment_gate(ticker: str) -> Tuple[bool, float]:
-    """Return (passes_gate, bullish_pct) from Alpaca News headline sentiment.
+    """Return (passes_gate, bullish_pct) for *ticker*.
 
-    Scores the last 10 news headlines for *ticker* using keyword matching.
-    Returns (True, 0.5) when credentials are absent or the call fails —
-    defaulting to allow so a news outage never blocks all trades.
+    Resolution order:
+      1. Seeking Alpha quant rating  — most authoritative (analyst consensus).
+      2. Seeking Alpha news headlines — when SA key present but rating missing.
+      3. yfinance recommendations    — SA unavailable / key absent.
+      4. Allow-by-default (True, 0.5) — complete failure so no trade is blocked
+         by a data outage.
     """
-    from engine import config as _cfg
     from engine.config import SENTIMENT_BULLISH_THRESHOLD
-    if not _cfg.API_KEY or not _cfg.API_SECRET:
-        return True, 0.5
+    log = logging.getLogger("ApexTrader")
+
+    # ── 1 & 2: Seeking Alpha ─────────────────────────────────────────────────
     try:
-        import requests as _req
-        resp = _req.get(
-            "https://data.alpaca.markets/v1beta1/news",
-            params={"symbols": ticker, "limit": 10, "sort": "desc"},
-            headers={
-                "APCA-API-KEY-ID": _cfg.API_KEY,
-                "APCA-API-SECRET-KEY": _cfg.API_SECRET,
-            },
-            timeout=5,
-        )
-        resp.raise_for_status()
-        articles = resp.json().get("news", [])
-        if not articles:
-            return True, 0.5
+        from engine.data.seeking_alpha import sa_sentiment_gate
+        from engine.config import SEEKING_ALPHA_API_KEY
+        if SEEKING_ALPHA_API_KEY:
+            passes, bpct = sa_sentiment_gate(ticker)
+            log.debug(f"[SA] check_sentiment_gate({ticker}): passes={passes} pct={bpct:.2f}")
+            return passes, bpct
+    except Exception as e:
+        log.debug(f"[SA] sentiment gate failed for {ticker}: {e}")
 
-        _BULLISH = {"upgrade", "beat", "surge", "raises", "record", "strong", "buy", "outperform"}
-        _BEARISH = {"downgrade", "miss", "decline", "cut", "weak", "sell", "underperform",
-                    "loss", "warning", "recall"}
-        bullish = bearish = 0
-        for art in articles:
-            headline = art.get("headline", "").lower()
-            if any(w in headline for w in _BULLISH):
-                bullish += 1
-            elif any(w in headline for w in _BEARISH):
-                bearish += 1
+    # ── 3: yfinance analyst recommendations ─────────────────────────────────
+    try:
+        import yfinance as _yf
+        info = _yf.Ticker(ticker).info
+        rec = str(info.get("recommendationKey", "")).lower()
+        if rec in ("strong_buy", "buy"):
+            return True, 0.80
+        if rec in ("hold", ""):
+            return True, 0.50   # hold = allow, neutral confidence
+        if rec in ("underperform", "sell", "strong_sell"):
+            return False, 0.20
+    except Exception as e:
+        log.debug(f"[SENTIMENT-fb] yfinance fallback failed for {ticker}: {e}")
 
-        total = bullish + bearish
-        bullish_pct = bullish / max(total, 1)
-        if total == 0:
-            return True, 0.5
-        return bullish_pct >= SENTIMENT_BULLISH_THRESHOLD, bullish_pct
-    except Exception:
-        return True, 0.5
+    # ── 4: allow by default ───────────────────────────────────────────────────
+    return True, 0.5

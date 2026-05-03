@@ -177,6 +177,11 @@ API_SECRET = os.getenv(f"{_MODE}_ALPACA_API_SECRET", "")
 # SDK picks the correct endpoint automatically via paper=True/False — no URL override needed
 ALPACA_BASE_URL = "https://paper-api.alpaca.markets" if PAPER else "https://api.alpaca.markets"
 
+# Market data feed: "sip" for paid Alpaca subscribers (full consolidated tape),
+# "iex" for free-tier users (IEX exchange only, ~15-50% of consolidated volume).
+# Set ALPACA_DATA_FEED=sip in .env when you have an Alpaca Algo Trader or higher plan.
+ALPACA_DATA_FEED: str = os.getenv("ALPACA_DATA_FEED", "iex").lower()
+
 # Convenience for switching: override per branch by env var if needed.
 MIN_POSITION_DOLLARS = float(os.getenv("MIN_POSITION_DOLLARS", "500"))
 MIN_BUYING_POWER_PCT = float(os.getenv("MIN_BUYING_POWER_PCT", "10.0"))
@@ -374,8 +379,15 @@ USE_FINNHUB_DISCOVERY      = False
 FINNHUB_API_KEY            = os.getenv("FINNHUB_API_KEY", "")
 PRICE_DATA_SOURCE          = os.getenv("PRICE_DATA_SOURCE", "alpaca").strip().lower()
 USE_FINNHUB_HISTORICAL     = PRICE_DATA_SOURCE == "finnhub" or os.getenv("USE_FINNHUB_HISTORICAL", "false").strip().lower() in ("1", "true", "yes")
-USE_SENTIMENT_GATE         = False
 SENTIMENT_BULLISH_THRESHOLD = 0.6
+
+# ── Seeking Alpha Finance API (RapidAPI) ──────────────────────────────────────
+SEEKING_ALPHA_API_KEY = os.getenv("SEEKING_ALPHA_API_KEY", "")
+SEEKING_ALPHA_HOST    = os.getenv("SEEKING_ALPHA_HOST", "seeking-alpha.p.rapidapi.com")
+USE_SEEKING_ALPHA     = bool(SEEKING_ALPHA_API_KEY)
+# Sentiment gate is auto-enabled when a Seeking Alpha key is configured.
+# It can also be force-enabled for yfinance-only fallback via env var.
+USE_SENTIMENT_GATE    = USE_SEEKING_ALPHA or os.getenv("USE_SENTIMENT_GATE", "false").strip().lower() in ("1", "true", "yes")
 
 # Trade Ideas Discovery
 # Scrapes TIPro highshortfloat + marketscope360 with Selenium.
@@ -412,7 +424,39 @@ PREOPEN_INTELLIGENCE_MAX_TICKERS = int(os.getenv("PREOPEN_INTELLIGENCE_MAX_TICKE
 PREOPEN_USE_REGIME_GATING    = os.getenv("PREOPEN_USE_REGIME_GATING", "true").lower() in ("1", "true", "yes")
 PREOPEN_USE_SENTIMENT_GATING = os.getenv("PREOPEN_USE_SENTIMENT_GATING", "true").lower() in ("1", "true", "yes")
 
-# ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+# ─────────────────────────────────────────────────────────────────
+# Crypto Weekend Trader
+# ─────────────────────────────────────────────────────────────────
+# Master switch — set CRYPTO_ENABLED=false in .env to disable entirely.
+# When enabled the bot runs crypto-only on Saturday + Sunday and skips
+# all equity / options logic for those two days.
+CRYPTO_ENABLED          = os.getenv("CRYPTO_ENABLED", "true").lower() in ("1", "true", "yes")
+
+# Universe: Alpaca crypto pairs (slash format: "BTC/USD")
+CRYPTO_UNIVERSE: list = [
+    p.strip() for p in os.getenv(
+        "CRYPTO_UNIVERSE",
+        "BTC/USD,ETH/USD,SOL/USD,AVAX/USD,LINK/USD,DOGE/USD,XRP/USD,LTC/USD,BCH/USD",
+    ).split(",") if p.strip()
+]
+
+# Position sizing
+CRYPTO_POSITION_PCT  = float(os.getenv("CRYPTO_POSITION_PCT",  "20.0"))  # % of buying power per crypto position (no position cap)
+CRYPTO_MIN_NOTIONAL  = float(os.getenv("CRYPTO_MIN_NOTIONAL",  "100.0")) # minimum order in USD
+
+# Exit thresholds
+CRYPTO_TP_PCT        = float(os.getenv("CRYPTO_TP_PCT",  "4.0"))         # take-profit % above entry
+CRYPTO_SL_PCT        = float(os.getenv("CRYPTO_SL_PCT",  "2.5"))         # stop-loss % below entry
+
+# Signal thresholds (RSI-based, 1h bars)
+CRYPTO_RSI_BUY_MIN   = float(os.getenv("CRYPTO_RSI_BUY_MIN",  "42.0"))  # RSI must be above this to buy
+CRYPTO_RSI_BUY_MAX   = float(os.getenv("CRYPTO_RSI_BUY_MAX",  "70.0"))  # RSI must be below this to buy
+CRYPTO_RSI_SELL_MAX  = float(os.getenv("CRYPTO_RSI_SELL_MAX", "52.0"))  # RSI must be below this to close
+
+# Scan interval during weekend (minutes)
+CRYPTO_SCAN_INTERVAL_MIN = int(os.getenv("CRYPTO_SCAN_INTERVAL_MIN", "15"))
+
+# ─────────────────────────────────────────────────────────────────
 # Daily Limits
 # ─────────────────────────────────────────────────────────────────
 POSITION_CHECK_MIN       = 5

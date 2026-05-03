@@ -1368,29 +1368,86 @@ def _fetch_squeeze_fundamentals(symbol: str) -> Optional[Dict]:
 
 
 def _fetch_squeeze_rs(symbol: str) -> Optional[float]:
-    """Fetch 13-week price return relative to S&P 500 via Finnhub (daily-cached)."""
+    """Fetch 13-week price return relative to S&P 500 (daily-cached).
+
+    Resolution order:
+      1. yfinance   — compute 13-week cumulative return of *symbol* vs SPY.
+      2. SA quant   — treat rating >= 3.5 as positive RS proxy (+10) when
+                      price history is unavailable.
+      3. Finnhub    — legacy fallback (requires FINNHUB_API_KEY).
+    """
     today = datetime.date.today()
     if symbol in _squeeze_rs_cache:
         cached_date, rs = _squeeze_rs_cache[symbol]
         if cached_date == today:
             return rs
+
+    # ── 1. yfinance 13-week relative return ───────────────────────────────────
     try:
-        from engine.config import FINNHUB_API_KEY
-        import requests as _req
-        r = _req.get(
-            "https://finnhub.io/api/v1/stock/metric",
-            params={"symbol": symbol, "metric": "all", "token": FINNHUB_API_KEY},
-            timeout=5,
-        )
-        metric = r.json().get("metric", {})
-        rs = metric.get("priceRelativeToS&P50013Week")
-        if rs is None:
-            return None
-        rs = float(rs)
+        import yfinance as _yf
+        import pandas as _pd
+
+        prices = _yf.download(
+            [symbol, "SPY"],
+            period="4mo",      # fetch extra buffer so we always have 13 weeks
+            progress=False,
+            auto_adjust=True,
+        )["Close"]
+
+        if isinstance(prices, _pd.Series):
+            # single-ticker return from download — shouldn't happen but guard it
+            raise ValueError("expected multi-ticker frame")
+
+        sym_col = symbol.upper()
+        if sym_col not in prices.columns or "SPY" not in prices.columns:
+            raise ValueError(f"missing columns: {list(prices.columns)}")
+
+        # keep last 65 trading days ≈ 13 calendar weeks
+        prices = prices.dropna().iloc[-65:]
+        if len(prices) < 10:
+            raise ValueError("insufficient price history")
+
+        sym_ret = (prices[sym_col].iloc[-1] / prices[sym_col].iloc[0] - 1) * 100
+        spy_ret = (prices["SPY"].iloc[-1]    / prices["SPY"].iloc[0]    - 1) * 100
+        rs = float(sym_ret - spy_ret)
         _squeeze_rs_cache[symbol] = (today, rs)
         return rs
+    except Exception as _e:
+        import logging as _log
+        _log.getLogger("ApexTrader").debug(f"[RS] yfinance fallback failed for {symbol}: {_e}")
+
+    # ── 2. SA quant rating as RS proxy ────────────────────────────────────────
+    try:
+        from engine.data.seeking_alpha import get_sa_quant_rating
+        rating = get_sa_quant_rating(symbol)
+        if rating is not None:
+            # map rating [1,5] → RS proxy [-20, +20]
+            rs = (rating - 3.0) * 10.0
+            _squeeze_rs_cache[symbol] = (today, rs)
+            return rs
     except Exception:
-        return None
+        pass
+
+    # ── 3. Finnhub legacy fallback ────────────────────────────────────────────
+    try:
+        from engine.config import FINNHUB_API_KEY
+        if FINNHUB_API_KEY:
+            import requests as _req
+            r = _req.get(
+                "https://finnhub.io/api/v1/stock/metric",
+                params={"symbol": symbol, "metric": "all", "token": FINNHUB_API_KEY},
+                timeout=5,
+            )
+            metric = r.json().get("metric", {})
+            rs = metric.get("priceRelativeToS&P50013Week")
+            if rs is not None:
+                rs = float(rs)
+                _squeeze_rs_cache[symbol] = (today, rs)
+                return rs
+    except Exception:
+        pass
+
+    return None
 
 
 class ShortSqueezeStrategy:

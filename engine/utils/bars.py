@@ -45,11 +45,7 @@ _data_client = None
 _option_data_client = None
 
 # ── Feed tracking ────────────────────────────────────────────────────────────
-# _sip_available: set False on first SIP subscription error so subsequent
-# calls skip the doomed SIP request entirely (saves one failed HTTP call
-# per symbol per cycle).
-_sip_available: bool = True
-# _last_feed_used: records which feed succeeded per symbol in this cycle.
+# _last_feed_used: records which feed was used per symbol in this cycle.
 # Cleared by clear_bar_cache() at the start of each scan cycle.
 _last_feed_used: Dict[str, str] = {}
 
@@ -157,47 +153,20 @@ def _get_bars_alpaca(symbol: str, period: str, interval: str, log) -> pd.DataFra
     start_iso = start_dt.astimezone(pytz.UTC).isoformat().replace("+00:00", "Z")
     end_iso   = end_dt.astimezone(pytz.UTC).isoformat().replace("+00:00", "Z")
 
-    global _last_alpaca_bar_ts, _sip_available
+    global _last_alpaca_bar_ts
     elapsed = time.time() - _last_alpaca_bar_ts
     if elapsed < _ALPACA_MIN_INTERVAL:
         time.sleep(_ALPACA_MIN_INTERVAL - elapsed)
 
-    # Use SIP feed if subscription allows, otherwise IEX.
-    # Once a subscription error is detected, _sip_available is latched False
-    # for the remainder of the session to skip the wasted SIP request.
-    feed_used = "iex"
-    if _sip_available:
-        try:
-            bars = client.get_stock_bars(StockBarsRequest(
-                symbol_or_symbols=symbol,
-                timeframe=tf,
-                start=start_iso,
-                end=end_iso,
-                feed="sip",
-            ))
-            feed_used = "sip"
-        except Exception as e:
-            err_str = str(e)
-            if "subscription does not permit" in err_str:
-                _sip_available = False
-                log.warning("[FEED] SIP data subscription unavailable — switching to IEX feed for all symbols this session")
-            else:
-                log.debug(f"{symbol}: Alpaca SIP feed failed ({e}), retrying with IEX feed.")
-            bars = client.get_stock_bars(StockBarsRequest(
-                symbol_or_symbols=symbol,
-                timeframe=tf,
-                start=start_iso,
-                end=end_iso,
-                feed="iex",
-            ))
-    else:
-        bars = client.get_stock_bars(StockBarsRequest(
-            symbol_or_symbols=symbol,
-            timeframe=tf,
-            start=start_iso,
-            end=end_iso,
-            feed="iex",
-        ))
+    from engine.config import ALPACA_DATA_FEED
+    feed_used = ALPACA_DATA_FEED  # "sip" for paid subscribers, "iex" for free tier
+    bars = client.get_stock_bars(StockBarsRequest(
+        symbol_or_symbols=symbol,
+        timeframe=tf,
+        start=start_iso,
+        end=end_iso,
+        feed=feed_used,
+    ))
     _last_alpaca_bar_ts = time.time()
     _last_feed_used[symbol] = feed_used
     if symbol in bars:

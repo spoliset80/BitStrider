@@ -59,11 +59,14 @@ from engine.config import (
 from engine.utils import MarketState, clear_bar_cache, get_bars, is_dead_ticker
 from engine.utils.bars import get_data_client as _get_data_client, get_feed_used as _get_feed_used
 
-# IEX (free) feed captures roughly 50% of consolidated volume vs SIP.
+# IEX (free) feed captures roughly 15% of consolidated volume vs SIP.
 # When IEX data is used, scale RVOL and dollar-vol thresholds down by this
 # factor so genuine movers are not incorrectly filtered out.
+# When ALPACA_DATA_FEED=sip, _IEX_FEED is False and all thresholds apply at 100%.
 _IEX_THRESHOLD_SCALE = 0.15
 from alpaca.data import StockSnapshotRequest as _StockSnapshotRequest
+from engine.config import ALPACA_DATA_FEED as _ALPACA_DATA_FEED
+_IEX_FEED: bool = (_ALPACA_DATA_FEED != "sip")  # True when on free IEX tier
 from .universe import get_tier as _get_tier_live, get_latest_batch as _get_latest_batch, get_ti_primary as _get_ti_primary
 from .discovery import get_priority_scan_queue as _get_priority_scan_queue
 
@@ -109,7 +112,7 @@ def _prefetch_snapshots(symbols: List[str]) -> None:
     try:
         client = _get_data_client()
         snaps = client.get_stock_snapshot(
-            _StockSnapshotRequest(symbol_or_symbols=symbols)
+            _StockSnapshotRequest(symbol_or_symbols=symbols, feed=_ALPACA_DATA_FEED)
         )
         if isinstance(snaps, dict):
             _snapshot_cache = snaps
@@ -235,7 +238,7 @@ def _passes_guardrails(symbol: str, bull_regime: bool = None, market_state: Opti
                 today_vol = float(day_vol)
                 denom = avg_daily_vol * max(elapsed_frac, 0.02)
                 rvol_fallback = today_vol / denom if denom > 0 else 0.0
-                iex_feed = _get_feed_used(symbol) == "iex"
+                iex_feed = _IEX_FEED
                 rvol_threshold = adaptive_rvol * (_IEX_THRESHOLD_SCALE if iex_feed else 1.0)
                 _log.warning(f"[RVOL@TIME FALLBACK] {symbol}: insufficient intraday data for RVOL@TIME, using fractional legacy RVOL logic. today_vol={today_vol:.0f}, avg_daily_vol={avg_daily_vol:.0f}, elapsed_frac={elapsed_frac:.3f}, denom={denom:.0f}, rvol_fallback={rvol_fallback:.3f}, adaptive_rvol={adaptive_rvol:.2f} (iex_scale={iex_feed})")
                 if not iex_feed and rvol_fallback < rvol_threshold:
@@ -261,7 +264,7 @@ def _passes_guardrails(symbol: str, bull_regime: bool = None, market_state: Opti
                 if avg_vols:
                     avg_intraday_vol = sum(avg_vols) / len(avg_vols)
                     rvol = today_vol / max(avg_intraday_vol, 1)
-                    iex_feed = _get_feed_used(symbol) == "iex"
+                    iex_feed = _IEX_FEED
                     rvol_threshold = adaptive_rvol * (_IEX_THRESHOLD_SCALE if iex_feed else 1.0)
                     _log.info(f"[RVOL@TIME DEBUG] {symbol}: today_vol={today_vol:.0f}, avg_intraday_vol={avg_intraday_vol:.0f}, elapsed_min={elapsed_min}, rvol={rvol:.3f}, rvol_threshold={rvol_threshold:.2f} (adaptive={adaptive_rvol:.2f} iex_scale={iex_feed})")
                     if not iex_feed and rvol < rvol_threshold:
@@ -274,8 +277,8 @@ def _passes_guardrails(symbol: str, bull_regime: bool = None, market_state: Opti
                     fallback_rvol = True
             # Time-weighted dollar volume guardrail
             elapsed_frac = elapsed_min / 390.0
-            # Scale threshold down when IEX feed is used (IEX ~50-60% of SIP volume)
-            iex_feed = _get_feed_used(symbol) == "iex"
+            # Scale threshold down when IEX feed is used (IEX ~15% of SIP volume)
+            iex_feed = _IEX_FEED
             dv_scale = _IEX_THRESHOLD_SCALE if iex_feed else 1.0
             tw_dollar_vol = adaptive_dollar_vol * max(elapsed_frac, 0.05) * dv_scale
             dollar_vol = price * day_vol
@@ -288,7 +291,7 @@ def _passes_guardrails(symbol: str, bull_regime: bool = None, market_state: Opti
 
         # Adaptive MIN_DOLLAR_VOLUME: scale threshold for IEX feed (partial volume)
         dollar_vol = price * day_vol
-        iex_feed_dv = _get_feed_used(symbol) == "iex"
+        iex_feed_dv = _IEX_FEED
         eff_dollar_vol_threshold = adaptive_dollar_vol * (_IEX_THRESHOLD_SCALE if iex_feed_dv else 1.0)
         if dollar_vol < eff_dollar_vol_threshold:
             _log.warning(f"[GUARDRAIL] {symbol} blocked: dollar volume {dollar_vol:.0f} < eff_threshold {eff_dollar_vol_threshold:.0f} (adaptive={adaptive_dollar_vol:.0f} iex_scale={iex_feed_dv}) | price={price:.2f} | day_vol={day_vol:.0f}")
@@ -307,7 +310,7 @@ def _passes_guardrails(symbol: str, bull_regime: bool = None, market_state: Opti
                     elapsed_min  = max((now_et - mkt_open).total_seconds() / 60, 1.0)
                     elapsed_frac = min(elapsed_min / 390.0, 1.0)
                     rvol = (day_vol / max(elapsed_frac, 0.02)) / avg_daily_vol
-                    iex_feed = _get_feed_used(symbol) == "iex"
+                    iex_feed = _IEX_FEED
                     rvol_threshold = adaptive_rvol * (_IEX_THRESHOLD_SCALE if iex_feed else 1.0)
                     if not iex_feed and rvol < rvol_threshold:
                         _log.warning(f"[GUARDRAIL] {symbol} blocked: RVOL {rvol:.2f} < rvol_threshold {rvol_threshold:.2f} (adaptive={adaptive_rvol:.2f} iex_scale={iex_feed}) | day_vol={day_vol:.0f} | avg_daily_vol={avg_daily_vol:.0f}")

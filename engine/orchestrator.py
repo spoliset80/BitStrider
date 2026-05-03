@@ -53,6 +53,7 @@ from engine.execution.enhanced import EnhancedExecutor
 from engine.options.executor import OptionsExecutor
 from engine.options.strategies import scan_options_universe
 from engine.risk import kill_mode as _kill_mode
+from engine.crypto.trader import CryptoTrader
 
 log = setup_logging()
 
@@ -70,6 +71,7 @@ class AppContext:
     client:           object
     executor:         EnhancedExecutor
     options_executor: Optional[OptionsExecutor]
+    crypto_trader:    Optional[CryptoTrader] = None
     # Per-session state
     last_market_regime:   str  = "bull"
     market_state:         Optional[MarketState] = None
@@ -89,10 +91,17 @@ def _build_context() -> AppContext:
             f"Options trading ENABLED ({int(cfg.OPTIONS_ALLOCATION_PCT)}% allocation, "
             f"{cfg.OPTIONS_DTE_MIN}-{cfg.OPTIONS_DTE_MAX} DTE)"
         )
+    crypto = None
+    if cfg.CRYPTO_ENABLED:
+        crypto = CryptoTrader(client, api_key=cfg.API_KEY, api_secret=cfg.API_SECRET)
+        log.info(
+            f"Crypto trading ENABLED — universe: {cfg.CRYPTO_UNIVERSE} "
+            f"| pos_pct={cfg.CRYPTO_POSITION_PCT}% | TP={cfg.CRYPTO_TP_PCT}% | SL={cfg.CRYPTO_SL_PCT}%"
+        )
     log.info(f"Trade mode: {cfg.TRADE_MODE} (PAPER={cfg.PAPER}, LIVE={cfg.LIVE})")
     if not cfg.LONG_ONLY_MODE:
         log.info("Shorting enabled (LONG_ONLY_MODE=False)")
-    return AppContext(client=client, executor=executor, options_executor=opts)
+    return AppContext(client=client, executor=executor, options_executor=opts, crypto_trader=crypto)
 
 
 # ── Discovery wrappers ────────────────────────────────────────────────────────
@@ -435,6 +444,36 @@ def _execute_bull_plan(
         time.sleep(1)
 
 
+# ── Crypto weekend cycle ─────────────────────────────────────────────────────
+
+def _run_crypto_cycle(ctx: AppContext) -> None:
+    """Scan and trade crypto pairs. Runs only on weekends."""
+    if ctx.crypto_trader is None:
+        log.info("[CRYPTO] Trader not initialised (CRYPTO_ENABLED=false) — skipping")
+        return
+    try:
+        ctx.crypto_trader.monitor_positions()
+        log.info(ctx.crypto_trader.status_summary())
+
+        signals = ctx.crypto_trader.scan(cfg.CRYPTO_UNIVERSE)
+        if not signals:
+            log.info("[CRYPTO] No signals this cycle")
+            return
+
+        for idx, s in enumerate(signals[:5], 1):
+            log.info(
+                f"[CRYPTO] #{idx}: {s.symbol} {s.action.upper()} "
+                f"@ {s.price:.4f} conf={s.confidence:.0%} | {s.reason}"
+            )
+
+        for sig in signals:
+            if sig.action == "buy":
+                if ctx.crypto_trader.execute_buy(sig):
+                    break  # one new entry per cycle
+    except Exception as e:
+        log.error(f"[CRYPTO] Cycle error: {e}", exc_info=True)
+
+
 # ── Core scan cycle ───────────────────────────────────────────────────────────
 
 def _check_kill_mode(ctx: AppContext) -> bool:
@@ -463,6 +502,16 @@ def scan_and_trade(ctx: AppContext) -> None:
 
     ctx.market_state = MarketState.from_now()
     ctx.market_state.resolve_regime()
+
+    # ── Weekend: crypto-only, skip all equity / options logic ────────────────
+    if not ctx.market_state.weekday:
+        if cfg.CRYPTO_ENABLED:
+            log.info("[SYSTEM] Weekend — running CRYPTO-ONLY cycle (equity/options suspended)")
+            _run_crypto_cycle(ctx)
+        else:
+            log.info("[SYSTEM] Weekend — equity market closed, CRYPTO_ENABLED=false, nothing to do")
+        return
+
     ctx.executor.update_market_state(ctx.market_state)
     _run_options_cycle(ctx, ctx.market_state)
 
@@ -726,7 +775,10 @@ def start() -> None:
     _start_software_stop_thread(ctx)
 
     # Block until startup TI capture completes (up to 90s)
-    if cfg.USE_TRADEIDEAS_DISCOVERY:
+    # Skip on weekends — only crypto runs, TI universe is irrelevant
+    import datetime as _dt
+    _startup_weekend = _dt.datetime.now(pytz.timezone("America/New_York")).weekday() >= 5
+    if cfg.USE_TRADEIDEAS_DISCOVERY and not _startup_weekend:
         try:
             log.info("Startup TI capture — refreshing universe before first scan…")
             _discovery.scan_tradeideas_universe(
@@ -766,7 +818,8 @@ def start() -> None:
         log.error(f"Initial scan error: {e}", exc_info=True)
 
     last_vix_check    = time.time()
-    current_interval  = get_adaptive_interval(ctx)
+    _is_weekend_now   = _dt.datetime.now(pytz.timezone("America/New_York")).weekday() >= 5
+    current_interval  = cfg.CRYPTO_SCAN_INTERVAL_MIN if (_is_weekend_now and cfg.CRYPTO_ENABLED) else get_adaptive_interval(ctx)
     last_scan         = time.time()
 
     schedule.every(30).minutes.do(log_status, ctx)
@@ -776,8 +829,15 @@ def start() -> None:
         while True:
             try:
                 # Refresh interval every 15 min
-                if cfg.ADAPTIVE_INTERVALS and (time.time() - last_vix_check) >= 900:
-                    new_interval = get_adaptive_interval(ctx)
+                if (time.time() - last_vix_check) >= 900:
+                    import datetime as _dt
+                    _weekend = _dt.datetime.now(pytz.timezone("America/New_York")).weekday() >= 5
+                    if _weekend and cfg.CRYPTO_ENABLED:
+                        new_interval = cfg.CRYPTO_SCAN_INTERVAL_MIN
+                    elif cfg.ADAPTIVE_INTERVALS:
+                        new_interval = get_adaptive_interval(ctx)
+                    else:
+                        new_interval = current_interval
                     if new_interval != current_interval:
                         log.info(f"Scan interval: {current_interval} → {new_interval} min")
                         current_interval = new_interval
