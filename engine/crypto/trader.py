@@ -365,10 +365,26 @@ class CryptoTrader:
             # Alpaca crypto orders are evaluated against non_marginable_buying_power (cash).
             # Using the broader buying_power (which includes margin) causes 40310000 errors.
             cash_bp       = float(getattr(account, "non_marginable_buying_power", None) or account.buying_power)
-            notional      = round(cash_bp * _cfg.CRYPTO_POSITION_PCT / 100, 2)
+
+            # ── Max positions gate ────────────────────────────────────────────
+            open_count = len(self._positions)
+            if open_count >= _cfg.CRYPTO_MAX_POSITIONS:
+                log.info(
+                    f"[CRYPTO] Max positions reached ({open_count}/{_cfg.CRYPTO_MAX_POSITIONS}) — skipping {signal.symbol}"
+                )
+                return False
+
+            # Size each position as (cash BP) / (max positions) so all slots
+            # together consume 100% of available buying power.
+            slots         = _cfg.CRYPTO_MAX_POSITIONS  # fixed divisor keeps each slice consistent
+            if _cfg.CRYPTO_POSITION_PCT > 0:
+                # Legacy explicit % override
+                notional  = round(cash_bp * _cfg.CRYPTO_POSITION_PCT / 100, 2)
+            else:
+                notional  = round(cash_bp / slots, 2)
             notional      = max(_cfg.CRYPTO_MIN_NOTIONAL, notional)
-            # Hard cap: never request more than what's available
-            notional      = min(notional, round(cash_bp * 0.98, 2))  # 2% buffer
+            # Hard cap: never request more than 98% of available cash
+            notional      = min(notional, round(cash_bp * 0.98, 2))
             if notional < _cfg.CRYPTO_MIN_NOTIONAL:
                 log.warning(
                     f"[CRYPTO] Insufficient cash balance for {signal.symbol} "

@@ -457,7 +457,8 @@ CRYPTO_UNIVERSE: list = [
 ]
 
 # Position sizing
-CRYPTO_POSITION_PCT  = float(os.getenv("CRYPTO_POSITION_PCT",  "20.0"))  # % of buying power per crypto position (no position cap)
+CRYPTO_MAX_POSITIONS = int(os.getenv("CRYPTO_MAX_POSITIONS", "12"))    # max simultaneous crypto positions
+CRYPTO_POSITION_PCT  = float(os.getenv("CRYPTO_POSITION_PCT",  "0.0"))   # legacy override; 0 = auto (BP / CRYPTO_MAX_POSITIONS)
 CRYPTO_MIN_NOTIONAL  = float(os.getenv("CRYPTO_MIN_NOTIONAL",  "100.0")) # minimum order in USD
 
 # Exit thresholds
