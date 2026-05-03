@@ -469,10 +469,17 @@ def _run_crypto_cycle(ctx: AppContext) -> None:
                 f"@ {s.price:.4f} conf={s.confidence:.0%} | {s.reason}"
             )
 
+        buys_this_cycle = 0
         for sig in signals:
             if sig.action == "buy":
+                # Stop if we've hit the max positions cap
+                if len(ctx.crypto_trader._positions) >= cfg.CRYPTO_MAX_POSITIONS:
+                    log.info(f"[CRYPTO] Max positions ({cfg.CRYPTO_MAX_POSITIONS}) reached — stopping buys this cycle")
+                    break
                 if ctx.crypto_trader.execute_buy(sig):
-                    break  # one new entry per cycle
+                    buys_this_cycle += 1
+        if buys_this_cycle == 0 and signals:
+            log.info("[CRYPTO] No new entries this cycle (all signals rejected)")
     except Exception as e:
         log.error(f"[CRYPTO] Cycle error: {e}", exc_info=True)
 

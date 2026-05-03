@@ -471,7 +471,7 @@ CRYPTO_RSI_BUY_MAX   = float(os.getenv("CRYPTO_RSI_BUY_MAX",  "70.0"))  # RSI mu
 CRYPTO_RSI_SELL_MAX  = float(os.getenv("CRYPTO_RSI_SELL_MAX", "52.0"))  # RSI must be below this to close
 
 # Scan interval during weekend (minutes)
-CRYPTO_SCAN_INTERVAL_MIN = int(os.getenv("CRYPTO_SCAN_INTERVAL_MIN", "15"))
+CRYPTO_SCAN_INTERVAL_MIN = int(os.getenv("CRYPTO_SCAN_INTERVAL_MIN", "30"))
 
 # ─────────────────────────────────────────────────────────────────
 # Daily Limits
