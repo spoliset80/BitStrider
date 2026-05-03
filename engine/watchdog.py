@@ -128,7 +128,11 @@ class AutoBotWatchdog:
         while True:
             env = os.environ.copy()
             env.update(self._parse_env_file())
-            env["TRADE_MODE"] = self.get_current_trade_mode()
+            # Only override TRADE_MODE from the watchdog's OS env if it was explicitly
+            # set there (e.g. $env:TRADE_MODE="live" in the shell).
+            # If not set in OS env, leave whatever _parse_env_file() read from .env.
+            if "TRADE_MODE" in os.environ:
+                env["TRADE_MODE"] = os.environ["TRADE_MODE"].strip().lower()
 
             mode = env["TRADE_MODE"]
             self.logger.info("Launching main.py in %s mode", mode.upper())

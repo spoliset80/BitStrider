@@ -344,6 +344,24 @@ class CryptoTrader:
 
         try:
             account       = self._client.get_account()
+
+            # ── Account / mode safety check ───────────────────────────────────
+            # Alpaca paper account numbers start with "PA"; live are numeric only.
+            acct_num      = str(getattr(account, "account_number", "") or "")
+            is_paper_acct = acct_num.upper().startswith("PA")
+            is_paper_cfg  = _cfg.PAPER
+            if is_paper_cfg != is_paper_acct:
+                log.error(
+                    f"[CRYPTO] ACCOUNT MISMATCH — TRADE_MODE={'paper' if is_paper_cfg else 'live'} "
+                    f"but connected account is {'PAPER' if is_paper_acct else 'LIVE'} ({acct_num}). "
+                    f"Aborting order to prevent trading on wrong account."
+                )
+                return False
+            log.debug(
+                f"[CRYPTO] Account verified: {'PAPER' if is_paper_acct else 'LIVE'} ({acct_num}) "
+                f"matches TRADE_MODE={'paper' if is_paper_cfg else 'live'}"
+            )
+
             # Alpaca crypto orders are evaluated against non_marginable_buying_power (cash).
             # Using the broader buying_power (which includes margin) causes 40310000 errors.
             cash_bp       = float(getattr(account, "non_marginable_buying_power", None) or account.buying_power)
@@ -425,10 +443,10 @@ class CryptoTrader:
                 o_sym = str(getattr(o, "symbol", "")).upper()
                 if o_sym != alpaca_sym.upper():
                     continue
-                order_type = str(getattr(o, "order_type", getattr(o, "type", ""))).lower()
-                if "stop_limit" in order_type or "stop-limit" in order_type:
+                order_type = str(getattr(o, "order_type", getattr(o, "type", ""))).lower().replace(" ", "_").replace("-", "_")
+                if "stop" in order_type:
                     log.info(
-                        f"[CRYPTO] Reusing existing SL order for {symbol} | order={o.id}"
+                        f"[CRYPTO] Reusing existing SL order for {symbol} | type={order_type} | order={o.id}"
                     )
                     return str(o.id)
         except Exception as e:
@@ -463,7 +481,12 @@ class CryptoTrader:
             )
             return str(order.id)
         except Exception as e:
-            log.warning(f"[CRYPTO] SL order placement failed for {symbol}: {e}")
+            err = str(e)
+            # "available: 0" means an open SL order already locks this qty — not a real error
+            if '"available":"0"' in err or "available: 0" in err.lower():
+                log.debug(f"[CRYPTO] SL already exists for {symbol} (balance locked by open order) — skipping duplicate")
+            else:
+                log.warning(f"[CRYPTO] SL order placement failed for {symbol}: {e}")
             return None
 
     def _cancel_sl_order(self, symbol: str, sl_order_id: str) -> None:
