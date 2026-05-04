@@ -522,12 +522,15 @@ def scan_and_trade(ctx: AppContext) -> None:
             else:
                 log.info("[SYSTEM] Weekend — running CRYPTO-ONLY cycle (equity/options suspended)")
             _run_crypto_cycle(ctx)
-            if _is_weekend:
+            if _is_weekend and not cfg.FORCE_EQUITY:
                 return  # weekends: stop here, no equity
-            # weekday FORCE_CRYPTO: fall through to equity/options below
+            # weekday FORCE_CRYPTO or FORCE_EQUITY: fall through to equity/options below
+            if cfg.FORCE_EQUITY and _is_weekend:
+                log.info("[SYSTEM] FORCE_EQUITY=true — running equity/options cycle on weekend")
         else:
-            log.info("[SYSTEM] Weekend — equity market closed, CRYPTO_ENABLED=false, nothing to do")
-        return
+            if not cfg.FORCE_EQUITY:
+                log.info("[SYSTEM] Weekend — equity market closed, CRYPTO_ENABLED=false, nothing to do")
+                return
 
     ctx.executor.update_market_state(ctx.market_state)
     _run_options_cycle(ctx, ctx.market_state)

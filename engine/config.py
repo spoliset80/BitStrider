@@ -433,6 +433,8 @@ PREOPEN_USE_SENTIMENT_GATING = os.getenv("PREOPEN_USE_SENTIMENT_GATING", "true")
 CRYPTO_ENABLED          = os.getenv("CRYPTO_ENABLED", "true").lower() in ("1", "true", "yes")
 # Force crypto to run on weekdays too (for testing). Set FORCE_CRYPTO=true in .env.
 FORCE_CRYPTO            = os.getenv("FORCE_CRYPTO", "false").lower() in ("1", "true", "yes")
+# Force equity/options to run on weekends too (for testing). Set FORCE_EQUITY=true in .env.
+FORCE_EQUITY            = os.getenv("FORCE_EQUITY", "false").lower() in ("1", "true", "yes")
 
 # Universe: Alpaca crypto pairs (slash format: "BTC/USD")
 # Full Alpaca-supported list (stablecoins USDC/USDT/USDG excluded — no signal value)
