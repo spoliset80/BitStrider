@@ -2,7 +2,7 @@
 
 > Automated trading bot — multi-strategy equity signals, A+ options scanner, adaptive scan intervals, tiered risk management, and clean email reports.
 
-**Version:** v1.3.0 · **Python:** 3.10+ · **Broker:** Alpaca (paper & live) · **Platform:** Windows / Linux / macOS
+**Version:** v1.4.0 · **Python:** 3.10+ · **Broker:** Alpaca (paper & live) · **Data:** Market Data App (primary) + Alpaca · **Platform:** Windows / Linux / macOS
 
 ---
 
@@ -31,20 +31,23 @@
 - **Adaptive scan intervals** — adjusts every cycle based on VIX level, market hours, and open position count
 - **Bear regime detection** — SPY < 200-SMA flips to bear: long cap 1/cycle, inverse ETFs front-weighted, shorts unlocked
 - **Kill mode** — emergency close-all on VIX ≥ 40, SPY intraday drop ≥ 3%, or VIX +50% in 5 h
-- **Position swap** — when at max 12 positions, auto-closes weakest for a higher-confidence new signal (swap-only in bear)
-- **Confidence gate** — executes signals ≥ 72% (longs); position sizing now scales with confidence up to 100% at 85%+
+- **Position swap** — when at max 10 positions, auto-closes weakest for a higher-confidence new signal (swap-only in bear)
+- **Confidence gate** — executes signals ≥ 72% (longs); position sizing scales with confidence up to 100% at 85%+
+- **VIX-adaptive RVOL guardrails** — RVOL threshold scales with VIX level and bull/bear regime (0.4× in calm bull, up to 1.3× in high-VIX bull); timestamp-based RVOL@TIME compares same-elapsed-minute windows across prior sessions, with proportional scaling for partial sessions
 
 **Options trading (Level 3, Alpaca)**
-- **A+ 9-filter scanner** — IV rank gate, EMA-20 trend, 3-day momentum, 5-day breakout/breakdown, chain liquidity, OI ≥ 500, spread ≤ 15%, R/R ≥ 1.5×, premium ≤ 3% of spot
-- **82% sniper threshold** — only executes the cleanest option setups by default via `OPTIONS_MIN_SIGNAL_CONFIDENCE`
-- **Open-window spread-first logic** — 9:35–9:45 ET prefers spreads; naked entries are allowed only when IV is very low and pre-market gap is small
-- **Options contract sizing scales by confidence** — low-conviction signals are smaller, stronger signals use full allocation
-- **Options diagnostic logging** — zero-signal scans now report fail reasons such as `adv`, `no_signal`, and cooldown rejections
-- **Watch list fallback** — when nothing clears the gate, shows the top-3 near-miss candidates (all structural filters passed) clearly labelled with their gate gap
+- **10-strategy A+ scanner** — MomentumCall, BearPut, BearCallSpread, ShortSqueeze, MeanReversionCall, BreakoutRetest, TrendPullbackSpread, IronCondor, Butterfly, CoveredCall
+- **76% sniper threshold** — configurable via `OPTIONS_MIN_SIGNAL_CONFIDENCE`; filters to the cleanest setups
+- **45% portfolio allocation**, max 4 concurrent option positions; equity capped at 5% × 10 = 50%
+- **Trailing stop** — activates at +20% gain, trails with 15% drawdown
+- **Open-window spread-first logic** — 9:35–9:45 ET prefers spreads; naked entries only when IV is very low and pre-market gap is small
+- **Parallel prefetch** — bars + OI + chains fetched concurrently before the strategy loop (up to 12 workers)
+- **5-min universe cache** — avoids hammering the options universe API on every cycle
+- **Options diagnostic logging** — zero-signal scans report per-strategy fail reasons; near-miss `[WATCH]` email
 - **Master kill-switch** — `OPTIONS_ENABLED=false` in `.env` disables the entire options system without restart
-- **15% portfolio allocation**, max 3 concurrent contracts, 7–21 DTE, +45% profit target / -30% stop loss
 
 **Infrastructure**
+- **Market Data App (primary)** + Alpaca + yfinance (fallback) — MDA provides consolidated SIP-level data for bars and quotes
 - **Trade Ideas integration** — headless Selenium scrape refreshes the universe every 30 min
 - **TI primary universe** — latest TI captures persist to `data/ti_primary.json`, with `data/universe.json` as TTL-backed fallback
 - **Dynamic universe** — `data/universe.json` with TTL-managed tiers; auto-pruned daily
@@ -60,36 +63,47 @@
 
 ```
 apextrader/
-├── main.py                       # Orchestrator: scan loop, execution, EOD close
-├── autobot.py                    # Watchdog launcher that keeps main.py running
+├── main.py                            # Entry point: scan loop, execution, EOD close
+├── autobot.py                         # Watchdog launcher that keeps main.py running
 ├── engine/
-│   ├── config.py                 # All runtime constants
-│   ├── scan.py                   # get_scan_targets(), scan_universe(), filter_signals()
-│   ├── strategies.py             # 7 equity strategy classes
-│   ├── options/strategies.py      # A+ options: MomentumCall, BearPut, CoveredCall + scan_options_universe()
-│   ├── options/executor.py        # Options order placement (buy-to-open, close)
-│   ├── execution/enhanced.py      # Equity order placement, swap logic, bracket/stop orders
-│   ├── notifications.py          # Email templates: build_top5_report(), build_eod_report()
-│   ├── universe.py               # TTL-managed ticker universe (JSON-backed)
-│   ├── predictions.py            # Day-picks persistence (predictions/day_picks.json)
-│   ├── utils.py                  # Data services: get_bars(), get_vix(), sentiment, trending
-│   └── broker_factory.py         # Alpaca client factory (paper / live)
+│   ├── config.py                      # All runtime constants
+│   ├── orchestrator.py                # Main trading loop coordinator
+│   ├── equity/
+│   │   ├── scan.py                    # get_scan_targets(), scan_universe(), _passes_guardrails()
+│   │   ├── strategies.py              # 7 equity strategy classes
+│   │   ├── discovery.py               # Priority scan queue (screener/sympathy/EDGAR)
+│   │   └── universe.py                # TTL-managed ticker universe (JSON-backed)
+│   ├── options/
+│   │   ├── strategies.py              # 10 option strategies + scan_options_universe()
+│   │   └── executor.py                # Options order placement (buy-to-open, close, trails)
+│   ├── execution/
+│   │   └── enhanced.py                # Equity order placement, swap logic, bracket/stop orders
+│   ├── broker/
+│   │   └── broker_factory.py          # Alpaca client factory (paper / live)
+│   ├── notifications/
+│   │   └── notifications.py           # Email templates: scan report, EOD report
+│   ├── predictions/
+│   │   └── predictions.py             # Day-picks persistence (predictions/day_picks.json)
+│   ├── utils/
+│   │   ├── bars.py                    # Bar fetching: MDA-primary → Alpaca → yfinance; RSI/ATR
+│   │   ├── market.py                  # MarketState, regime detection, VIX, IEX-feed detection
+│   │   └── risk.py                    # Position sizing, daily P&L caps
+│   └── risk/
+│       └── kill_mode.py               # Kill-mode triggers and enforcement
 ├── scripts/
-│   ├── _options_today.py         # Standalone A+ options scanner (run daily)
-│   ├── run_autobot_task.ps1      # Task Scheduler launcher
-│   ├── run_top3.py               # Standalone equity top-3 scan (dry-run)
-│   ├── capture_tradeideas.py     # Trade Ideas Selenium scraper
-│   ├── predict_tomorrow.py       # Next-day prediction generator
-│   ├── _validate_universe.py     # Validate universe.json integrity
-│   └── prune_universe.py         # Manual universe prune utility
+│   ├── backtest_options.py            # Options strategy backtest runner
+│   ├── run_top3.py                    # Standalone equity top-3 scan (dry-run)
+│   ├── capture_tradeideas.py          # Trade Ideas Selenium scraper
+│   ├── predict_tomorrow.py            # Next-day prediction generator
+│   └── prune_universe.py             # Manual universe prune utility
 ├── data/
-│   ├── ti_primary.json           # Latest TI capture universe (primary scan source)
-│   └── universe.json             # Dynamic ticker universe with TTL tiers
+│   ├── ti_primary.json                # Latest TI capture universe (primary scan source)
+│   └── universe.json                  # Dynamic ticker universe with TTL tiers
 ├── predictions/
-│   ├── day_picks.json            # Today's top picks (persisted each cycle)
-│   └── watchlist.json            # Prediction watchlist
+│   ├── day_picks.json                 # Today's top picks (persisted each cycle)
+│   └── watchlist.json                 # Prediction watchlist
 ├── requirements.txt
-└── .env                          # Secrets — never commit
+└── .env                               # Secrets — never commit
 ```
 
 ---
@@ -123,8 +137,14 @@ PAPER_ALPACA_API_SECRET=your_paper_secret
 LIVE_ALPACA_API_KEY=your_live_key
 LIVE_ALPACA_API_SECRET=your_live_secret
 
+# ── Market Data App (primary bar/quote data) ──────────────────────
+MARKETDATA_API_KEY=your_mda_bearer_token
+
 # ── Options trading ───────────────────────────────────────────────
 OPTIONS_ENABLED=true                # false = kill-switch (no restart needed)
+OPTIONS_ALLOCATION_PCT=45.0         # % of equity reserved for all options combined
+OPTIONS_TRAIL_ACTIVATE_PCT=20.0     # activate trailing stop at +20% gain
+OPTIONS_TRAIL_DRAWDOWN_PCT=15.0     # trail with 15% drawdown from peak
 
 # ── Email notifications ───────────────────────────────────────────
 USE_EMAIL_NOTIFICATIONS=true
@@ -174,11 +194,12 @@ All tunable constants live in [`engine/config.py`](engine/config.py). Key settin
 |---|---|---|
 | `TRADE_MODE` | `paper` | `paper` or `live` — set via env var |
 | `MIN_SIGNAL_CONFIDENCE` | `0.72` | Minimum confidence to execute a long |
-| `MAX_POSITIONS` | `12` | Max concurrent equity positions (7.5% × 12 = 90%) |
-| `POSITION_SIZE_PCT` | `7.5` | Per-trade allocation (% of account) |
+| `MAX_POSITIONS` | `10` | Max concurrent equity positions (5% × 10 = 50%) |
+| `POSITION_SIZE_PCT` | `5.0` | Per-trade allocation (% of account) |
 | `SWAP_ON_FULL` | `True` | Close weakest position for a better signal when full |
 | `SWAP_MIN_CONFIDENCE` | `0.75` | Minimum confidence to trigger a swap |
 | `LONG_ONLY_MODE` | `True` | Disables short entries (PDT-safe) |
+| `RVOL_MIN` | `1.0` | Base RVOL threshold; adaptive clamps scale with VIX and regime |
 | `MARKET_REGIME_SIGNALS_CAP` | `1` | Max long signals per cycle in bear regime |
 | `DAILY_LOSS_LIMIT_BULL_PCT` | configured | Halt trading if daily P&L drops by this % in bull |
 | `DAILY_LOSS_LIMIT_BEAR_PCT` | configured | Tighter limit for bear days |
@@ -192,33 +213,41 @@ All tunable constants live in [`engine/config.py`](engine/config.py). Key settin
 | Setting | Default | Description |
 |---|---|---|
 | `OPTIONS_ENABLED` | `true` | Master kill-switch — set `false` to disable everything |
-| `OPTIONS_ALLOCATION_PCT` | `15.0` | % of equity for all options combined |
-| `OPTIONS_MAX_POSITIONS` | `3` | Max concurrent option contracts |
+| `OPTIONS_ALLOCATION_PCT` | `45.0` | % of equity for all options combined |
+| `OPTIONS_MAX_POSITIONS` | `4` | Max concurrent option positions |
 | `OPTIONS_DTE_MIN` / `MAX` | `7` / `21` | Expiry window (near-term, higher-theta) |
 | `OPTIONS_DELTA_TARGET` | `0.40` | Target delta at entry (0.30–0.50 range) |
-| `OPTIONS_MIN_SIGNAL_CONFIDENCE` | `0.82` | Minimum confidence to consider an options signal |
+| `OPTIONS_MIN_SIGNAL_CONFIDENCE` | `0.76` | Minimum confidence to execute an options signal |
+| `OPTIONS_MIN_RVOL` | `1.5` | Minimum RVOL for options momentum entries |
 | `OPTIONS_PROFIT_TARGET_PCT` | `45.0` | Close contract at +45% gain |
 | `OPTIONS_STOP_LOSS_PCT` | `30.0` | Close contract at -30% loss |
+| `OPTIONS_TRAIL_ACTIVATE_PCT` | `20.0` | Activate trailing stop at +20% gain |
+| `OPTIONS_TRAIL_DRAWDOWN_PCT` | `15.0` | Trail with 15% drawdown from peak gain |
 
 ---
 
 ## Equity Strategies
 
-Each strategy in [`engine/strategies.py`](engine/strategies.py) receives OHLCV bars and returns a `Signal` with `confidence` (0–1). All 7 run in parallel via `ThreadPoolExecutor`:
+Each strategy in [`engine/equity/strategies.py`](engine/equity/strategies.py) receives OHLCV bars and returns a `Signal` with `confidence` (0–1). All 7 run in parallel via `ThreadPoolExecutor`.
 
+### RVOL@TIME Guardrail
 
-### Alpaca API Integration (Equity)
+Before any strategy evaluates a symbol, `_passes_guardrails()` runs a time-aware relative volume check. It filters today's 1-min bars from 9:30 AM to the current minute, then compares against the same elapsed-minute window from the prior 5 trading sessions. Partial sessions (≥ 50% coverage) are accepted and proportionally scaled. This ensures a stock's volume pace is genuinely elevated at the current time of day — not just occasionally spiked at open.
 
-All equity strategies now use the Alpaca API for historical price and volume data, mirroring the options pipeline. This ensures consistent, reliable data for both equities and options, and enables seamless live trading and backtesting. The yfinance fallback is retained for redundancy only.
+RVOL thresholds are VIX- and regime-adaptive:
 
-**Current Focus:**
-- Refactoring and enhancing equity strategies to leverage Alpaca data for all scans and signals
-- Unified data access layer for both equities and options
-- Improved reliability and speed for live and backtest modes
+| Regime | VIX | Adaptive RVOL floor |
+|---|---|---|
+| Bull | > 25 | 1.3× |
+| Bull | 18–25 | 0.8× |
+| Bull | 15–18 | 0.5× |
+| Bull | < 15 | 0.4× |
+| Bear | < 18 | 0.4× |
+| Bear | ≥ 18 | 0.6× |
 
 | Strategy | Edge |
 |---|---|
-| `MomentumStrategy` | Pure momentum — RVOL ≥ 1.5× + price velocity |
+| `MomentumStrategy` | Pure momentum — RVOL ≥ 1.0× base + price velocity |
 | `SweepeaStrategy` | Daily pullback to 8-EMA with liquidity sweep setup |
 | `GapBreakoutStrategy` | Gap + consolidation range breakout |
 | `ORBStrategy` | Opening range breakout with follow-through |

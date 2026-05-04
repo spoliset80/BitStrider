@@ -682,7 +682,7 @@ BEAR_BREAKDOWN = {
 # ─────────────────────────────────────────────────────────────────
 # Golden Ratio Scanner Guardrails
 # ─────────────────────────────────────────────────────────────────
-RVOL_MIN                 = 1.5         # Require relative volume ≥ 1.5x before entering
+RVOL_MIN                 = 1.0         # Require relative volume ≥ 1.0x before entering (adaptive can reduce to 0.4–0.8)
 MIN_STOCK_PRICE          = 1.0         # Skip penny stocks below $1 (poor fill quality, high spread)
 ALPACA_MOVER_SCAN_INTERVAL_MIN = 10   # Re-poll Alpaca screener every 10 min (resets at market open)
 MIN_DOLLAR_VOLUME        = 1_000_000   # Skip illiquid setups: price × day_vol < $1M
