@@ -66,20 +66,17 @@ from engine.config import (
 )
 import os
 from engine.utils.market import _INVERSE_ETFS, _is_bull_regime
-from engine.utils.bars import calculate_atr as _calc_atr14_base
+from engine.utils.bars import calculate_atr as _calc_atr14
 
 _market_state: Optional[MarketState] = None
 
 _MDA_API_KEY: Optional[str] = os.environ.get("MARKETDATA_API_KEY") or None
 _MDA_AVAILABLE: bool = bool(_MDA_API_KEY)
-
-def _calc_atr14(bars, period: int = 14) -> float:
-    from engine.utils.bars import calculate_atr
-    return calculate_atr(bars, period)
-
-_OPTIONS_UNIVERSE_CACHE: list[str] | None = None
 _OPTIONS_UNIVERSE_CACHE_TS: datetime.datetime = datetime.datetime.min.replace(tzinfo=datetime.timezone.utc)
-_OPTIONS_UNIVERSE_CACHE_TTL_SEC = 60
+_OPTIONS_UNIVERSE_CACHE: list[str] | None = None
+
+
+_OPTIONS_UNIVERSE_CACHE_TTL_SEC = 300
 
 
 def _get_options_universe() -> list[str]:
@@ -2398,7 +2395,7 @@ class MeanReversionCallStrategy:
             std20    = float(ctx.closes.rolling(20).std().iloc[-1])
             lower_bb = sma20 - 2 * std20
 
-            conf  = 0.70
+            conf  = 0.72
             conf += min(0.08, (35 - ctx.rsi) * 0.003)
             conf += min(0.04, (rr - f["MIN_RR"]) * 0.02)
             confidence = round(min(0.94, conf), 3)

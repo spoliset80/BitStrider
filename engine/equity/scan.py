@@ -190,13 +190,14 @@ def _passes_guardrails(symbol: str, bull_regime: bool = None, market_state: Opti
             day_vol = float(intraday["volume"].sum())
             open_px = float(intraday["open"].iloc[0])
 
-        # Resolve regime and VIX before adaptive gates
+        # Resolve regime, VIX, and IEX-feed status once — reused throughout
         vix = None
         if hasattr(market_state, 'vix') and market_state.vix is not None:
             vix = market_state.vix
         elif hasattr(market_state, 'resolve_vix'):
             vix, _, _ = market_state.resolve_vix()
         bull = bull_regime if bull_regime is not None else market_state.resolve_regime()
+        iex_feed = _is_iex_feed()
 
         # Adaptive MIN_STOCK_PRICE: more flexible for current market
         base_min_price = MIN_STOCK_PRICE
@@ -207,28 +208,28 @@ def _passes_guardrails(symbol: str, bull_regime: bool = None, market_state: Opti
             if vix and vix > 25:
                 adaptive_min_price = base_min_price + 0.5
                 adaptive_dollar_vol = base_dollar_vol * 1.2
-                adaptive_rvol = base_rvol + 0.3
+                adaptive_rvol = base_rvol + 0.3           # 1.3 — choppy bull, need real surge
             elif vix and vix >= 18:
                 adaptive_min_price = base_min_price
                 adaptive_dollar_vol = base_dollar_vol
-                adaptive_rvol = max(1.2, base_rvol - 0.3)
+                adaptive_rvol = max(0.8, base_rvol - 0.2) # 0.8
             elif vix and vix >= 15:
                 adaptive_min_price = base_min_price
                 adaptive_dollar_vol = base_dollar_vol * 0.9
-                adaptive_rvol = max(1.0, base_rvol - 0.5)
+                adaptive_rvol = max(0.5, base_rvol - 0.5) # 0.5
             else:
                 adaptive_min_price = max(1.0, base_min_price - 0.5)
                 adaptive_dollar_vol = base_dollar_vol * 0.8
-                adaptive_rvol = max(0.9, base_rvol - 0.6)
+                adaptive_rvol = max(0.4, base_rvol - 0.6) # 0.4
         else:
             if vix and vix < 18:
                 adaptive_min_price = max(1.0, base_min_price - 0.7)
                 adaptive_dollar_vol = base_dollar_vol * 0.6
-                adaptive_rvol = max(0.8, base_rvol - 0.7)
+                adaptive_rvol = max(0.4, base_rvol - 0.7) # 0.4
             else:
                 adaptive_min_price = max(1.0, base_min_price - 0.5)
                 adaptive_dollar_vol = base_dollar_vol * 0.75
-                adaptive_rvol = max(1.0, base_rvol - 0.4)
+                adaptive_rvol = max(0.6, base_rvol - 0.4) # 0.6
 
         if price < adaptive_min_price:
             _log.warning(f"[GUARDRAIL] {symbol} blocked: price {price:.2f} < adaptive_min_price {adaptive_min_price}")
@@ -238,6 +239,7 @@ def _passes_guardrails(symbol: str, bull_regime: bool = None, market_state: Opti
 
         # Adaptive RVOL_MIN: higher in bull/high VIX, lower in calm or bear conditions
         # Use regular market hours only so extended-hours volume does not distort the pace.
+        _rvol_gate_applied = False  # track whether RVOL@TIME block ran (skip legacy gate below)
         if market_state.is_regular_hours and bull:
             # Fetch today's and past 5 days' 1-min bars via get_bars (MDA-primary)
             today_intraday = get_bars(symbol, "1d", "1m")
@@ -246,13 +248,8 @@ def _passes_guardrails(symbol: str, bull_regime: bool = None, market_state: Opti
             mkt_open = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
             elapsed_min = int(max((now_et - mkt_open).total_seconds() / 60, 1))
             elapsed_min = min(elapsed_min, 390)
-            fallback_rvol = False
             if today_intraday.empty or past_intraday.empty or len(today_intraday) < 5 or len(past_intraday) < 390*2:
-                # Fallback: use fractional legacy RVOL logic
-                now_et = datetime.datetime.now(_ET)
-                mkt_open = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
-                elapsed_min = int(max((now_et - mkt_open).total_seconds() / 60, 1))
-                elapsed_min = min(elapsed_min, 390)
+                # Fallback: use fractional legacy RVOL logic (now_et/mkt_open/elapsed_min already computed above)
                 elapsed_frac = elapsed_min / 390.0
                 # Get average daily volume from last 5 days
                 daily = get_bars(symbol, "5d", "1d")
@@ -263,7 +260,6 @@ def _passes_guardrails(symbol: str, bull_regime: bool = None, market_state: Opti
                 today_vol = float(day_vol)
                 denom = avg_daily_vol * max(elapsed_frac, 0.02)
                 rvol_fallback = today_vol / denom if denom > 0 else 0.0
-                iex_feed = _is_iex_feed()
                 rvol_threshold = adaptive_rvol * (_IEX_THRESHOLD_SCALE if iex_feed else 1.0)
                 _log.warning(f"[RVOL@TIME FALLBACK] {symbol}: insufficient intraday data for RVOL@TIME, using fractional legacy RVOL logic. today_vol={today_vol:.0f}, avg_daily_vol={avg_daily_vol:.0f}, elapsed_frac={elapsed_frac:.3f}, denom={denom:.0f}, rvol_fallback={rvol_fallback:.3f}, adaptive_rvol={adaptive_rvol:.2f} (iex_scale={iex_feed})")
                 if not iex_feed and rvol_fallback < rvol_threshold:
@@ -271,7 +267,6 @@ def _passes_guardrails(symbol: str, bull_regime: bool = None, market_state: Opti
                     if return_reason:
                         return False, 'rvol'
                     return False
-                fallback_rvol = True
             else:
                 # Today's volume up to now
                 today_vol = float(today_intraday["volume"].iloc[:elapsed_min].sum())
@@ -289,7 +284,6 @@ def _passes_guardrails(symbol: str, bull_regime: bool = None, market_state: Opti
                 if avg_vols:
                     avg_intraday_vol = sum(avg_vols) / len(avg_vols)
                     rvol = today_vol / max(avg_intraday_vol, 1)
-                    iex_feed = _is_iex_feed()
                     rvol_threshold = adaptive_rvol * (_IEX_THRESHOLD_SCALE if iex_feed else 1.0)
                     _log.info(f"[RVOL@TIME DEBUG] {symbol}: today_vol={today_vol:.0f}, avg_intraday_vol={avg_intraday_vol:.0f}, elapsed_min={elapsed_min}, rvol={rvol:.3f}, rvol_threshold={rvol_threshold:.2f} (adaptive={adaptive_rvol:.2f} iex_scale={iex_feed})")
                     if not iex_feed and rvol < rvol_threshold:
@@ -299,11 +293,10 @@ def _passes_guardrails(symbol: str, bull_regime: bool = None, market_state: Opti
                         return False
                 else:
                     _log.warning(f"[RVOL@TIME FALLBACK] {symbol}: not enough valid days for RVOL@TIME, using legacy RVOL logic.")
-                    fallback_rvol = True
+            _rvol_gate_applied = True  # RVOL@TIME block ran — skip legacy gate below
             # Time-weighted dollar volume guardrail
             elapsed_frac = elapsed_min / 390.0
             # Scale threshold down when IEX feed is used (IEX ~15% of SIP volume)
-            iex_feed = _is_iex_feed()
             dv_scale = _IEX_THRESHOLD_SCALE if iex_feed else 1.0
             tw_dollar_vol = adaptive_dollar_vol * max(elapsed_frac, 0.05) * dv_scale
             dollar_vol = price * day_vol
@@ -314,18 +307,18 @@ def _passes_guardrails(symbol: str, bull_regime: bool = None, market_state: Opti
                     return False, 'dollar_vol'
                 return False
 
-        # Adaptive MIN_DOLLAR_VOLUME: scale threshold for IEX feed (partial volume)
+        # Adaptive MIN_DOLLAR_VOLUME: during market hours the time-weighted check above
+        # already ran; only apply the raw absolute threshold outside regular hours.
         dollar_vol = price * day_vol
-        iex_feed_dv = _is_iex_feed()
-        eff_dollar_vol_threshold = adaptive_dollar_vol * (_IEX_THRESHOLD_SCALE if iex_feed_dv else 1.0)
-        if dollar_vol < eff_dollar_vol_threshold:
-            _log.warning(f"[GUARDRAIL] {symbol} blocked: dollar volume {dollar_vol:.0f} < eff_threshold {eff_dollar_vol_threshold:.0f} (adaptive={adaptive_dollar_vol:.0f} iex_scale={iex_feed_dv}) | price={price:.2f} | day_vol={day_vol:.0f}")
+        eff_dollar_vol_threshold = adaptive_dollar_vol * (_IEX_THRESHOLD_SCALE if iex_feed else 1.0)
+        if not market_state.is_regular_hours and dollar_vol < eff_dollar_vol_threshold:
+            _log.warning(f"[GUARDRAIL] {symbol} blocked: dollar volume {dollar_vol:.0f} < eff_threshold {eff_dollar_vol_threshold:.0f} (adaptive={adaptive_dollar_vol:.0f} iex_scale={iex_feed}) | price={price:.2f} | day_vol={day_vol:.0f}")
             if return_reason:
                 return False, 'dollar_vol'
             return False
 
-        # RVOL gate (adaptive)
-        if market_state.is_market_open and bull:
+        # RVOL gate (adaptive) — skipped when RVOL@TIME block already evaluated RVOL above
+        if not _rvol_gate_applied and market_state.is_market_open and bull:
             daily = get_bars(symbol, "5d", "1d")
             if not daily.empty and len(daily) >= 2:
                 avg_daily_vol = float(daily["volume"].iloc[:-1].mean())
@@ -335,7 +328,6 @@ def _passes_guardrails(symbol: str, bull_regime: bool = None, market_state: Opti
                     elapsed_min  = max((now_et - mkt_open).total_seconds() / 60, 1.0)
                     elapsed_frac = min(elapsed_min / 390.0, 1.0)
                     rvol = (day_vol / max(elapsed_frac, 0.02)) / avg_daily_vol
-                    iex_feed = _is_iex_feed()
                     rvol_threshold = adaptive_rvol * (_IEX_THRESHOLD_SCALE if iex_feed else 1.0)
                     if not iex_feed and rvol < rvol_threshold:
                         _log.warning(f"[GUARDRAIL] {symbol} blocked: RVOL {rvol:.2f} < rvol_threshold {rvol_threshold:.2f} (adaptive={adaptive_rvol:.2f} iex_scale={iex_feed}) | day_vol={day_vol:.0f} | avg_daily_vol={avg_daily_vol:.0f}")
@@ -343,13 +335,7 @@ def _passes_guardrails(symbol: str, bull_regime: bool = None, market_state: Opti
                             return False, 'rvol'
                         return False
 
-        # Adaptive MAX_GAP_CHASE_PCT using market regime and VIX
-        vix = None
-        if hasattr(market_state, 'vix') and market_state.vix is not None:
-            vix = market_state.vix
-        elif hasattr(market_state, 'resolve_vix'):
-            vix, _, _ = market_state.resolve_vix()
-        bull = bull_regime if bull_regime is not None else market_state.resolve_regime()
+        # Adaptive MAX_GAP_CHASE_PCT using market regime and VIX (already resolved above)
         base_gap = MAX_GAP_CHASE_PCT
         if bull:
             if vix and vix > 25:

@@ -165,7 +165,6 @@ class OptionsExecutor:
             if new_order_id:
                 threading.Thread(target=self._adaptive_limit_retry, args=(new_order_id, side, new_limit, symbol, contracts, occ_sym, is_mleg, payload, retry_count+1), daemon=True).start()
         else:
-            from engine.broker.etrade_client import LimitOrderRequest, OrderSide, TimeInForce
             order_req = LimitOrderRequest(
                 symbol=occ_sym,
                 qty=contracts,
@@ -681,6 +680,14 @@ class OptionsExecutor:
             return True  # allow attempt; the order itself will catch any restriction
 
     def place_option_order(self, signal: OptionSignal, market_state: MarketState) -> bool:
+        """
+        Production-ready order placement for ApexTrader.
+        Fixes communications with Alpaca API and internal state tracking.
+        """
+        # Fetch budget once — reused by the gross-notional pre-check (section 0) and
+        # contract sizing (section 3) to avoid two account API calls per order.
+        total_budget, remaining = self._get_options_budget()
+
         # 0. Gross Notional Check (LIVE accounts only)
         if not PAPER:
             # Prepare legs for the pending order
@@ -690,8 +697,6 @@ class OptionsExecutor:
             is_spread = signal.spread_sell_strike is not None and not is_butterfly and not is_condor
             is_mleg = is_butterfly or is_spread or is_condor
             cp_type = "call" if "call" in signal.option_type.lower() else "put"
-            # Use the same contract calculation as below
-            total_budget, remaining = self._get_options_budget()
             raw_contracts = self._calc_contracts(signal, remaining)
             from engine.config import MIN_SIGNAL_CONFIDENCE, CONF_SCALE_MIN_MULT, CONF_SCALE_FULL_CONF
             _conf_mult = CONF_SCALE_MIN_MULT + (1.0 - CONF_SCALE_MIN_MULT) * min(
@@ -743,10 +748,6 @@ class OptionsExecutor:
                     f"[OPTIONS] Skipping {signal.symbol} order: even 1 contract would exceed gross notional cap (${gross_notional:,.2f} > 6x equity ${equity:,.2f})"
                 )
                 return False
-        """
-        Production-ready order placement for ApexTrader.
-        Fixes communications with Alpaca API and internal state tracking.
-        """
         # 1. Global Enable Check
         if not getattr(self, "OPTIONS_ENABLED", True):
             return False
@@ -812,7 +813,6 @@ class OptionsExecutor:
                 return False
 
         # 3. Budget & Contract Calculation
-        total_budget, remaining = self._get_options_budget()
         raw_contracts = self._calc_contracts(signal, remaining)
         if raw_contracts <= 0:
             per_contract = signal.mid_price * CONTRACT_SIZE
