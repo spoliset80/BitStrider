@@ -102,6 +102,15 @@ def get_data_client() -> "StockHistoricalDataClient":
         if not API_KEY or not API_SECRET:
             raise ValueError("Alpaca API credentials not found in environment")
         _data_client = StockHistoricalDataClient(API_KEY, API_SECRET)
+        # Increase connection pool to match the 24-worker parallel prefetch
+        # (urllib3 default is 10 — causes 'pool full, discarding connection' at 24 workers)
+        try:
+            from requests.adapters import HTTPAdapter
+            adapter = HTTPAdapter(pool_connections=4, pool_maxsize=30)
+            _data_client._session.mount("https://", adapter)
+            _data_client._session.mount("http://", adapter)
+        except Exception:
+            pass
     return _data_client
 
 
@@ -112,6 +121,13 @@ def get_option_data_client() -> "OptionHistoricalDataClient":
         if not API_KEY or not API_SECRET:
             raise ValueError("Alpaca API credentials not found in environment")
         _option_data_client = OptionHistoricalDataClient(API_KEY, API_SECRET)
+        try:
+            from requests.adapters import HTTPAdapter
+            adapter = HTTPAdapter(pool_connections=4, pool_maxsize=30)
+            _option_data_client._session.mount("https://", adapter)
+            _option_data_client._session.mount("http://", adapter)
+        except Exception:
+            pass
     return _option_data_client
 
 
