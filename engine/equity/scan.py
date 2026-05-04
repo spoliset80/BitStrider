@@ -248,51 +248,96 @@ def _passes_guardrails(symbol: str, bull_regime: bool = None, market_state: Opti
             mkt_open = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
             elapsed_min = int(max((now_et - mkt_open).total_seconds() / 60, 1))
             elapsed_min = min(elapsed_min, 390)
-            if today_intraday.empty or past_intraday.empty or len(today_intraday) < 5 or len(past_intraday) < 390*2:
-                # Fallback: use fractional legacy RVOL logic (now_et/mkt_open/elapsed_min already computed above)
+            # ── RVOL@TIME: timestamp-based same-window comparison ─────────────────
+            # Use actual ET timestamps to slice each prior session's bars to the same
+            # elapsed-minute window as today.  This is robust against:
+            #   • sessions with early closes / halts (different bar counts)
+            #   • data gaps (missing bars within a session)
+            #   • weekends in the calendar-day loop
+            # Partial sessions (≥50% of expected bars) are accepted and scaled
+            # proportionally so they compare on the same elapsed-time basis.
+            # Falls back to fractional legacy RVOL only when no valid prior bars exist.
+            _rvol_computed = False
+            cutoff_today = mkt_open + datetime.timedelta(minutes=elapsed_min)
+            if not today_intraday.empty and len(today_intraday) >= 3:
+                try:
+                    today_mask = (
+                        (today_intraday["time"] >= mkt_open) &
+                        (today_intraday["time"] <  cutoff_today)
+                    )
+                    today_vol = float(today_intraday.loc[today_mask, "volume"].sum())
+
+                    avg_vols = []
+                    if not past_intraday.empty:
+                        for _d in range(1, 8):   # walk back up to 7 cal-days to find 5 sessions
+                            if len(avg_vols) >= 5:
+                                break
+                            prior_date = (now_et - datetime.timedelta(days=_d)).date()
+                            if prior_date.weekday() >= 5:   # skip Saturday/Sunday
+                                continue
+                            day_open_dt  = _ET.localize(
+                                datetime.datetime.combine(prior_date, datetime.time(9, 30))
+                            )
+                            day_cutoff   = day_open_dt + datetime.timedelta(minutes=elapsed_min)
+                            day_mask     = (
+                                (past_intraday["time"] >= day_open_dt) &
+                                (past_intraday["time"] <  day_cutoff)
+                            )
+                            day_slice = past_intraday.loc[day_mask, "volume"]
+                            n = len(day_slice)
+                            if n >= max(3, int(elapsed_min * 0.50)):
+                                # Scale partial sessions to full elapsed-window equivalent
+                                avg_vols.append(float(day_slice.sum()) * (elapsed_min / n))
+
+                    if avg_vols:
+                        avg_intraday_vol = sum(avg_vols) / len(avg_vols)
+                        rvol = today_vol / max(avg_intraday_vol, 1)
+                        rvol_threshold = adaptive_rvol * (_IEX_THRESHOLD_SCALE if iex_feed else 1.0)
+                        _log.info(
+                            f"[RVOL@TIME] {symbol}: today_vol={today_vol:.0f}, "
+                            f"avg_intraday_vol={avg_intraday_vol:.0f} ({len(avg_vols)} sessions), "
+                            f"elapsed_min={elapsed_min}, rvol={rvol:.3f}, threshold={rvol_threshold:.2f} "
+                            f"(adaptive={adaptive_rvol:.2f} iex_scale={iex_feed})"
+                        )
+                        if not iex_feed and rvol < rvol_threshold:
+                            _log.warning(
+                                f"[GUARDRAIL] {symbol} blocked: RVOL@TIME {rvol:.2f} < "
+                                f"rvol_threshold {rvol_threshold:.2f} (adaptive={adaptive_rvol:.2f}) "
+                                f"| today_vol={today_vol:.0f} | avg_intraday_vol={avg_intraday_vol:.0f}"
+                            )
+                            if return_reason:
+                                return False, 'rvol'
+                            return False
+                        _rvol_computed = True
+                except Exception as _rvol_err:
+                    _log.debug(f"[RVOL@TIME] {symbol}: timestamp-based RVOL failed ({_rvol_err}) — using fallback")
+
+            if not _rvol_computed:
+                # Fallback: fractional legacy RVOL — always gates (never silent pass-through)
                 elapsed_frac = elapsed_min / 390.0
-                # Get average daily volume from last 5 days
                 daily = get_bars(symbol, "5d", "1d")
                 if not daily.empty and len(daily) >= 2:
                     avg_daily_vol = float(daily["volume"].iloc[:-1].mean())
                 else:
                     avg_daily_vol = 1.0
-                today_vol = float(day_vol)
+                today_vol_fb = float(day_vol)
                 denom = avg_daily_vol * max(elapsed_frac, 0.02)
-                rvol_fallback = today_vol / denom if denom > 0 else 0.0
+                rvol_fallback = today_vol_fb / denom if denom > 0 else 0.0
                 rvol_threshold = adaptive_rvol * (_IEX_THRESHOLD_SCALE if iex_feed else 1.0)
-                _log.warning(f"[RVOL@TIME FALLBACK] {symbol}: insufficient intraday data for RVOL@TIME, using fractional legacy RVOL logic. today_vol={today_vol:.0f}, avg_daily_vol={avg_daily_vol:.0f}, elapsed_frac={elapsed_frac:.3f}, denom={denom:.0f}, rvol_fallback={rvol_fallback:.3f}, adaptive_rvol={adaptive_rvol:.2f} (iex_scale={iex_feed})")
+                _log.warning(
+                    f"[RVOL@TIME FALLBACK] {symbol}: no valid prior-session bars — "
+                    f"fractional legacy RVOL: rvol={rvol_fallback:.3f}, threshold={rvol_threshold:.2f} "
+                    f"(avg_daily={avg_daily_vol:.0f} elapsed_frac={elapsed_frac:.3f} iex_scale={iex_feed})"
+                )
                 if not iex_feed and rvol_fallback < rvol_threshold:
-                    _log.warning(f"[GUARDRAIL] {symbol} blocked: RVOL_FALLBACK {rvol_fallback:.2f} < rvol_threshold {rvol_threshold:.2f} (adaptive={adaptive_rvol:.2f} iex_scale={iex_feed}) | today_vol={today_vol:.0f} | denom={denom:.0f}")
+                    _log.warning(
+                        f"[GUARDRAIL] {symbol} blocked: RVOL_FALLBACK {rvol_fallback:.2f} < "
+                        f"rvol_threshold {rvol_threshold:.2f} (adaptive={adaptive_rvol:.2f}) "
+                        f"| today_vol={today_vol_fb:.0f} | denom={denom:.0f}"
+                    )
                     if return_reason:
                         return False, 'rvol'
                     return False
-            else:
-                # Today's volume up to now
-                today_vol = float(today_intraday["volume"].iloc[:elapsed_min].sum())
-                # For each of the previous 5 days, sum volume up to the same minute
-                avg_vols = []
-                for d in range(1, 6):
-                    day_start = -elapsed_min - 390 * d
-                    day_end = -390 * (d - 1)
-                    if day_end == 0:
-                        day_slice = past_intraday["volume"].iloc[day_start:]
-                    else:
-                        day_slice = past_intraday["volume"].iloc[day_start:day_end]
-                    if len(day_slice) == elapsed_min:
-                        avg_vols.append(float(day_slice.sum()))
-                if avg_vols:
-                    avg_intraday_vol = sum(avg_vols) / len(avg_vols)
-                    rvol = today_vol / max(avg_intraday_vol, 1)
-                    rvol_threshold = adaptive_rvol * (_IEX_THRESHOLD_SCALE if iex_feed else 1.0)
-                    _log.info(f"[RVOL@TIME DEBUG] {symbol}: today_vol={today_vol:.0f}, avg_intraday_vol={avg_intraday_vol:.0f}, elapsed_min={elapsed_min}, rvol={rvol:.3f}, rvol_threshold={rvol_threshold:.2f} (adaptive={adaptive_rvol:.2f} iex_scale={iex_feed})")
-                    if not iex_feed and rvol < rvol_threshold:
-                        _log.warning(f"[GUARDRAIL] {symbol} blocked: RVOL@TIME {rvol:.2f} < rvol_threshold {rvol_threshold:.2f} (adaptive={adaptive_rvol:.2f} iex_scale={iex_feed}) | today_vol={today_vol:.0f} | avg_intraday_vol={avg_intraday_vol:.0f}")
-                        if return_reason:
-                            return False, 'rvol'
-                        return False
-                else:
-                    _log.warning(f"[RVOL@TIME FALLBACK] {symbol}: not enough valid days for RVOL@TIME, using legacy RVOL logic.")
             _rvol_gate_applied = True  # RVOL@TIME block ran — skip legacy gate below
             # Time-weighted dollar volume guardrail
             elapsed_frac = elapsed_min / 390.0
