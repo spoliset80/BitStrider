@@ -138,11 +138,20 @@ class EnhancedExecutor:
         self._pdt_violation_alerted: bool = False  # tracks whether the PDT violation email has been sent this session
         self._eod_close_done: object = None  # date of last completed EOD close (prevents duplicate runs)
         self.market_state: Optional[MarketState] = None
+        self._options_cost_reserve: float = 0.0  # $ currently deployed in options — set by orchestrator each cycle
         self._rebuild_entry_log_from_orders()
 
     def update_market_state(self, market_state: MarketState) -> None:
         """Store the active market snapshot for per-cycle execution decisions."""
         self.market_state = market_state
+
+    def set_options_cost_reserve(self, cost: float) -> None:
+        """Called by the orchestrator each cycle with the current options capital deployed.
+
+        The equity executor deducts this from available buying power so equity trades
+        cannot double-spend the capital already committed to open options positions.
+        """
+        self._options_cost_reserve = max(0.0, cost)
 
     # -- Entry Log Rebuild (survive restarts) ----------------------------
     def _rebuild_entry_log_from_orders(self) -> None:
@@ -362,18 +371,25 @@ class EnhancedExecutor:
         )
 
         # ── Buying power gate (must come first) ───────────────────────────
-        # Check if sufficient buying power for this trade (primary constraint).
-        # This allows entry even when at max positions if capital is available.
+        # Deduct capital already committed to open options positions so equity
+        # cannot double-spend the options allocation.
+        effective_bp = acct.buying_power - self._options_cost_reserve
+        if self._options_cost_reserve > 0:
+            log.debug(
+                f"[DBG] BP after options reserve deduction: "
+                f"${acct.buying_power:,.0f} - ${self._options_cost_reserve:,.0f} = ${effective_bp:,.0f}"
+            )
         margin = 2.0 if order_type == OrderType.SHORT else 1.0
         min_usable = (SMALL_ACCOUNT_MIN_POSITION_DOLLARS 
                       if acct.equity < SMALL_ACCOUNT_EQUITY_THRESHOLD 
                       else MIN_POSITION_DOLLARS)
         min_bp_needed = min_usable * margin
         
-        if acct.buying_power < min_bp_needed:
+        if effective_bp < min_bp_needed:
             return False, (
-                f"Insufficient buying power: ${acct.buying_power:,.0f} "
-                f"(need ${min_bp_needed:,.0f} for minimum position)"
+                f"Insufficient buying power: ${effective_bp:,.0f} "
+                f"(need ${min_bp_needed:,.0f} for minimum position, "
+                f"${self._options_cost_reserve:,.0f} reserved for options)"
             )
         
         # ── Max positions gate (secondary; optional swap if at limit) ─────

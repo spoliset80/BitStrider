@@ -1,15 +1,15 @@
 {
-  "generated_at": "2026-05-04T09:26:17-04:00",
+  "generated_at": "2026-05-04T10:07:45-04:00",
   "date": "2026-05-04",
   "market_regime": "bull",
   "picks": [
     {
-      "symbol": "RNG",
+      "symbol": "ASRT",
       "action": "buy",
-      "price": 45.0518,
-      "confidence": 0.7758,
-      "strategy": "Sentiment",
-      "reason": "Sentiment bullish + vol x3.26 + price>20SMA"
+      "price": 21.685,
+      "confidence": 0.96,
+      "strategy": "EarlySqueeze",
+      "reason": "Early squeeze: float 5.6M | gap +17.3% | RVOL x55.1 projected | above VWAP"
     }
   ]
 }

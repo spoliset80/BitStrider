@@ -1745,8 +1745,8 @@ class ShortSqueezeStrategy:
                 if rr < 0.8:
                     return None
 
-                # Confidence — spread mode is lower starting point (more uncertainty)
-                conf = 0.68
+                # Confidence — spread mode: base 0.73 (min boosts clear 0.76 threshold)
+                conf = 0.73
                 conf += min(0.07, (short_pct - 0.12) * 0.55)
                 conf += min(0.04, rev_growth * 0.12)
                 if confirmed_rs and rs_13w is not None:
@@ -1793,7 +1793,7 @@ class ShortSqueezeStrategy:
                 if rr < f["MIN_RR"]:
                     return None
 
-                conf = 0.70
+                conf = 0.74
                 conf += min(0.08, (short_pct - 0.12) * 0.6)
                 conf += min(0.04, rev_growth * 0.15)
                 if rs_13w is not None:

@@ -184,7 +184,8 @@ def _run_options_cycle(ctx: AppContext, market_state: MarketState) -> None:
     if ctx.options_executor is None:
         return
 
-    if not market_state.is_regular_hours:
+    # Allow FORCE_EQUITY to bypass the regular-hours gate (weekend/after-hours testing).
+    if not market_state.is_regular_hours and not cfg.FORCE_EQUITY:
         return
 
     try:
@@ -533,6 +534,11 @@ def scan_and_trade(ctx: AppContext) -> None:
 
     ctx.executor.update_market_state(ctx.market_state)
     _run_options_cycle(ctx, ctx.market_state)
+
+    # Inform equity executor how much capital is already committed to open options
+    # positions so it deducts that from available buying power before sizing equity trades.
+    if ctx.options_executor is not None:
+        ctx.executor.set_options_cost_reserve(ctx.options_executor._current_options_cost())
 
     market_state = ctx.market_state
     if not market_state.is_market_open:
