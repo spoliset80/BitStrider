@@ -1,47 +1,15 @@
 {
-  "generated_at": "2026-05-03T23:11:08-04:00",
-  "date": "2026-05-03",
+  "generated_at": "2026-05-04T09:26:17-04:00",
+  "date": "2026-05-04",
   "market_regime": "bull",
   "picks": [
     {
-      "symbol": "ORGO",
+      "symbol": "RNG",
       "action": "buy",
-      "price": 2.56,
-      "confidence": 0.92,
+      "price": 45.0518,
+      "confidence": 0.7758,
       "strategy": "Sentiment",
-      "reason": "Sentiment bullish + vol x5.75 + price>20SMA"
-    },
-    {
-      "symbol": "OLED",
-      "action": "buy",
-      "price": 96.37,
-      "confidence": 0.8754,
-      "strategy": "Sentiment",
-      "reason": "Sentiment bullish + vol x4.25 + price>20SMA"
-    },
-    {
-      "symbol": "TRN",
-      "action": "buy",
-      "price": 36.18,
-      "confidence": 0.8366,
-      "strategy": "Sentiment",
-      "reason": "Sentiment bullish + vol x3.87 + price>20SMA"
-    },
-    {
-      "symbol": "HLF",
-      "action": "buy",
-      "price": 16.28,
-      "confidence": 0.82,
-      "strategy": "Sweepea",
-      "reason": "Daily Sweepea pullback to 20-EMA | ATR $0.73"
-    },
-    {
-      "symbol": "LWLG",
-      "action": "buy",
-      "price": 16.27,
-      "confidence": 0.82,
-      "strategy": "Sweepea",
-      "reason": "Daily Sweepea pullback to 8-EMA | ATR $1.96"
+      "reason": "Sentiment bullish + vol x3.26 + price>20SMA"
     }
   ]
 }
