@@ -25,6 +25,7 @@ import concurrent.futures
 import datetime
 import logging
 import math
+import threading
 import time
 from dataclasses import dataclass
 from typing import Optional, List, Dict, Tuple
@@ -216,6 +217,23 @@ _oi_cache: Dict[str, tuple] = {}      # symbol -> (date, oi_map)
 # Per-scan-cycle bar-context cache — populated by parallel prefetch, cleared each scan
 _bar_ctx_cache: Dict[str, Optional["_BarCtx"]] = {}
 
+# Module-level OI TradingClient singleton — avoids creating a new HTTP session
+# for every symbol during parallel OI prefetch (was 120+ instantiations per cycle).
+_oi_trading_client = None
+_oi_trading_client_lock = threading.Lock()
+
+
+def _get_oi_trading_client():
+    """Return a module-level singleton TradingClient for OI contract fetches."""
+    global _oi_trading_client
+    if _oi_trading_client is not None:
+        return _oi_trading_client
+    with _oi_trading_client_lock:
+        if _oi_trading_client is None:
+            from engine.broker.broker_factory import BrokerFactory
+            _oi_trading_client = BrokerFactory.create_stock_client("alpaca")
+    return _oi_trading_client
+
 # Memory usage monitor
 def _check_memory():
     process = psutil.Process()
@@ -244,8 +262,14 @@ def _get_options_chain(symbol: str) -> Optional[OptionsChainInfo]:
     if len(_chain_cache) >= _CHAIN_MAX:
         _chain_cache.clear()
 
-    # 65-day daily bars for HV, ATR, IV rank (already Alpaca-first in get_bars)
-    hist = get_bars(symbol, period="65d", interval="1d")
+    # 65-day daily bars for HV, ATR, IV rank.
+    # Reuse already-prefetched bar context when available (avoids a redundant
+    # get_bars("65d","1d") call during the parallel prefetch phase).
+    _cached_ctx = _bar_ctx_cache.get(symbol)
+    if _cached_ctx is not None and _cached_ctx.daily is not None and len(_cached_ctx.daily) >= 15:
+        hist = _cached_ctx.daily
+    else:
+        hist = get_bars(symbol, period="65d", interval="1d")
     if hist.empty or len(hist) < 15:
         return None
     spot = float(hist["close"].iloc[-1])
@@ -355,8 +379,7 @@ def _fetch_oi_from_contracts(symbol: str, exp_gte: datetime.date, exp_lte: datet
 
     try:
         from alpaca.trading.requests import GetOptionContractsRequest
-        from engine.broker.broker_factory import BrokerFactory
-        tc = BrokerFactory.create_stock_client("alpaca")
+        tc = _get_oi_trading_client()
         oi_map: Dict[str, int] = {}
         page_token = None
         while True:
@@ -2523,11 +2546,11 @@ def scan_options_universe(
         except Exception:
             pass
 
-    # Up to 12 workers: chain snapshots are the bottleneck (network I/O bound).
-    # urllib3 default pool size is 10; we stay at 12 because chains and bars
-    # use separate clients (OptionHistoricalDataClient vs StockHistoricalDataClient)
-    # so they don't share the same pool.
-    _PREFETCH_WORKERS = min(12, _n_total)
+    # Up to 24 workers: all three fetch types (bars, OI, chain) are network I/O
+    # bound and use separate HTTP clients, so they don't contend on a single pool.
+    # 24 workers gives ~5-round ceil(122/24) versus the old ~11-round ceil(122/12),
+    # roughly halving wall-clock prefetch time for a 120-ticker universe.
+    _PREFETCH_WORKERS = min(24, _n_total)
     with concurrent.futures.ThreadPoolExecutor(max_workers=_PREFETCH_WORKERS) as pool:
         list(pool.map(_prefetch, ti_universe))
     log.info(f"Options scan: prefetch complete — starting strategy evaluation")
