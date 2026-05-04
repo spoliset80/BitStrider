@@ -1168,15 +1168,19 @@ class OptionsExecutor:
                     _sign = 1 if leg["side"] == "buy" else -1
                     current_mark += _sign * _mid
 
-                entry_mark = abs(pos.entry_price)   # net debit paid (or credit received) per share
+                entry_price_signed = float(pos.entry_price)
+                entry_mark = abs(entry_price_signed)   # absolute entry premium per share
                 entry_cost_dollars = entry_mark * pos.contracts * CONTRACT_SIZE
                 if entry_cost_dollars < 0.01:
                     continue
 
                 # pnl_pct: positive = profitable, negative = losing.
-                # For debit spreads: current_mark > entry_mark → profit.
-                # For credit spreads: entry_price stored negative, entry_mark = abs → same formula.
-                pnl_pct = (current_mark - entry_mark) / entry_mark * 100
+                # Use signed entry price so both debit and credit strategies normalize correctly:
+                #   debit  entry +x: (current - +x) / x
+                #   credit entry -x: (current - -x) / x
+                # This yields ~0% near entry for either style and prevents false -200% reads
+                # on credit spreads.
+                pnl_pct = (current_mark - entry_price_signed) / entry_mark * 100
 
                 if pnl_pct > pos.peak_pnl_pct:
                     pos.peak_pnl_pct = pnl_pct
