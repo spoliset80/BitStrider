@@ -239,118 +239,201 @@ def _passes_guardrails(symbol: str, bull_regime: bool = None, market_state: Opti
 
         # Adaptive RVOL_MIN: higher in bull/high VIX, lower in calm or bear conditions
         # Use regular market hours only so extended-hours volume does not distort the pace.
+        #
+        # ── History-depth tiers ───────────────────────────────────────────────
+        # Tier 1 — 0 daily bars:   skip (no coverage); log [NEW_LISTING]
+        # Tier 2 — 1–4 daily bars: no RVOL baseline exists; gate on absolute
+        #                          dollar-volume pace instead (avoids blocking
+        #                          a genuine high-volume day-1/2 IPO)
+        # Tier 3 — 5–14 daily bars: RVOL@TIME with threshold discounted by
+        #                          session count (fewer ref sessions = more noise)
+        # Tier 4 — 15+ daily bars: full RVOL@TIME threshold (normal operation)
+        # ─────────────────────────────────────────────────────────────────────
         _rvol_gate_applied = False  # track whether RVOL@TIME block ran (skip legacy gate below)
         if market_state.is_regular_hours and bull:
-            # Fetch today's and past 5 days' 1-min bars via get_bars (MDA-primary)
-            today_intraday = get_bars(symbol, "1d", "1m")
-            past_intraday  = get_bars(symbol, "6d", "1m")
-            now_et = datetime.datetime.now(_ET)
-            mkt_open = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
-            elapsed_min = int(max((now_et - mkt_open).total_seconds() / 60, 1))
-            elapsed_min = min(elapsed_min, 390)
-            # ── RVOL@TIME: timestamp-based same-window comparison ─────────────────
-            # Use actual ET timestamps to slice each prior session's bars to the same
-            # elapsed-minute window as today.  This is robust against:
-            #   • sessions with early closes / halts (different bar counts)
-            #   • data gaps (missing bars within a session)
-            #   • weekends in the calendar-day loop
-            # Partial sessions (≥50% of expected bars) are accepted and scaled
-            # proportionally so they compare on the same elapsed-time basis.
-            # Falls back to fractional legacy RVOL only when no valid prior bars exist.
-            _rvol_computed = False
-            cutoff_today = mkt_open + datetime.timedelta(minutes=elapsed_min)
-            if not today_intraday.empty and len(today_intraday) >= 3:
-                try:
-                    today_mask = (
-                        (today_intraday["time"] >= mkt_open) &
-                        (today_intraday["time"] <  cutoff_today)
-                    )
-                    today_vol = float(today_intraday.loc[today_mask, "volume"].sum())
+            # Determine history depth from daily bars (already cheap — MDA/Alpaca daily)
+            _daily_hist = get_bars(symbol, "20d", "1d")
+            _n_daily = len(_daily_hist)
 
-                    avg_vols = []
-                    if not past_intraday.empty:
-                        for _d in range(1, 8):   # walk back up to 7 cal-days to find 5 sessions
-                            if len(avg_vols) >= 5:
-                                break
-                            prior_date = (now_et - datetime.timedelta(days=_d)).date()
-                            if prior_date.weekday() >= 5:   # skip Saturday/Sunday
-                                continue
-                            day_open_dt  = _ET.localize(
-                                datetime.datetime.combine(prior_date, datetime.time(9, 30))
-                            )
-                            day_cutoff   = day_open_dt + datetime.timedelta(minutes=elapsed_min)
-                            day_mask     = (
-                                (past_intraday["time"] >= day_open_dt) &
-                                (past_intraday["time"] <  day_cutoff)
-                            )
-                            day_slice = past_intraday.loc[day_mask, "volume"]
-                            n = len(day_slice)
-                            if n >= max(3, int(elapsed_min * 0.50)):
-                                # Scale partial sessions to full elapsed-window equivalent
-                                avg_vols.append(float(day_slice.sum()) * (elapsed_min / n))
+            if _n_daily == 0:
+                # Tier 1: no coverage at all — skip immediately
+                _log.info(f"[NEW_LISTING] {symbol}: no historical bar data available — skipping")
+                if return_reason:
+                    return False, 'other'
+                return False
 
-                    if avg_vols:
-                        avg_intraday_vol = sum(avg_vols) / len(avg_vols)
-                        rvol = today_vol / max(avg_intraday_vol, 1)
-                        rvol_threshold = adaptive_rvol * (_IEX_THRESHOLD_SCALE if iex_feed else 1.0)
-                        _log.info(
-                            f"[RVOL@TIME] {symbol}: today_vol={today_vol:.0f}, "
-                            f"avg_intraday_vol={avg_intraday_vol:.0f} ({len(avg_vols)} sessions), "
-                            f"elapsed_min={elapsed_min}, rvol={rvol:.3f}, threshold={rvol_threshold:.2f} "
-                            f"(adaptive={adaptive_rvol:.2f} iex_scale={iex_feed})"
-                        )
-                        if not iex_feed and rvol < rvol_threshold:
-                            _log.warning(
-                                f"[GUARDRAIL] {symbol} blocked: RVOL@TIME {rvol:.2f} < "
-                                f"rvol_threshold {rvol_threshold:.2f} (adaptive={adaptive_rvol:.2f}) "
-                                f"| today_vol={today_vol:.0f} | avg_intraday_vol={avg_intraday_vol:.0f}"
-                            )
-                            if return_reason:
-                                return False, 'rvol'
-                            return False
-                        _rvol_computed = True
-                except Exception as _rvol_err:
-                    _log.debug(f"[RVOL@TIME] {symbol}: timestamp-based RVOL failed ({_rvol_err}) — using fallback")
-
-            if not _rvol_computed:
-                # Fallback: fractional legacy RVOL — always gates (never silent pass-through)
-                elapsed_frac = elapsed_min / 390.0
-                daily = get_bars(symbol, "5d", "1d")
-                if not daily.empty and len(daily) >= 2:
-                    avg_daily_vol = float(daily["volume"].iloc[:-1].mean())
-                else:
-                    avg_daily_vol = 1.0
-                today_vol_fb = float(day_vol)
-                denom = avg_daily_vol * max(elapsed_frac, 0.02)
-                rvol_fallback = today_vol_fb / denom if denom > 0 else 0.0
-                rvol_threshold = adaptive_rvol * (_IEX_THRESHOLD_SCALE if iex_feed else 1.0)
-                _log.warning(
-                    f"[RVOL@TIME FALLBACK] {symbol}: no valid prior-session bars — "
-                    f"fractional legacy RVOL: rvol={rvol_fallback:.3f}, threshold={rvol_threshold:.2f} "
-                    f"(avg_daily={avg_daily_vol:.0f} elapsed_frac={elapsed_frac:.3f} iex_scale={iex_feed})"
+            elif _n_daily <= 4:
+                # Tier 2: IPO / very new listing (days 1–4) — no reliable RVOL baseline.
+                # Gate on raw dollar-volume pace: require $750K * elapsed_frac of the day
+                # (~$1.5M/day equivalent). This lets through genuine high-volume new listings
+                # (e.g. day-2 IPO running 85× volume) while blocking quiet ones.
+                now_et   = datetime.datetime.now(_ET)
+                mkt_open = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
+                elapsed_min  = int(max((now_et - mkt_open).total_seconds() / 60, 1))
+                elapsed_frac = min(elapsed_min / 390.0, 1.0)
+                dollar_vol_now = price * day_vol
+                _NEW_LISTING_DV_THRESHOLD = 750_000
+                dv_threshold = _NEW_LISTING_DV_THRESHOLD * max(elapsed_frac, 0.05)
+                _log.info(
+                    f"[NEW_LISTING] {symbol}: {_n_daily}d history — "
+                    f"using dollar-vol gate (no RVOL baseline). "
+                    f"dv={dollar_vol_now:,.0f} threshold={dv_threshold:,.0f} "
+                    f"elapsed_frac={elapsed_frac:.2f}"
                 )
-                if not iex_feed and rvol_fallback < rvol_threshold:
+                if dollar_vol_now < dv_threshold:
                     _log.warning(
-                        f"[GUARDRAIL] {symbol} blocked: RVOL_FALLBACK {rvol_fallback:.2f} < "
-                        f"rvol_threshold {rvol_threshold:.2f} (adaptive={adaptive_rvol:.2f}) "
-                        f"| today_vol={today_vol_fb:.0f} | denom={denom:.0f}"
+                        f"[GUARDRAIL] {symbol} blocked: new listing dollar-vol "
+                        f"{dollar_vol_now:,.0f} < {dv_threshold:,.0f} "
+                        f"({_n_daily}d history)"
                     )
                     if return_reason:
-                        return False, 'rvol'
+                        return False, 'dollar_vol'
                     return False
-            _rvol_gate_applied = True  # RVOL@TIME block ran — skip legacy gate below
-            # Time-weighted dollar volume guardrail
-            elapsed_frac = elapsed_min / 390.0
-            # Scale threshold down when IEX feed is used (IEX ~15% of SIP volume)
-            dv_scale = _IEX_THRESHOLD_SCALE if iex_feed else 1.0
-            tw_dollar_vol = adaptive_dollar_vol * max(elapsed_frac, 0.05) * dv_scale
-            dollar_vol = price * day_vol
-            _log.info(f"[DOLLAR_VOL@TIME DEBUG] {symbol}: dollar_vol={dollar_vol:.0f}, tw_dollar_vol={tw_dollar_vol:.0f} (iex_scale={iex_feed}), elapsed_min={elapsed_min}, elapsed_frac={elapsed_frac:.3f}")
-            if dollar_vol < tw_dollar_vol:
-                _log.warning(f"[GUARDRAIL] {symbol} blocked: dollar volume {dollar_vol:.0f} < tw_dollar_vol {tw_dollar_vol:.0f} (iex_scale={iex_feed}) | price={price:.2f} | day_vol={day_vol:.0f}")
-                if return_reason:
-                    return False, 'dollar_vol'
-                return False
+                _rvol_gate_applied = True
+
+            else:
+                # Tier 3 / Tier 4: enough history for RVOL@TIME
+                # Fetch today's and past bars via get_bars (MDA-primary)
+                today_intraday = get_bars(symbol, "1d", "1m")
+                past_intraday  = get_bars(symbol, "6d", "1m")
+                now_et = datetime.datetime.now(_ET)
+                mkt_open = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
+                elapsed_min = int(max((now_et - mkt_open).total_seconds() / 60, 1))
+                elapsed_min = min(elapsed_min, 390)
+
+                # ── RVOL@TIME: timestamp-based same-window comparison ─────────────
+                # Use actual ET timestamps to slice each prior session's bars to the
+                # same elapsed-minute window as today.  Robust against:
+                #   • sessions with early closes / halts (different bar counts)
+                #   • data gaps (missing bars within a session)
+                #   • weekends in the calendar-day loop
+                # Partial sessions (≥50% of expected bars) are accepted and scaled
+                # proportionally so they compare on the same elapsed-time basis.
+                # Tier 3 (5–14 daily bars): threshold discounted by session count —
+                # fewer reference sessions = noisier baseline = lower bar to clear.
+                #   4 sessions → 100% threshold
+                #   3 sessions →  90%
+                #   2 sessions →  80%
+                #   1 session  →  65%
+                # Falls back to fractional legacy RVOL only when no valid sessions exist.
+                _rvol_computed = False
+                cutoff_today = mkt_open + datetime.timedelta(minutes=elapsed_min)
+                if not today_intraday.empty and len(today_intraday) >= 3:
+                    try:
+                        today_mask = (
+                            (today_intraday["time"] >= mkt_open) &
+                            (today_intraday["time"] <  cutoff_today)
+                        )
+                        today_vol = float(today_intraday.loc[today_mask, "volume"].sum())
+
+                        avg_vols = []
+                        if not past_intraday.empty:
+                            for _d in range(1, 8):   # walk back up to 7 cal-days to find 5 sessions
+                                if len(avg_vols) >= 5:
+                                    break
+                                prior_date = (now_et - datetime.timedelta(days=_d)).date()
+                                if prior_date.weekday() >= 5:   # skip Saturday/Sunday
+                                    continue
+                                day_open_dt = _ET.localize(
+                                    datetime.datetime.combine(prior_date, datetime.time(9, 30))
+                                )
+                                day_cutoff  = day_open_dt + datetime.timedelta(minutes=elapsed_min)
+                                day_mask    = (
+                                    (past_intraday["time"] >= day_open_dt) &
+                                    (past_intraday["time"] <  day_cutoff)
+                                )
+                                day_slice = past_intraday.loc[day_mask, "volume"]
+                                n = len(day_slice)
+                                if n >= max(3, int(elapsed_min * 0.50)):
+                                    # Scale partial sessions to full elapsed-window equivalent
+                                    avg_vols.append(float(day_slice.sum()) * (elapsed_min / n))
+
+                        if avg_vols:
+                            avg_intraday_vol = sum(avg_vols) / len(avg_vols)
+                            rvol = today_vol / max(avg_intraday_vol, 1)
+                            # Session-count discount: fewer reference sessions → lower threshold
+                            _session_discount = {1: 0.65, 2: 0.80, 3: 0.90}.get(len(avg_vols), 1.0)
+                            rvol_threshold = (
+                                adaptive_rvol * _session_discount *
+                                (_IEX_THRESHOLD_SCALE if iex_feed else 1.0)
+                            )
+                            _log.info(
+                                f"[RVOL@TIME] {symbol}: today_vol={today_vol:.0f}, "
+                                f"avg_intraday_vol={avg_intraday_vol:.0f} ({len(avg_vols)} sessions), "
+                                f"elapsed_min={elapsed_min}, rvol={rvol:.3f}, "
+                                f"threshold={rvol_threshold:.2f} "
+                                f"(adaptive={adaptive_rvol:.2f} "
+                                f"session_discount={_session_discount:.2f} "
+                                f"iex_scale={iex_feed})"
+                            )
+                            if not iex_feed and rvol < rvol_threshold:
+                                _log.warning(
+                                    f"[GUARDRAIL] {symbol} blocked: RVOL@TIME {rvol:.2f} < "
+                                    f"rvol_threshold {rvol_threshold:.2f} "
+                                    f"(adaptive={adaptive_rvol:.2f} "
+                                    f"sessions={len(avg_vols)} discount={_session_discount:.2f}) "
+                                    f"| today_vol={today_vol:.0f} | avg_intraday_vol={avg_intraday_vol:.0f}"
+                                )
+                                if return_reason:
+                                    return False, 'rvol'
+                                return False
+                            _rvol_computed = True
+                    except Exception as _rvol_err:
+                        _log.debug(
+                            f"[RVOL@TIME] {symbol}: timestamp-based RVOL failed "
+                            f"({_rvol_err}) — using fallback"
+                        )
+
+                if not _rvol_computed:
+                    # Fallback: fractional legacy RVOL — always gates (never silent pass-through)
+                    elapsed_frac = elapsed_min / 390.0
+                    # Reuse _daily_hist already fetched above — no extra API call
+                    if not _daily_hist.empty and len(_daily_hist) >= 2:
+                        avg_daily_vol = float(_daily_hist["volume"].iloc[:-1].mean())
+                    else:
+                        avg_daily_vol = 1.0
+                    today_vol_fb = float(day_vol)
+                    denom = avg_daily_vol * max(elapsed_frac, 0.02)
+                    rvol_fallback = today_vol_fb / denom if denom > 0 else 0.0
+                    rvol_threshold = adaptive_rvol * (_IEX_THRESHOLD_SCALE if iex_feed else 1.0)
+                    _log.warning(
+                        f"[RVOL@TIME FALLBACK] {symbol}: no valid prior-session bars — "
+                        f"fractional legacy RVOL: rvol={rvol_fallback:.3f}, "
+                        f"threshold={rvol_threshold:.2f} "
+                        f"(avg_daily={avg_daily_vol:.0f} elapsed_frac={elapsed_frac:.3f} "
+                        f"iex_scale={iex_feed})"
+                    )
+                    if not iex_feed and rvol_fallback < rvol_threshold:
+                        _log.warning(
+                            f"[GUARDRAIL] {symbol} blocked: RVOL_FALLBACK {rvol_fallback:.2f} < "
+                            f"rvol_threshold {rvol_threshold:.2f} (adaptive={adaptive_rvol:.2f}) "
+                            f"| today_vol={today_vol_fb:.0f} | denom={denom:.0f}"
+                        )
+                        if return_reason:
+                            return False, 'rvol'
+                        return False
+
+                _rvol_gate_applied = True  # RVOL@TIME block ran — skip legacy gate below
+                # Time-weighted dollar volume guardrail
+                elapsed_frac = elapsed_min / 390.0
+                # Scale threshold down when IEX feed is used (IEX ~15% of SIP volume)
+                dv_scale = _IEX_THRESHOLD_SCALE if iex_feed else 1.0
+                tw_dollar_vol = adaptive_dollar_vol * max(elapsed_frac, 0.05) * dv_scale
+                dollar_vol = price * day_vol
+                _log.info(
+                    f"[DOLLAR_VOL@TIME DEBUG] {symbol}: dollar_vol={dollar_vol:.0f}, "
+                    f"tw_dollar_vol={tw_dollar_vol:.0f} (iex_scale={iex_feed}), "
+                    f"elapsed_min={elapsed_min}, elapsed_frac={elapsed_frac:.3f}"
+                )
+                if dollar_vol < tw_dollar_vol:
+                    _log.warning(
+                        f"[GUARDRAIL] {symbol} blocked: dollar volume {dollar_vol:.0f} < "
+                        f"tw_dollar_vol {tw_dollar_vol:.0f} (iex_scale={iex_feed}) "
+                        f"| price={price:.2f} | day_vol={day_vol:.0f}"
+                    )
+                    if return_reason:
+                        return False, 'dollar_vol'
+                    return False
 
         # Adaptive MIN_DOLLAR_VOLUME: during market hours the time-weighted check above
         # already ran; only apply the raw absolute threshold outside regular hours.
@@ -364,9 +447,9 @@ def _passes_guardrails(symbol: str, bull_regime: bool = None, market_state: Opti
 
         # RVOL gate (adaptive) — skipped when RVOL@TIME block already evaluated RVOL above
         if not _rvol_gate_applied and market_state.is_market_open and bull:
-            daily = get_bars(symbol, "5d", "1d")
-            if not daily.empty and len(daily) >= 2:
-                avg_daily_vol = float(daily["volume"].iloc[:-1].mean())
+            _daily_for_gate = get_bars(symbol, "20d", "1d")
+            if not _daily_for_gate.empty and len(_daily_for_gate) >= 2:
+                avg_daily_vol = float(_daily_for_gate["volume"].iloc[:-1].mean())
                 if avg_daily_vol > 0:
                     now_et       = datetime.datetime.now(_ET)
                     mkt_open     = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
