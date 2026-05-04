@@ -149,15 +149,76 @@ def _mboum_analyst_boost(symbol: str, confidence: float, max_boost: float = 0.07
         return confidence
 
 
-# ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+# ── MDA real-time quote helper ────────────────────────────────────────────────
+# Cache: {symbol: (monotonic_ts, quote_dict)}
+_mda_quote_cache: dict = {}
+_MDA_QUOTE_TTL = 300  # 5-minute TTL — quote data stays fresh enough for signal confirmation
+
+
+def _mda_quote(symbol: str) -> dict:
+    """Return a dict with MDA real-time quote fields for *symbol*.
+
+    Keys returned (all float, 0.0 when unavailable):
+      price, change_pct, volume, week52_high, week52_low
+
+    Results are cached for 5 minutes. Returns empty dict on any error.
+    """
+    import time as _t, os as _os, requests as _req
+    now = _t.monotonic()
+    cached = _mda_quote_cache.get(symbol)
+    if cached and (now - cached[0]) < _MDA_QUOTE_TTL:
+        return cached[1]
+    key = _os.environ.get("MARKETDATA_API_KEY", "")
+    if not key:
+        return {}
+    try:
+        r = _req.get(
+            f"https://api.marketdata.app/v1/stocks/quotes/{symbol}/",
+            headers={"Authorization": f"Bearer {key}"},
+            timeout=6,
+        )
+        if r.status_code not in (200, 203):
+            return {}
+        d = r.json()
+        if d.get("s") != "ok":
+            return {}
+        def _first(lst):
+            return float(lst[0]) if lst else 0.0
+        q = {
+            "price":       _first(d.get("last",      [])),
+            "change_pct":  _first(d.get("changepct", [])) * 100,  # MDA decimal → pct
+            "volume":      _first(d.get("volume",    [])),
+            "week52_high": _first(d.get("52weekHigh", [])),
+            "week52_low":  _first(d.get("52weekLow",  [])),
+        }
+        _mda_quote_cache[symbol] = (now, q)
+        return q
+    except Exception:
+        return {}
+
+
+def _near_52w_high(symbol: str, within_pct: float = 15.0) -> bool:
+    """Return True when the current price is within *within_pct*% of the 52-week high.
+
+    This is a strong bullish structural filter: breakouts near a 52-week high
+    have significantly higher follow-through rates than breakouts from mid-range.
+    Uses MDA real-time quote (cached 5 min). Returns False on any data failure.
+    """
+    q = _mda_quote(symbol)
+    if not q or q["week52_high"] <= 0 or q["price"] <= 0:
+        return False
+    pct_from_high = (q["week52_high"] - q["price"]) / q["week52_high"] * 100
+    return pct_from_high <= within_pct
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Sweepea Strategy
-# ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+# ──────────────────────────────────────────────────────────────────────────────
 class SweepeaStrategy:
     """Liquidity Sweep + Pinbar with Donchian Channel swing detection.
     Also fires on daily 8/20-EMA pullback after an initial squeeze (secondary move)."""
 
     def scan(self, symbol: str) -> Optional[Signal]:
-        # ── Path A: daily 8/20-EMA pullback (post-squeeze secondary entry) ──────
         try:
             # Daily bar only meaningful after 10 AM ET — skip pre-market noise
             if datetime.datetime.now(ET).hour >= 10:
@@ -387,6 +448,9 @@ class TrendBreakerStrategy:
         confidence = 0.78 + min((vol_ratio - 3.0) * 0.025, 0.12)
         if is_high_short_float(symbol):
             confidence = min(confidence + 0.07, 0.95)
+        # Near 52-week high = structural breakout, not just an intraday noise squeeze
+        if _near_52w_high(symbol, within_pct=20.0):
+            confidence = min(confidence + 0.04, 0.95)
         confidence = _sa_metrics_boost(symbol, confidence)
 
         return Signal(
@@ -593,6 +657,15 @@ class MomentumStrategy:
                 and vol_ratio >= MOMENTUM["volume_surge"]
                 and price > sma20):
             confidence = min(0.73 + (momentum / 100), 0.95)
+            # MDA real-time confirmation: ensure momentum is still intact
+            q = _mda_quote(symbol)
+            if q and q["price"] > 0:
+                # If live price has pulled back >1% from the bar close, skip
+                if q["price"] < price * 0.99:
+                    return None
+                # Near 52-week high boosts conviction
+                if q["week52_high"] > 0 and (q["week52_high"] - q["price"]) / q["week52_high"] * 100 <= 10:
+                    confidence = min(confidence + 0.03, 0.95)
             confidence = _sa_metrics_boost(symbol, confidence)
             return Signal(symbol, "buy", price, confidence,
                           f"Strong momentum ({momentum:.1f}%) + volume x{vol_ratio:.1f} + above SMA20", "Momentum")
@@ -666,6 +739,14 @@ class GapBreakoutStrategy:
 
         atr14 = _calc_atr14(daily)
         confidence = min(0.73 + (gap_pct / 100), 0.95)
+        # Near 52-week high = institutional momentum, not just an intraday gap
+        if _near_52w_high(symbol, within_pct=10.0):
+            confidence = min(confidence + 0.04, 0.95)
+        # MDA change% confirmation: gap must still be intact at trade time
+        q = _mda_quote(symbol)
+        if q and q["change_pct"] < gap_pct * 0.4:
+            # Live price has given back >60% of the gap — skip
+            return None
         confidence = _sa_metrics_boost(symbol, confidence)
         return Signal(
             symbol, "buy", price, confidence,
@@ -806,16 +887,35 @@ _float_info_cache: dict = {}   # {symbol: float_shares or 0.0 if unavailable}
 _mcap_cache:        dict = {}  # {symbol: market_cap_float}
 
 def _get_float_shares(symbol: str) -> Optional[float]:
-    """Cached float share count sourced from yfinance.
+    """Cached float share count — Mboum key-statistics primary, yfinance fallback.
 
-    Returns None when float data is unavailable (yfinance not installed, or
-    the symbol has no float data). Caches both hits and misses for the session
-    so repeated scans of the same symbol don't re-fetch.
-    TTL: session-level (process restart clears it — float data is stable intraday).
+    Mboum BASIC `key-statistics` provides floatShares and sharesOutstanding
+    via the same RapidAPI key already in use for analyst data.  This replaces
+    the yfinance dependency which is unreliable for real-time data.
+    Caches session-level (float is stable intraday).
     """
     if symbol in _float_info_cache:
         v = _float_info_cache[symbol]
         return v if v > 0 else None
+    # ── Primary: Mboum key-statistics ──────────────────────────────────────────
+    try:
+        import requests as _req
+        _mboum_key = "e8623e01d7msh66804a8ade71af0p120d0ejsn20ee85188848"
+        r = _req.get(
+            "https://mboum-finance.p.rapidapi.com/v1/markets/stock/modules",
+            params={"symbol": symbol, "module": "default-key-statistics"},
+            headers={"x-rapidapi-host": "mboum-finance.p.rapidapi.com", "x-rapidapi-key": _mboum_key},
+            timeout=6,
+        )
+        if r.status_code == 200:
+            body = r.json().get("body", {})
+            shares = body.get("floatShares", {}).get("raw") or body.get("sharesOutstanding", {}).get("raw")
+            if shares and float(shares) > 0:
+                _float_info_cache[symbol] = float(shares)
+                return float(shares)
+    except Exception:
+        pass
+    # ── Fallback: yfinance ────────────────────────────────────────────────────────
     try:
         import yfinance as _yf
         info   = _yf.Ticker(symbol).info

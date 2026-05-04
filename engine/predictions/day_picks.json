@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-05-03T23:07:13-04:00",
+  "generated_at": "2026-05-03T23:11:08-04:00",
   "date": "2026-05-03",
   "market_regime": "bull",
   "picks": [
@@ -12,36 +12,36 @@
       "reason": "Sentiment bullish + vol x5.75 + price>20SMA"
     },
     {
-      "symbol": "UONE",
+      "symbol": "OLED",
       "action": "buy",
-      "price": 7.3,
-      "confidence": 0.9083,
-      "strategy": "FloatRotation",
-      "reason": "Float rotation: 1.9x float (1.9M) | +33.2% day"
+      "price": 96.37,
+      "confidence": 0.8754,
+      "strategy": "Sentiment",
+      "reason": "Sentiment bullish + vol x4.25 + price>20SMA"
     },
     {
-      "symbol": "ACCO",
+      "symbol": "TRN",
       "action": "buy",
-      "price": 3.95,
-      "confidence": 0.8957,
+      "price": 36.18,
+      "confidence": 0.8366,
       "strategy": "Sentiment",
-      "reason": "Sentiment bullish + vol x4.46 + price>20SMA"
+      "reason": "Sentiment bullish + vol x3.87 + price>20SMA"
     },
     {
-      "symbol": "CERS",
+      "symbol": "HLF",
       "action": "buy",
-      "price": 2.72,
-      "confidence": 0.8934,
-      "strategy": "Sentiment",
-      "reason": "Sentiment bullish + vol x4.43 + price>20SMA"
+      "price": 16.28,
+      "confidence": 0.82,
+      "strategy": "Sweepea",
+      "reason": "Daily Sweepea pullback to 20-EMA | ATR $0.73"
     },
     {
-      "symbol": "FIVN",
+      "symbol": "LWLG",
       "action": "buy",
-      "price": 22.24,
-      "confidence": 0.8874,
-      "strategy": "Sentiment",
-      "reason": "Sentiment bullish + vol x4.37 + price>20SMA"
+      "price": 16.27,
+      "confidence": 0.82,
+      "strategy": "Sweepea",
+      "reason": "Daily Sweepea pullback to 8-EMA | ATR $1.96"
     }
   ]
 }

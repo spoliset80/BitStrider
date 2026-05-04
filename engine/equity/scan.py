@@ -60,13 +60,29 @@ from engine.utils import MarketState, clear_bar_cache, get_bars, is_dead_ticker
 from engine.utils.bars import get_data_client as _get_data_client, get_feed_used as _get_feed_used
 
 # IEX (free) feed captures roughly 15% of consolidated volume vs SIP.
-# When IEX data is used, scale RVOL and dollar-vol thresholds down by this
-# factor so genuine movers are not incorrectly filtered out.
-# When ALPACA_DATA_FEED=sip, _IEX_FEED is False and all thresholds apply at 100%.
+# MDA (Market Data App) provides full consolidated (SIP-equivalent) data, so
+# IEX scaling is disabled when MDA is the primary source.
 _IEX_THRESHOLD_SCALE = 0.15
 from alpaca.data import StockSnapshotRequest as _StockSnapshotRequest
 from engine.config import ALPACA_DATA_FEED as _ALPACA_DATA_FEED
-_IEX_FEED: bool = (_ALPACA_DATA_FEED != "sip")  # True when on free IEX tier
+import os as _scan_os
+
+
+def _mda_available() -> bool:
+    """Return True when the MDA API key is present in the environment.
+
+    Evaluated lazily (at call time) so it works correctly after load_dotenv().
+    """
+    return bool(_scan_os.environ.get("MARKETDATA_API_KEY"))
+
+
+def _is_iex_feed() -> bool:
+    """Return True only when MDA is unavailable AND Alpaca feed is IEX.
+
+    MDA provides full consolidated data equivalent to SIP, so IEX threshold
+    scaling is disabled whenever MDA is the active data source.
+    """
+    return (not _mda_available()) and (_ALPACA_DATA_FEED != "sip")
 from .universe import get_tier as _get_tier_live, get_latest_batch as _get_latest_batch, get_ti_primary as _get_ti_primary
 from .discovery import get_priority_scan_queue as _get_priority_scan_queue
 
@@ -91,33 +107,77 @@ from engine.utils.market import _is_bull_regime, _INVERSE_ETFS
 # slices of the universe are covered across consecutive cycles.
 _scan_offset: int = 0
 
-# ── Batch snapshot cache ──────────────────────────────────────────────────────
-# Populated once at the start of each scan_universe() call via a single
-# batch request.  _passes_guardrails() reads from this cache to avoid
-# per-symbol 1-minute bars requests (390 bars × N symbols = dominant I/O cost).
+# ── Batch snapshot caches ─────────────────────────────────────────────────────
+# _snapshot_cache    : Alpaca snapshot objects (fallback when MDA unavailable)
+# _mda_snapshot_cache: MDA bulk-quote dicts {price, volume, open} (primary)
+# Populated once at the start of each scan_universe() call.
+# _passes_guardrails() checks _mda_snapshot_cache first, then _snapshot_cache,
+# then falls back to per-symbol get_bars() (which also uses MDA).
 _snapshot_cache: Dict = {}
+_mda_snapshot_cache: Dict[str, Dict] = {}
 
 
 def _prefetch_snapshots(symbols: List[str]) -> None:
-    """Batch-fetch stock snapshots for *symbols* and store in _snapshot_cache.
+    """Batch-fetch price/volume snapshots for *symbols*.
 
-    A single API call replaces N individual get_bars("1d","1m") requests in
-    _passes_guardrails(), reducing scan latency significantly for large universes.
-    Failures are silently swallowed — _passes_guardrails() falls back to bars.
+    Primary:  MDA bulk quotes (consolidated, full-feed data) → _mda_snapshot_cache
+    Fallback: Alpaca StockSnapshotRequest → _snapshot_cache
+
+    _passes_guardrails() checks _mda_snapshot_cache first, then _snapshot_cache,
+    then falls back to per-symbol get_bars() (MDA-primary).
     """
-    global _snapshot_cache
+    global _snapshot_cache, _mda_snapshot_cache
     _snapshot_cache = {}
+    _mda_snapshot_cache = {}
     if not symbols:
         return
-    try:
-        client = _get_data_client()
-        snaps = client.get_stock_snapshot(
-            _StockSnapshotRequest(symbol_or_symbols=symbols, feed=_ALPACA_DATA_FEED)
-        )
-        if isinstance(snaps, dict):
-            _snapshot_cache = snaps
-    except Exception:
-        pass  # fall back to per-symbol get_bars in _passes_guardrails
+
+    # ── Primary: MDA bulk quotes ───────────────────────────────────────────
+    if _mda_available():
+        try:
+            import requests as _req
+            mda_key = _scan_os.environ.get("MARKETDATA_API_KEY", "")
+            # MDA supports up to 100 symbols per bulk-quote call.
+            for _chunk_start in range(0, len(symbols), 100):
+                chunk = symbols[_chunk_start: _chunk_start + 100]
+                r = _req.get(
+                    "https://api.marketdata.app/v1/stocks/bulkquotes/",
+                    params={"symbols": ",".join(chunk)},
+                    headers={"Authorization": f"Bearer {mda_key}"},
+                    timeout=12,
+                )
+                if r.status_code not in (200, 203):
+                    break
+                data = r.json()
+                if data.get("s") != "ok":
+                    break
+                syms    = data.get("symbol", [])
+                lasts   = data.get("last",   [])
+                vols    = data.get("volume", [])
+                opens   = data.get("open",   [])
+                for sym, last, vol, opn in zip(syms, lasts, vols, opens):
+                    if last is not None and vol is not None:
+                        _mda_snapshot_cache[sym] = {
+                            "price":  float(last),
+                            "volume": float(vol),
+                            "open":   float(opn) if opn is not None else float(last),
+                        }
+        except Exception:
+            pass  # fall through to Alpaca fallback
+
+    # ── Fallback: Alpaca batch snapshot (for symbols MDA missed / MDA unavail) ─
+    mda_covered = set(_mda_snapshot_cache)
+    alpaca_needed = [s for s in symbols if s not in mda_covered]
+    if alpaca_needed:
+        try:
+            client = _get_data_client()
+            snaps = client.get_stock_snapshot(
+                _StockSnapshotRequest(symbol_or_symbols=alpaca_needed, feed=_ALPACA_DATA_FEED)
+            )
+            if isinstance(snaps, dict):
+                _snapshot_cache = snaps
+        except Exception:
+            pass  # per-symbol get_bars fallback in _passes_guardrails
 
 
 def _passes_guardrails(symbol: str, bull_regime: bool = None, market_state: Optional[MarketState] = None, return_reason: bool = False) -> bool:
@@ -133,13 +193,20 @@ def _passes_guardrails(symbol: str, bull_regime: bool = None, market_state: Opti
     """
     # return_reason is now an explicit argument
     try:
-        # ── Fast path: use batch-prefetched snapshot (no per-symbol HTTP call) ─
-        _snap = _snapshot_cache.get(symbol)
-        if (
-            _snap is not None
-            and _snap.daily_bar is not None
-            and _snap.latest_trade is not None
+        # ── Fast path 1: MDA bulk-quote cache (consolidated, full-feed) ───────
+        _mda_snap = _mda_snapshot_cache.get(symbol)
+        if _mda_snap is not None:
+            price    = _mda_snap["price"]
+            day_vol  = _mda_snap["volume"]
+            open_px  = _mda_snap["open"]
+            intraday = None
+        # ── Fast path 2: Alpaca batch-prefetched snapshot (fallback) ─────────
+        elif (
+            _snapshot_cache.get(symbol) is not None
+            and _snapshot_cache[symbol].daily_bar is not None
+            and _snapshot_cache[symbol].latest_trade is not None
         ):
+            _snap   = _snapshot_cache[symbol]
             price   = float(_snap.latest_trade.price)
             day_vol = float(_snap.daily_bar.volume)
             open_px = float(_snap.daily_bar.open)
@@ -204,19 +271,9 @@ def _passes_guardrails(symbol: str, bull_regime: bool = None, market_state: Opti
         # Adaptive RVOL_MIN: higher in bull/high VIX, lower in calm or bear conditions
         # Use regular market hours only so extended-hours volume does not distort the pace.
         if market_state.is_regular_hours and bull:
-            # Fetch today's 1-min bars and previous 5 days' 1-min bars
-            from engine.utils.bars import _get_bars_yfinance
-            import logging
-            log = logging.getLogger("ApexTrader")
-            today_intraday = _get_bars_yfinance(symbol, "1d", "1m", log)
-            past_intraday = _get_bars_yfinance(symbol, "6d", "1m", log)
-            # Fallback to Alpaca if yfinance is missing/incomplete
-            if today_intraday.empty or len(today_intraday) < 5:
-                log.info(f"[RVOL FALLBACK] {symbol}: yfinance intraday bars missing/incomplete, trying Alpaca fallback.")
-                today_intraday = get_bars(symbol, "1d", "1m")
-            if past_intraday.empty or len(past_intraday) < 390*2:
-                log.info(f"[RVOL FALLBACK] {symbol}: yfinance past intraday bars missing/incomplete, trying Alpaca fallback.")
-                past_intraday = get_bars(symbol, "6d", "1m")
+            # Fetch today's and past 5 days' 1-min bars via get_bars (MDA-primary)
+            today_intraday = get_bars(symbol, "1d", "1m")
+            past_intraday  = get_bars(symbol, "6d", "1m")
             now_et = datetime.datetime.now(_ET)
             mkt_open = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
             elapsed_min = int(max((now_et - mkt_open).total_seconds() / 60, 1))
@@ -238,7 +295,7 @@ def _passes_guardrails(symbol: str, bull_regime: bool = None, market_state: Opti
                 today_vol = float(day_vol)
                 denom = avg_daily_vol * max(elapsed_frac, 0.02)
                 rvol_fallback = today_vol / denom if denom > 0 else 0.0
-                iex_feed = _IEX_FEED
+                iex_feed = _is_iex_feed()
                 rvol_threshold = adaptive_rvol * (_IEX_THRESHOLD_SCALE if iex_feed else 1.0)
                 _log.warning(f"[RVOL@TIME FALLBACK] {symbol}: insufficient intraday data for RVOL@TIME, using fractional legacy RVOL logic. today_vol={today_vol:.0f}, avg_daily_vol={avg_daily_vol:.0f}, elapsed_frac={elapsed_frac:.3f}, denom={denom:.0f}, rvol_fallback={rvol_fallback:.3f}, adaptive_rvol={adaptive_rvol:.2f} (iex_scale={iex_feed})")
                 if not iex_feed and rvol_fallback < rvol_threshold:
@@ -264,7 +321,7 @@ def _passes_guardrails(symbol: str, bull_regime: bool = None, market_state: Opti
                 if avg_vols:
                     avg_intraday_vol = sum(avg_vols) / len(avg_vols)
                     rvol = today_vol / max(avg_intraday_vol, 1)
-                    iex_feed = _IEX_FEED
+                    iex_feed = _is_iex_feed()
                     rvol_threshold = adaptive_rvol * (_IEX_THRESHOLD_SCALE if iex_feed else 1.0)
                     _log.info(f"[RVOL@TIME DEBUG] {symbol}: today_vol={today_vol:.0f}, avg_intraday_vol={avg_intraday_vol:.0f}, elapsed_min={elapsed_min}, rvol={rvol:.3f}, rvol_threshold={rvol_threshold:.2f} (adaptive={adaptive_rvol:.2f} iex_scale={iex_feed})")
                     if not iex_feed and rvol < rvol_threshold:
@@ -278,7 +335,7 @@ def _passes_guardrails(symbol: str, bull_regime: bool = None, market_state: Opti
             # Time-weighted dollar volume guardrail
             elapsed_frac = elapsed_min / 390.0
             # Scale threshold down when IEX feed is used (IEX ~15% of SIP volume)
-            iex_feed = _IEX_FEED
+            iex_feed = _is_iex_feed()
             dv_scale = _IEX_THRESHOLD_SCALE if iex_feed else 1.0
             tw_dollar_vol = adaptive_dollar_vol * max(elapsed_frac, 0.05) * dv_scale
             dollar_vol = price * day_vol
@@ -291,7 +348,7 @@ def _passes_guardrails(symbol: str, bull_regime: bool = None, market_state: Opti
 
         # Adaptive MIN_DOLLAR_VOLUME: scale threshold for IEX feed (partial volume)
         dollar_vol = price * day_vol
-        iex_feed_dv = _IEX_FEED
+        iex_feed_dv = _is_iex_feed()
         eff_dollar_vol_threshold = adaptive_dollar_vol * (_IEX_THRESHOLD_SCALE if iex_feed_dv else 1.0)
         if dollar_vol < eff_dollar_vol_threshold:
             _log.warning(f"[GUARDRAIL] {symbol} blocked: dollar volume {dollar_vol:.0f} < eff_threshold {eff_dollar_vol_threshold:.0f} (adaptive={adaptive_dollar_vol:.0f} iex_scale={iex_feed_dv}) | price={price:.2f} | day_vol={day_vol:.0f}")
@@ -310,7 +367,7 @@ def _passes_guardrails(symbol: str, bull_regime: bool = None, market_state: Opti
                     elapsed_min  = max((now_et - mkt_open).total_seconds() / 60, 1.0)
                     elapsed_frac = min(elapsed_min / 390.0, 1.0)
                     rvol = (day_vol / max(elapsed_frac, 0.02)) / avg_daily_vol
-                    iex_feed = _IEX_FEED
+                    iex_feed = _is_iex_feed()
                     rvol_threshold = adaptive_rvol * (_IEX_THRESHOLD_SCALE if iex_feed else 1.0)
                     if not iex_feed and rvol < rvol_threshold:
                         _log.warning(f"[GUARDRAIL] {symbol} blocked: RVOL {rvol:.2f} < rvol_threshold {rvol_threshold:.2f} (adaptive={adaptive_rvol:.2f} iex_scale={iex_feed}) | day_vol={day_vol:.0f} | avg_daily_vol={avg_daily_vol:.0f}")
@@ -344,9 +401,14 @@ def _passes_guardrails(symbol: str, bull_regime: bool = None, market_state: Opti
                 # When 1-min bars are available, require tight recent consolidation.
                 # With snapshot-only data, skip the consolidation check (conservative:
                 # allows the signal — strategy-level filters apply next).
-                _snap_fast_path = _snapshot_cache.get(symbol) is not None and \
-                    _snapshot_cache[symbol].daily_bar is not None and \
-                    _snapshot_cache[symbol].latest_trade is not None
+                _snap_fast_path = (
+                    symbol in _mda_snapshot_cache
+                    or (
+                        _snapshot_cache.get(symbol) is not None
+                        and _snapshot_cache[symbol].daily_bar is not None
+                        and _snapshot_cache[symbol].latest_trade is not None
+                    )
+                )
                 if not _snap_fast_path:
                     last_n    = intraday.iloc[-GAP_CHASE_CONSOL_BARS:]
                     bar_range = float(last_n["high"].max() - last_n["low"].min())
