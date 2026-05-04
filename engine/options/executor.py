@@ -180,26 +180,23 @@ class OptionsExecutor:
 
     def _calculate_gross_notional(self, extra: Optional[dict] = None) -> float:
         """
-        Calculate the gross notional value of all open option positions, plus an optional extra position.
-        Each leg: abs(contracts * strike * 100)
+        Calculate the gross notional value of all open option positions, plus an optional
+        extra (pending) position.  Uses option premium cost (mid_price × 100), not the
+        underlying strike notional, so the cap is proportional to actual capital at risk.
+
+        Existing positions: abs(entry_price) × contracts × 100
+        Pending order:      mid_price × contracts × n_legs × 100
         """
         total = 0.0
-        # Existing positions
+        # Existing positions — use abs(entry_price) which is the premium paid/received per share
         for pos in self._positions.values():
-            for leg in (pos.legs if pos.legs else [{"occ_symbol": pos.occ_symbol, "side": "buy", "ratio_qty": 1}]):
-                contracts = abs(pos.contracts) * abs(leg.get("ratio_qty", 1))
-                # Extract strike from OCC symbol (format: SYMBOLYYMMDDC|P########)
-                occ = leg["occ_symbol"]
-                m = re.match(r"^[A-Z]+\d{6}[CP](\d{8})$", occ)
-                if m:
-                    strike = int(m.group(1)) / 1000.0
-                    total += abs(contracts * strike * 100)
-        # Add extra (pending order) if provided
+            n_legs = max(1, len(pos.legs))
+            total += abs(pos.entry_price) * abs(pos.contracts) * n_legs * 100
+        # Add pending order if provided
         if extra:
-            for leg in extra.get("legs", []):
-                contracts = abs(extra["contracts"]) * abs(leg.get("ratio_qty", 1))
-                strike = leg["strike"]
-                total += abs(contracts * strike * 100)
+            mid = abs(extra.get("mid_price", 0.0))
+            n_legs = max(1, len(extra.get("legs", [])))
+            total += mid * abs(extra.get("contracts", 1)) * n_legs * 100
         return total
 
     def __init__(self, client: TradingClient):
@@ -736,7 +733,7 @@ class OptionsExecutor:
             min_contracts = 1
             order_accepted = False
             while contracts >= min_contracts:
-                extra = {"contracts": contracts, "legs": legs}
+                extra = {"contracts": contracts, "legs": legs, "mid_price": signal.mid_price}
                 gross_notional = self._calculate_gross_notional(extra=extra)
                 if equity > 0 and gross_notional > 6 * equity:
                     contracts -= 1
