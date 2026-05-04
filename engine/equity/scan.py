@@ -1,35 +1,3 @@
-# Adaptive equity allocation based on pre-intelligence (market regime, signal quality, or pre-market indicators)
-from engine.utils import MarketState
-def get_adaptive_equity_allocation(market_state: MarketState, avg_signal_conf: float = None, premarket_strength: float = None) -> float:
-    """
-    Returns adaptive position size percentage for equities based on pre-intelligence.
-    - In strong bull regime or high signal confidence, increase allocation.
-    - In bear regime or weak signals, decrease allocation.
-    - Optionally, use premarket_strength (0-1) if available.
-    """
-    from engine.config import POSITION_SIZE_PCT
-    from engine.utils.market import get_allocation_split
-    base = POSITION_SIZE_PCT
-    equity_pct, _ = get_allocation_split(market_state)
-    base *= equity_pct
-    # Example logic: scale up in bull, down in bear
-    if hasattr(market_state, 'resolve_regime'):
-        bull = market_state.resolve_regime()
-        if bull:
-            base *= 1.2  # 20% more aggressive in bull
-        else:
-            base *= 0.8  # 20% more conservative in bear
-    # If average signal confidence is provided, scale further
-    if avg_signal_conf is not None:
-        if avg_signal_conf > 0.85:
-            base *= 1.15
-        elif avg_signal_conf < 0.75:
-            base *= 0.85
-    # If premarket_strength is provided (0-1), scale linearly between 0.8x and 1.2x
-    if premarket_strength is not None:
-        base *= (0.8 + 0.4 * premarket_strength)
-    # Clamp to reasonable bounds (e.g., 3% to 15%)
-    return max(3.0, min(base, 15.0))
 """ApexTrader scan nucleus.
 
 Contains reusable scanning functions for main loop and run_top3 tools.

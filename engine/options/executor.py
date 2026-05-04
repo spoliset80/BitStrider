@@ -505,7 +505,7 @@ class OptionsExecutor:
                     f"${configured_budget:.2f} — budget capped at ${total_budget:.2f}"
                 )
 
-            used      = self._current_options_cost()
+            used      = self.current_options_cost()
             remaining = max(0.0, total_budget - used)
             return total_budget, remaining
 
@@ -513,7 +513,7 @@ class OptionsExecutor:
             log.warning(f"[OPTIONS] Could not fetch account budget: {e}", exc_info=True)
             return 0.0, 0.0
 
-    def _current_options_cost(self) -> float:
+    def current_options_cost(self) -> float:
         """Estimate total capital deployed in open options positions."""
         total = 0.0
         for pos in self._positions.values():
