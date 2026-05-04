@@ -20,7 +20,6 @@ from engine.utils import (
     get_premarket_bars,
     get_trending_tickers,
     filter_trending_momentum,
-    get_finnhub_trending_tickers,
     check_sentiment_gate,
 )
 from engine.config import PRIORITY_1_MOMENTUM as _P1, PRIORITY_2_ESTABLISHED as _P2
@@ -156,16 +155,6 @@ class PreopenIntelligenceScanner:
     def _register_default_providers(self) -> None:
         self.providers = [
             PreopenSignalProvider(
-                name="trending",
-                apply=self._provider_trending,
-                description="Live momentum feed from external trending sources",
-            ),
-            PreopenSignalProvider(
-                name="finnhub",
-                apply=self._provider_finnhub,
-                description="Finnhub trending and stock momentum candidates",
-            ),
-            PreopenSignalProvider(
                 name="priority_queue",
                 apply=self._provider_priority_queue,
                 description="Existing high-priority tickers from sympathy/EDGAR/scan backlog",
@@ -189,6 +178,26 @@ class PreopenIntelligenceScanner:
                 name="sa_day_watch",
                 apply=self._provider_sa_day_watch,
                 description="SA v2 day-watch market movers and leading stories",
+            ),
+            PreopenSignalProvider(
+                name="yh_screener",
+                apply=self._provider_yh_screener,
+                description="Yahoo Finance15 day gainers, losers, most-active screener",
+            ),
+            PreopenSignalProvider(
+                name="yh_news",
+                apply=self._provider_yh_news,
+                description="Yahoo Finance15 news ticker extraction",
+            ),
+            PreopenSignalProvider(
+                name="mda_movers",
+                apply=self._provider_mda_movers,
+                description="Market Data App bulk quotes: detect pre-market gappers and high-volume movers",
+            ),
+            PreopenSignalProvider(
+                name="mboum_analyst",
+                apply=self._provider_mboum_analyst,
+                description="Mboum analyst consensus: boost tickers with strong Buy ratings and rising price targets",
             ),
         ]
 
@@ -233,38 +242,6 @@ class PreopenIntelligenceScanner:
                 {"runs": 0.0, "contributions": 0.0, "hits": 0.0},
             )
             perf["contributions"] += abs(weight)
-
-    def _provider_trending(
-        self,
-        scores: dict[str, dict],
-        market_state: MarketState,
-        priority_1: list,
-        priority_2: list,
-        max_watchlist: int,
-        provider: PreopenSignalProvider,
-    ) -> None:
-        try:
-            trending = get_trending_tickers(15)
-        except Exception:
-            trending = []
-        for sym in trending:
-            self._add_candidate(scores, sym, 1.0 * provider.weight, "trending", provider_name=provider.name)
-
-    def _provider_finnhub(
-        self,
-        scores: dict[str, dict],
-        market_state: MarketState,
-        priority_1: list,
-        priority_2: list,
-        max_watchlist: int,
-        provider: PreopenSignalProvider,
-    ) -> None:
-        try:
-            finn_tickers = get_finnhub_trending_tickers()
-        except Exception:
-            finn_tickers = []
-        for sym in finn_tickers:
-            self._add_candidate(scores, sym, 0.8 * provider.weight, "finnhub", provider_name=provider.name)
 
     def _provider_priority_queue(
         self,
@@ -434,6 +411,159 @@ class PreopenIntelligenceScanner:
                 )
         except Exception as _e:
             log.debug(f"[PREOPEN] sa_day_watch provider error: {_e}")
+
+    def _provider_yh_screener(
+        self,
+        scores: dict[str, dict],
+        market_state: MarketState,
+        priority_1: list,
+        priority_2: list,
+        max_watchlist: int,
+        provider: PreopenSignalProvider,
+    ) -> None:
+        try:
+            from engine.data.yahoo_finance15 import get_yh_day_gainers, get_yh_most_active
+            regime_mult = 1.1 if getattr(market_state, "regime", "bull") == "bull" else 0.85
+
+            for sym in get_yh_day_gainers(25)[:15]:
+                self._add_candidate(scores, sym, 1.2 * provider.weight * regime_mult,
+                                    "YH-gainer", provider_name=provider.name)
+            for sym in get_yh_most_active(20)[:10]:
+                self._add_candidate(scores, sym, 0.8 * provider.weight * regime_mult,
+                                    "YH-active", provider_name=provider.name)
+        except Exception as _e:
+            log.debug(f"[PREOPEN] yh_screener provider error: {_e}")
+
+    def _provider_mda_movers(
+        self,
+        scores: dict[str, dict],
+        market_state: MarketState,
+        priority_1: list,
+        priority_2: list,
+        max_watchlist: int,
+        provider: PreopenSignalProvider,
+    ) -> None:
+        """Score pre-market movers using MDA bulk quotes on watchlist + P1 universe."""
+        import os
+        key = os.environ.get("MARKETDATA_API_KEY")
+        if not key:
+            return
+        try:
+            import requests
+            candidates = list(dict.fromkeys(
+                [item["symbol"] for item in sorted(scores.values(), key=lambda d: d["score"], reverse=True)[:40]]
+                + priority_1[:20]
+            ))
+            if not candidates:
+                return
+            sym_str = ",".join(candidates[:50])
+            r = requests.get(
+                "https://api.marketdata.app/v1/stocks/bulkquotes/",
+                params={"symbols": sym_str},
+                headers={"Authorization": f"Bearer {key}"},
+                timeout=10,
+            )
+            if r.status_code not in (200, 203):
+                return
+            data = r.json()
+            if data.get("s") != "ok":
+                return
+            symbols = data.get("symbol", [])
+            changes = data.get("changepct", [])
+            volumes = data.get("volume", [])
+            regime_mult = 1.1 if getattr(market_state, "regime", "bull") == "bull" else 0.85
+            for sym, chg, vol in zip(symbols, changes, volumes):
+                if chg is None or vol is None:
+                    continue
+                chg_pct = float(chg) * 100  # MDA returns as decimal
+                # Strong gap up: high confidence signal
+                if chg_pct >= 3.0:
+                    self._add_candidate(scores, sym, 1.5 * provider.weight * regime_mult,
+                                        f"MDA-gap+{chg_pct:.1f}%", provider_name=provider.name)
+                elif chg_pct >= 1.5:
+                    self._add_candidate(scores, sym, 0.9 * provider.weight * regime_mult,
+                                        f"MDA-move+{chg_pct:.1f}%", provider_name=provider.name)
+                # Gap down in bear regime = short opportunity
+                elif chg_pct <= -3.0 and getattr(market_state, "regime", "bull") == "bear":
+                    self._add_candidate(scores, sym, 0.7 * provider.weight,
+                                        f"MDA-gap{chg_pct:.1f}%", provider_name=provider.name)
+        except Exception as _e:
+            log.debug(f"[PREOPEN] mda_movers provider error: {_e}")
+
+    def _provider_mboum_analyst(
+        self,
+        scores: dict[str, dict],
+        market_state: MarketState,
+        priority_1: list,
+        priority_2: list,
+        max_watchlist: int,
+        provider: PreopenSignalProvider,
+    ) -> None:
+        """Boost tickers where analyst consensus shows strong Buy rating and
+        current price is meaningfully below analyst mean price target (upside)."""
+        try:
+            import requests, os, time
+            key = "e8623e01d7msh66804a8ade71af0p120d0ejsn20ee85188848"
+            h = {
+                "x-rapidapi-host": "mboum-finance.p.rapidapi.com",
+                "x-rapidapi-key": key,
+            }
+            # Check top candidates only — stay within BASIC rate limit (10 req/min)
+            top_candidates = [
+                item["symbol"]
+                for item in sorted(scores.values(), key=lambda d: d["score"], reverse=True)[:8]
+            ]
+            regime_mult = 1.1 if getattr(market_state, "regime", "bull") == "bull" else 0.75
+            for sym in top_candidates:
+                try:
+                    r = requests.get(
+                        "https://mboum-finance.p.rapidapi.com/v1/markets/stock/modules",
+                        params={"symbol": sym, "module": "financial-data"},
+                        headers=h, timeout=8,
+                    )
+                    if r.status_code != 200:
+                        continue
+                    body = r.json().get("body", {})
+                    current = float(body.get("currentPrice", 0) or 0)
+                    target_mean = float(body.get("targetMeanPrice", 0) or 0)
+                    rec = str(body.get("recommendationKey", "")).lower()
+                    if current <= 0 or target_mean <= 0:
+                        continue
+                    upside_pct = (target_mean - current) / current * 100
+                    # Strong buy + meaningful upside = high-conviction boost
+                    if rec in ("strong_buy", "buy") and upside_pct >= 10:
+                        boost = min(1.8, 0.8 + upside_pct / 50) * provider.weight * regime_mult
+                        self._add_candidate(scores, sym, boost,
+                                            f"analyst-{rec}-upside{upside_pct:.0f}%",
+                                            provider_name=provider.name)
+                        log.debug(f"[PREOPEN][MBOUM] {sym}: {rec} upside={upside_pct:.1f}% boost={boost:.2f}")
+                    elif rec == "hold" and upside_pct >= 15:
+                        self._add_candidate(scores, sym, 0.4 * provider.weight * regime_mult,
+                                            f"analyst-hold-upside{upside_pct:.0f}%",
+                                            provider_name=provider.name)
+                    time.sleep(0.35)  # respect 10 req/min BASIC limit
+                except Exception:
+                    continue
+        except Exception as _e:
+            log.debug(f"[PREOPEN] mboum_analyst provider error: {_e}")
+
+    def _provider_yh_news(
+        self,
+        scores: dict[str, dict],
+        market_state: MarketState,
+        priority_1: list,
+        priority_2: list,
+        max_watchlist: int,
+        provider: PreopenSignalProvider,
+    ) -> None:
+        try:
+            from engine.data.yahoo_finance15 import get_yh_news_tickers
+            regime_mult = 1.0 if getattr(market_state, "regime", "bull") == "bull" else 0.8
+            for sym in get_yh_news_tickers(30)[:15]:
+                self._add_candidate(scores, sym, 0.9 * provider.weight * regime_mult,
+                                    "YH-news", provider_name=provider.name)
+        except Exception as _e:
+            log.debug(f"[PREOPEN] yh_news provider error: {_e}")
 
     def _log_watchlist_summary(self, market_state: MarketState) -> None:
         sentiment_label = "bull" if market_state.resolve_sentiment() == "bull" else "bear"

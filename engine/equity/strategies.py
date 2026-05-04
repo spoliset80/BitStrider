@@ -69,24 +69,82 @@ from engine.utils.market import _is_bull_regime  # canonical regime function —
 # Shared helper: apply SA v2 metrics-grades confidence boost to any buy signal.
 # max_boost caps total addition to avoid over-weighting SA on noisy data.
 def _sa_metrics_boost(symbol: str, confidence: float, max_boost: float = 0.08) -> float:
-    """Return confidence + SA metrics-grades boost (capped at max_boost)."""
+    """Return confidence + SA metrics-grades boost, then Mboum analyst-consensus boost.
+
+    Both signals are layered: SA grade boost (up to max_boost) is applied first,
+    then Mboum analyst consensus boost/penalty is applied on top (cached 10 min).
+    """
     try:
         from engine.data.seeking_alpha import get_sa_metrics_grades
         grades = get_sa_metrics_grades(symbol)
-        if not grades:
+        if grades:
+            boost = 0.0
+            mom  = grades.get("momentum_category",      0)
+            epsr = grades.get("eps_revisions_category", 0)
+            prof = grades.get("profitability_category", 0)
+            grw  = grades.get("growth_category",        0)
+            if mom  >= 8:  boost += 0.03
+            elif mom >= 6: boost += 0.015
+            if epsr >= 8:  boost += 0.02
+            elif epsr >= 6: boost += 0.01
+            if prof >= 8:  boost += 0.015
+            if grw  >= 8:  boost += 0.015
+            confidence = min(confidence + min(boost, max_boost), 0.97)
+    except Exception:
+        pass
+    # Layer Mboum analyst consensus on top (cached — no extra API hit per symbol)
+    return _mboum_analyst_boost(symbol, confidence)
+
+
+# Cache: {symbol: (ts, boost_value)}  — avoids hammering Mboum BASIC (10 req/min)
+_mboum_boost_cache: dict = {}
+_MBOUM_CACHE_TTL = 600  # 10 min
+
+
+def _mboum_analyst_boost(symbol: str, confidence: float, max_boost: float = 0.07) -> float:
+    """Return confidence + Mboum analyst-consensus boost.
+
+    Adds up to max_boost when:
+      - recommendation is 'strong_buy' or 'buy'
+      - analyst mean price target is meaningfully above current price (upside ≥10%)
+
+    Result is cached per symbol for 10 minutes to respect Mboum BASIC rate limits.
+    """
+    import time as _time
+    try:
+        import requests as _req, os as _os
+        now = _time.monotonic()
+        cached = _mboum_boost_cache.get(symbol)
+        if cached and (now - cached[0]) < _MBOUM_CACHE_TTL:
+            return min(confidence + cached[1], 0.97)
+        key = "e8623e01d7msh66804a8ade71af0p120d0ejsn20ee85188848"
+        r = _req.get(
+            "https://mboum-finance.p.rapidapi.com/v1/markets/stock/modules",
+            params={"symbol": symbol, "module": "financial-data"},
+            headers={"x-rapidapi-host": "mboum-finance.p.rapidapi.com", "x-rapidapi-key": key},
+            timeout=6,
+        )
+        if r.status_code != 200:
+            _mboum_boost_cache[symbol] = (_time.monotonic(), 0.0)
             return confidence
+        body = r.json().get("body", {})
+        current = float(body.get("currentPrice", 0) or 0)
+        target_mean = float(body.get("targetMeanPrice", 0) or 0)
+        rec = str(body.get("recommendationKey", "")).lower()
+        if current <= 0 or target_mean <= 0:
+            _mboum_boost_cache[symbol] = (_time.monotonic(), 0.0)
+            return confidence
+        upside_pct = (target_mean - current) / current * 100
         boost = 0.0
-        mom  = grades.get("momentum_category",      0)
-        epsr = grades.get("eps_revisions_category", 0)
-        prof = grades.get("profitability_category", 0)
-        grw  = grades.get("growth_category",        0)
-        if mom  >= 8:  boost += 0.03
-        elif mom >= 6: boost += 0.015
-        if epsr >= 8:  boost += 0.02
-        elif epsr >= 6: boost += 0.01
-        if prof >= 8:  boost += 0.015
-        if grw  >= 8:  boost += 0.015
-        return min(confidence + min(boost, max_boost), 0.97)
+        if rec in ("strong_buy", "buy") and upside_pct >= 10:
+            boost = min(max_boost, 0.03 + upside_pct / 500)
+        elif rec == "hold" and upside_pct >= 20:
+            boost = 0.02
+        # Sell consensus → small penalty
+        elif rec in ("sell", "strong_sell"):
+            boost = -0.04
+        _mboum_boost_cache[symbol] = (_time.monotonic(), boost)
+        return min(confidence + boost, 0.97)
     except Exception:
         return confidence
 

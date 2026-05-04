@@ -1,47 +1,47 @@
 {
-  "generated_at": "2026-05-02T16:09:46-04:00",
-  "date": "2026-05-02",
+  "generated_at": "2026-05-03T23:07:13-04:00",
+  "date": "2026-05-03",
   "market_regime": "bull",
   "picks": [
     {
-      "symbol": "CXDO",
+      "symbol": "ORGO",
       "action": "buy",
-      "price": 7.5305,
+      "price": 2.56,
       "confidence": 0.92,
       "strategy": "Sentiment",
-      "reason": "Sentiment bullish + vol x5.48 + price>20SMA"
+      "reason": "Sentiment bullish + vol x5.75 + price>20SMA"
+    },
+    {
+      "symbol": "UONE",
+      "action": "buy",
+      "price": 7.3,
+      "confidence": 0.9083,
+      "strategy": "FloatRotation",
+      "reason": "Float rotation: 1.9x float (1.9M) | +33.2% day"
+    },
+    {
+      "symbol": "ACCO",
+      "action": "buy",
+      "price": 3.95,
+      "confidence": 0.8957,
+      "strategy": "Sentiment",
+      "reason": "Sentiment bullish + vol x4.46 + price>20SMA"
     },
     {
       "symbol": "CERS",
       "action": "buy",
       "price": 2.72,
-      "confidence": 0.92,
+      "confidence": 0.8934,
       "strategy": "Sentiment",
-      "reason": "Sentiment bullish + vol x5.65 + price>20SMA"
+      "reason": "Sentiment bullish + vol x4.43 + price>20SMA"
     },
     {
-      "symbol": "BOOM",
+      "symbol": "FIVN",
       "action": "buy",
-      "price": 8.38,
-      "confidence": 0.92,
+      "price": 22.24,
+      "confidence": 0.8874,
       "strategy": "Sentiment",
-      "reason": "Sentiment bullish + vol x4.80 + price>20SMA"
-    },
-    {
-      "symbol": "ACCO",
-      "action": "buy",
-      "price": 3.9499,
-      "confidence": 0.92,
-      "strategy": "Sentiment",
-      "reason": "Sentiment bullish + vol x5.01 + price>20SMA"
-    },
-    {
-      "symbol": "OLED",
-      "action": "buy",
-      "price": 96.4,
-      "confidence": 0.92,
-      "strategy": "Sentiment",
-      "reason": "Sentiment bullish + vol x5.29 + price>20SMA"
+      "reason": "Sentiment bullish + vol x4.37 + price>20SMA"
     }
   ]
 }

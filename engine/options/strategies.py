@@ -64,10 +64,14 @@ from engine.config import (
     MEMORY_WARN_MB,
     get_options_universe,
 )
+import os
 from engine.utils.market import _INVERSE_ETFS, _is_bull_regime
 from engine.utils.bars import calculate_atr as _calc_atr14_base
 
 _market_state: Optional[MarketState] = None
+
+_MDA_API_KEY: Optional[str] = os.environ.get("MARKETDATA_API_KEY") or None
+_MDA_AVAILABLE: bool = bool(_MDA_API_KEY)
 
 def _calc_atr14(bars, period: int = 14) -> float:
     from engine.utils.bars import calculate_atr
@@ -263,7 +267,17 @@ def _get_options_chain(symbol: str) -> Optional[OptionsChainInfo]:
     exp_gte = today + datetime.timedelta(days=OPTIONS_DTE_MIN)
     exp_lte = today + datetime.timedelta(days=OPTIONS_DTE_MAX)
 
-    # ── Alpaca option chain ──────────────────────────────────────
+    # ── Market Data App option chain (primary) ───────────────────
+    if _MDA_AVAILABLE:
+        try:
+            result = _get_chain_marketdata(symbol, spot, exp_gte, exp_lte, hv30, atr14, hist)
+            if result is not None:
+                _chain_cache[symbol] = (now, result)
+                return result
+        except Exception as e:
+            log.debug(f"{symbol}: MDA option chain failed: {e}")
+
+    # ── Alpaca option chain (fallback) ───────────────────────────
     if ALPACA_AVAILABLE:
         try:
             result = _get_chain_alpaca(symbol, spot, exp_gte, exp_lte, hv30, atr14, hist)
@@ -444,6 +458,124 @@ def _get_chain_alpaca(
         expiry=target_expiry,
         calls=calls,
         puts=puts,
+        spot_price=spot,
+        iv_rank=iv_rank,
+        hv_30=hv30,
+        atr14=max(atr14, 0.01),
+    )
+
+
+def _get_chain_marketdata(
+    symbol: str, spot: float,
+    exp_gte: datetime.date, exp_lte: datetime.date,
+    hv30: float, atr14: float, hist: pd.DataFrame,
+) -> Optional["OptionsChainInfo"]:
+    """Fetch option chain via Market Data App API (marketdata.app).
+
+    Returns the same OptionsChainInfo structure as _get_chain_alpaca.
+    MDA delivers delta/gamma/theta/vega in a columnar list format.
+    """
+    import requests
+
+    headers = {"Authorization": f"Bearer {_MDA_API_KEY}"}
+    base_url = "https://api.marketdata.app/v1"
+
+    # Step 1: get available expirations and pick the nearest in [exp_gte, exp_lte]
+    try:
+        r_exp = requests.get(f"{base_url}/options/expirations/{symbol}/", headers=headers, timeout=10)
+        if r_exp.status_code not in (200, 203):
+            log.debug(f"{symbol}: MDA expirations status {r_exp.status_code}")
+            return None
+        exps_raw = r_exp.json().get("expirations", [])
+        target_expiry: Optional[datetime.date] = None
+        for exp_str in exps_raw:
+            try:
+                d = datetime.date.fromisoformat(exp_str)
+            except ValueError:
+                continue
+            if exp_gte <= d <= exp_lte:
+                target_expiry = d
+                break
+        if target_expiry is None:
+            log.debug(f"{symbol}: MDA no expiration found in [{exp_gte}, {exp_lte}]")
+            return None
+    except Exception as e:
+        log.debug(f"{symbol}: MDA expirations fetch error: {e}")
+        return None
+
+    # Step 2: fetch calls and puts for that expiration
+    exp_str = target_expiry.isoformat()
+    calls_df = pd.DataFrame()
+    puts_df  = pd.DataFrame()
+
+    for side in ("call", "put"):
+        try:
+            r = requests.get(f"{base_url}/options/chain/{symbol}/",
+                params={"expiration": exp_str, "side": side},
+                headers=headers, timeout=15)
+            if r.status_code not in (200, 203):
+                log.debug(f"{symbol}: MDA {side} chain status {r.status_code}")
+                return None
+            data = r.json()
+            if data.get("s") != "ok" or not data.get("optionSymbol"):
+                return None
+
+            n = len(data["optionSymbol"])
+
+            def _col(key, default=0.0):
+                vals = data.get(key)
+                return vals if vals and len(vals) == n else [default] * n
+
+            rows = []
+            for i in range(n):
+                bid  = float(_col("bid")[i] or 0)
+                ask  = float(_col("ask")[i] or 0)
+                mid  = float(_col("mid")[i] or 0) or ((bid + ask) / 2 if ask > 0 else 0)
+                last = float(_col("last")[i] or 0) or mid
+                iv   = float(_col("iv")[i] or 0)
+                rows.append({
+                    "contractsymbol": data["optionSymbol"][i],
+                    "strike":         float(_col("strike")[i] or 0),
+                    "bid":            bid,
+                    "ask":            ask,
+                    "mid":            mid,
+                    "lastprice":      last,
+                    "impliedvolatility": iv,
+                    "iv_pct":         iv * 100,
+                    "delta":          float(_col("delta")[i] or 0),
+                    "gamma":          float(_col("gamma")[i] or 0),
+                    "theta":          float(_col("theta")[i] or 0),
+                    "vega":           float(_col("vega")[i] or 0),
+                    "openinterest":   int(_col("openInterest")[i] or 0),
+                    "volume":         int(_col("volume")[i] or 0),
+                })
+
+            df = pd.DataFrame(rows)
+            if side == "call":
+                calls_df = df
+            else:
+                puts_df = df
+        except Exception as e:
+            log.debug(f"{symbol}: MDA {side} fetch error: {e}")
+            return None
+
+    if calls_df.empty and puts_df.empty:
+        return None
+
+    # IV rank from ATM call IV
+    if not calls_df.empty:
+        mid_c = calls_df[(calls_df["strike"] >= spot * 0.95) & (calls_df["strike"] <= spot * 1.05)]
+        cur_iv = float(mid_c["impliedvolatility"].mean()) * 100 if not mid_c.empty else hv30
+    else:
+        cur_iv = hv30
+    iv_rank = _calc_iv_rank(cur_iv, hist["close"])
+
+    log.debug(f"{symbol}: MDA chain OK — {len(calls_df)} calls, {len(puts_df)} puts, exp={target_expiry}")
+    return OptionsChainInfo(
+        symbol=symbol,
+        expiry=target_expiry,
+        calls=calls_df,
+        puts=puts_df,
         spot_price=spot,
         iv_rank=iv_rank,
         hv_30=hv30,
@@ -1730,12 +1862,12 @@ class IronCondorStrategy:
                 return None
 
             chain = _get_options_chain(symbol)
-            if chain is None or chain.iv_rank < 40:
+            if chain is None or chain.iv_rank < 50:
                 return None
 
-            # Short strikes: ~0.20 delta OTM (no direction kwarg — _pick_strike uses abs(delta))
-            short_put_row  = _pick_strike(chain.puts,  ctx.spot, 0.20, f)
-            short_call_row = _pick_strike(chain.calls, ctx.spot, 0.20, f)
+            # Short strikes: ~0.10 delta OTM = ~90% probability of profit (expire worthless)
+            short_put_row  = _pick_strike(chain.puts,  ctx.spot, 0.10, f)
+            short_call_row = _pick_strike(chain.calls, ctx.spot, 0.10, f)
             if short_put_row is None or short_call_row is None:
                 return None
 
@@ -1777,10 +1909,25 @@ class IronCondorStrategy:
             if net_credit <= 0 or max_loss <= 0:
                 return None
 
+            # Credit quality gate: must collect ≥20% of max risk as premium.
+            # Below 20% the trade does not pay enough for the risk taken.
+            credit_ratio = net_credit / spread_width
+            if credit_ratio < 0.20:
+                log.debug(f"IronCondor {symbol}: credit/width {credit_ratio:.1%} < 20% — skip")
+                return None
+
+            # RVOL gate: avoid selling condors into abnormally high-volume sessions.
+            # RVOL > 2.5 signals a trending/news-driven day where the range often
+            # expands beyond a 0.10-delta short strike.
+            if ctx.rvol is not None and ctx.rvol > 2.5:
+                log.debug(f"IronCondor {symbol}: RVOL {ctx.rvol:.1f} > 2.5 (high activity day) — skip")
+                return None
+
             dte  = (chain.expiry - datetime.date.today()).days
-            conf = 0.82   # iron condors have defined risk — start at threshold
-            conf += min(0.05, (chain.iv_rank - 40) * 0.002)
-            conf += min(0.04, (net_credit / spread_width) * 0.2)   # credit/width ratio bonus
+            # Confidence: base driven by IVR and credit quality (no flat base inflation)
+            conf = 0.78
+            conf += min(0.07, (chain.iv_rank - 50) * 0.002)   # IVR 50→85 adds 0→0.07
+            conf += min(0.06, (credit_ratio - 0.20) * 0.3)    # credit ratio 20%→40% adds 0→0.06
             confidence = round(min(0.93, conf), 3)
 
             return OptionSignal(

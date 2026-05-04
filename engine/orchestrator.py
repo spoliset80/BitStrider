@@ -35,7 +35,6 @@ from . import config as cfg
 from .utils import (
     setup_logging,
     MarketState,
-    get_finnhub_trending_tickers,
     get_market_sentiment,
     get_market_hours_interval,
     get_position_tuning_interval,
