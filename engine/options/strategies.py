@@ -209,6 +209,11 @@ _oi_cache: Dict[str, tuple] = {}      # symbol -> (date, oi_map)
 # Per-scan-cycle bar-context cache — populated by parallel prefetch, cleared each scan
 _bar_ctx_cache: Dict[str, Optional["_BarCtx"]] = {}
 
+# Schwab failure tracking for fallback to Alpaca (Stage 2)
+# When Schwab fails 3x for a symbol, switch to Alpaca fallback
+_schwab_failure_count: Dict[str, int] = {}   # symbol -> failure_count
+_fallback_source: Dict[str, str] = {}        # symbol -> "schwab" or "alpaca" (for logging)
+
 # Module-level OI TradingClient singleton — avoids creating a new HTTP session
 # for every symbol during parallel OI prefetch (was 120+ instantiations per cycle).
 _oi_trading_client = None
@@ -243,7 +248,11 @@ def _calc_hv30(closes: pd.Series) -> float:
 
 def _get_options_chain(symbol: str) -> Optional[OptionsChainInfo]:
     """Fetch the best near-term options chain (14-30 DTE) with full quality metadata.
-    Uses Alpaca OptionHistoricalDataClient.
+    
+    Primary: Schwab (Stage 1 - connection pool + exponential backoff improvements)
+    Fallback: Alpaca when Schwab fails 3x (Stage 2)
+    
+    Logs which source provided the chain for monitoring.
     """
     now = time.monotonic()
     cached = _chain_cache.get(symbol)
@@ -280,14 +289,43 @@ def _get_options_chain(symbol: str) -> Optional[OptionsChainInfo]:
     exp_gte = today + datetime.timedelta(days=OPTIONS_DTE_MIN)
     exp_lte = today + datetime.timedelta(days=OPTIONS_DTE_MAX)
 
-    # ── Schwab option chain (primary) ────────────────────────────
-    try:
-        result = _get_chain_schwab(symbol, spot, exp_gte, exp_lte, hv30, atr14, hist)
-        if result is not None:
-            _chain_cache[symbol] = (now, result)
-            return result
-    except Exception as e:
-        log.debug(f"{symbol}: Schwab option chain failed: {e}")
+    # ── Stage 1 & 2: Schwab primary with Alpaca fallback ──────────────────
+    # Track Schwab failures — after 3 failures, use Alpaca fallback
+    schwab_fail_count = _schwab_failure_count.get(symbol, 0)
+    use_alpaca_fallback = schwab_fail_count >= 3
+    
+    if not use_alpaca_fallback:
+        # Try Schwab (Stage 1 improvements: connection pool 10→25 + exponential backoff)
+        try:
+            result = _get_chain_schwab(symbol, spot, exp_gte, exp_lte, hv30, atr14, hist)
+            if result is not None:
+                _schwab_failure_count[symbol] = 0  # Reset on success
+                _fallback_source[symbol] = "schwab"
+                _chain_cache[symbol] = (now, result)
+                return result
+            else:
+                # Schwab returned None — increment failure count
+                _schwab_failure_count[symbol] = schwab_fail_count + 1
+                log.debug(f"{symbol}: Schwab chain failed (attempt {schwab_fail_count + 1}/3)")
+        except Exception as e:
+            _schwab_failure_count[symbol] = schwab_fail_count + 1
+            log.debug(f"{symbol}: Schwab chain exception: {e} (attempt {schwab_fail_count + 1}/3)")
+    
+    # ── Stage 2: Alpaca fallback ─────────────────────────────────────────
+    # Use Alpaca if Schwab failed 3x or was already skipped
+    if use_alpaca_fallback or schwab_fail_count >= 3:
+        try:
+            result = _get_chain_alpaca(symbol, spot, exp_gte, exp_lte, hv30, atr14, hist)
+            if result is not None:
+                _fallback_source[symbol] = "alpaca"
+                if use_alpaca_fallback:
+                    log.info(f"{symbol}: Using Alpaca fallback (Schwab failed 3x)")
+                _chain_cache[symbol] = (now, result)
+                return result
+            else:
+                log.warning(f"{symbol}: Both Schwab (failed {schwab_fail_count + 1}x) and Alpaca fallback returned None")
+        except Exception as e:
+            log.warning(f"{symbol}: Alpaca fallback exception: {e}")
 
     return None
 
@@ -518,6 +556,275 @@ def _get_chain_schwab(
     exp_gte: datetime.date, exp_lte: datetime.date,
     hv30: float, atr14: float, hist: pd.DataFrame,
 ) -> Optional[OptionsChainInfo]:
+    """Fetch option chain via Schwab API with retry logic for transient errors.
+    
+    Schwab returns a nested dict structure:
+    - callExpDateMap: {expiration_str: {strike_str: [option_list]}}
+    - putExpDateMap: {expiration_str: {strike_str: [option_list]}}
+    
+    Retries: 502, 503, 504 server errors up to 3 times with exponential backoff
+    (0.5s, 1s, 2s) to handle temporary Schwab API outages/overload.
+    
+    Returns calls/puts DataFrames with the same structure as Alpaca/MDA.
+    """
+    try:
+        from engine.broker.schwab_client import get_schwab_market_data_client
+        from requests.exceptions import HTTPError
+    except ImportError:
+        return None
+    
+    try:
+        client = get_schwab_market_data_client()
+        
+        # Retry transient 5xx errors (502, 503, 504)
+        def _fetch_with_retry():
+            for attempt in range(3):
+                try:
+                    resp = client.get_option_chains(symbol, contract_type="ALL")
+                    return resp
+                except HTTPError as e:
+                    status_code = e.response.status_code
+                    # Retry on 502 (Bad Gateway), 503 (Service Unavailable), 504 (Gateway Timeout)
+                    if status_code in (502, 503, 504):
+                        if attempt < 2:  # Not the last attempt
+                            wait_time = (2 ** attempt) * 0.5  # 0.5s, 1s, 2s
+                            log.debug(f"{symbol}: Schwab {status_code} error — retrying in {wait_time:.1f}s")
+                            import time
+                            time.sleep(wait_time)
+                        else:
+                            log.warning(f"{symbol}: Schwab {status_code} error — giving up after 3 attempts")
+                            raise
+                    else:
+                        # Don't retry other HTTP errors (400, 401, 429, etc.)
+                        raise
+            return None
+        
+        response = _fetch_with_retry()
+        
+        if not response or response.get("status") != "SUCCESS":
+            log.debug(f"{symbol}: Schwab response status not SUCCESS: {response}")
+            return None
+        
+        # Extract expiration date maps
+        call_map = response.get("callExpDateMap", {})
+        put_map = response.get("putExpDateMap", {})
+        
+        if not call_map and not put_map:
+            log.debug(f"{symbol}: Schwab no call or put maps found")
+            return None
+        
+        # Find valid expirations in our DTE range
+        target_expiry = None
+        target_call_key = None
+        target_put_key = None
+        
+        for call_key in call_map.keys():
+            try:
+                # Format is "2026-05-20:15" (date:DTE)
+                date_part = call_key.split(":")[0]
+                exp = datetime.datetime.strptime(date_part, "%Y-%m-%d").date()
+                if exp_gte <= exp <= exp_lte:
+                    if target_expiry is None or exp < target_expiry:
+                        target_expiry = exp
+                        target_call_key = call_key
+            except (ValueError, IndexError):
+                continue
+        
+        for put_key in put_map.keys():
+            try:
+                date_part = put_key.split(":")[0]
+                exp = datetime.datetime.strptime(date_part, "%Y-%m-%d").date()
+                if exp_gte <= exp <= exp_lte:
+                    if target_expiry is None or exp < target_expiry:
+                        target_expiry = exp
+                        target_put_key = put_key
+            except (ValueError, IndexError):
+                continue
+        
+        if target_expiry is None:
+            log.debug(f"{symbol}: Schwab no valid expirations in [{exp_gte}, {exp_lte}]")
+            return None
+        
+        calls = []
+        puts = []
+        
+        # Process calls using the actual key from the map
+        if target_call_key and target_call_key in call_map:
+            for strike_str, option_list in call_map[target_call_key].items():
+                try:
+                    strike = float(strike_str)
+                    # Skip strikes outside range
+                    if strike < spot * 0.70 or strike > spot * 1.30:
+                        continue
+                    
+                    # Schwab returns array per strike, usually 1 option but take first
+                    if option_list and len(option_list) > 0:
+                        opt = option_list[0]
+                        bid = float(opt.get("bid", 0) or 0)
+                        ask = float(opt.get("ask", 0) or 0)
+                        mid = (bid + ask) / 2 if (bid > 0 and ask > 0) else 0
+                        last = float(opt.get("last", mid) or mid)
+                        iv = float(opt.get("volatility", 0) or 0) / 100  # Schwab gives IV as percentage
+                        delta = float(opt.get("delta", 0) or 0)
+                        oi = int(opt.get("openInterest", 0) or 0)
+                        
+                        calls.append({
+                            "contractsymbol": opt.get("symbol", ""),
+                            "strike": strike,
+                            "bid": bid,
+                            "ask": ask,
+                            "mid": mid,
+                            "lastprice": last,
+                            "impliedvolatility": iv,
+                            "iv_pct": iv * 100,
+                            "delta": delta,
+                            "openinterest": oi,
+                        })
+                except (ValueError, TypeError, KeyError):
+                    continue
+        
+        # Process puts using the actual key from the map
+        if target_put_key and target_put_key in put_map:
+            for strike_str, option_list in put_map[target_put_key].items():
+                try:
+                    strike = float(strike_str)
+                    # Skip strikes outside range
+                    if strike < spot * 0.70 or strike > spot * 1.30:
+                        continue
+                    
+                    if option_list and len(option_list) > 0:
+                        opt = option_list[0]
+                        bid = float(opt.get("bid", 0) or 0)
+                        ask = float(opt.get("ask", 0) or 0)
+                        mid = (bid + ask) / 2 if (bid > 0 and ask > 0) else 0
+                        last = float(opt.get("last", mid) or mid)
+                        iv = float(opt.get("volatility", 0) or 0) / 100  # Schwab gives IV as percentage
+                        delta = float(opt.get("delta", 0) or 0)
+                        oi = int(opt.get("openInterest", 0) or 0)
+                        
+                        puts.append({
+                            "contractsymbol": opt.get("symbol", ""),
+                            "strike": strike,
+                            "bid": bid,
+                            "ask": ask,
+                            "mid": mid,
+                            "lastprice": last,
+                            "impliedvolatility": iv,
+                            "iv_pct": iv * 100,
+                            "delta": delta,
+                            "openinterest": oi,
+                        })
+                except (ValueError, TypeError, KeyError):
+                    continue
+        
+        if not calls and not puts:
+            log.debug(f"{symbol}: Schwab found no valid calls/puts for {target_expiry}")
+            return None
+        
+        calls_df = pd.DataFrame(calls) if calls else pd.DataFrame()
+        puts_df = pd.DataFrame(puts) if puts else pd.DataFrame()
+        
+        # IV rank from ATM call IV
+        if not calls_df.empty:
+            mid_c = calls_df[(calls_df["strike"] >= spot * 0.95) & (calls_df["strike"] <= spot * 1.05)]
+            cur_iv = float(mid_c["impliedvolatility"].mean()) * 100 if not mid_c.empty else hv30
+        else:
+            cur_iv = hv30
+        iv_rank = _calc_iv_rank(cur_iv, hist["close"])
+        
+        log.debug(f"{symbol}: Schwab chain OK — {len(calls_df)} calls, {len(puts_df)} puts, exp={target_expiry}")
+        return OptionsChainInfo(
+            symbol=symbol,
+            expiry=target_expiry,
+            calls=calls_df,
+            puts=puts_df,
+            spot_price=spot,
+            iv_rank=iv_rank,
+            hv_30=hv30,
+            atr14=max(atr14, 0.01),
+        )
+    
+    except Exception as e:
+        log.debug(f"{symbol}: Schwab option chain parse error: {e}")
+        import traceback
+        log.debug(traceback.format_exc())
+        return None
+
+
+def _get_chain_alpaca(
+    symbol: str, spot: float,
+    exp_gte: datetime.date, exp_lte: datetime.date,
+    hv30: float, atr14: float, hist: pd.DataFrame,
+) -> Optional[OptionsChainInfo]:
+    """Fetch option chain via Alpaca OptionHistoricalDataClient (fallback).
+    
+    Called when Schwab fails 3 times or is unavailable.
+    Returns the same OptionsChainInfo structure as Schwab/MDA.
+    """
+    try:
+        from alpaca.data.requests import OptionChainRequest
+        from engine.utils import get_option_data_client
+    except ImportError:
+        return None
+    
+    try:
+        client = get_option_data_client()
+        req = OptionChainRequest(
+            underlying_symbol=symbol,
+            expiration_date_gte=exp_gte,
+            expiration_date_lte=exp_lte,
+            strike_price_gte=round(spot * 0.70, 2),
+            strike_price_lte=round(spot * 1.30, 2),
+        )
+        snapshots = client.get_option_chain(req)
+        if not snapshots:
+            return None
+        
+        calls = _snapshots_to_df(snapshots, "call")
+        puts  = _snapshots_to_df(snapshots, "put")
+        
+        if calls.empty and puts.empty:
+            return None
+        
+        # Merge real OI from /v2/options/contracts
+        oi_map = _fetch_oi_from_contracts(symbol, exp_gte, exp_lte)
+        if oi_map:
+            calls = _apply_oi_to_df(calls, oi_map)
+            puts  = _apply_oi_to_df(puts,  oi_map)
+        
+        # IV rank from ATM call IV
+        if not calls.empty:
+            mid_c = calls[(calls["strike"] >= spot * 0.95) & (calls["strike"] <= spot * 1.05)]
+            cur_iv = float(mid_c["impliedvolatility"].mean()) * 100 if not mid_c.empty else hv30
+        else:
+            cur_iv = hv30
+        iv_rank = _calc_iv_rank(cur_iv, hist["close"])
+        
+        # Get expiry from the chain
+        target_expiry = None
+        if not calls.empty and "expiry" in calls.columns:
+            target_expiry = calls["expiry"].iloc[0]
+        elif not puts.empty and "expiry" in puts.columns:
+            target_expiry = puts["expiry"].iloc[0]
+        
+        if target_expiry is None:
+            target_expiry = exp_gte
+        
+        log.debug(f"{symbol}: Alpaca chain OK — {len(calls)} calls, {len(puts)} puts, exp={target_expiry}")
+        return OptionsChainInfo(
+            symbol=symbol,
+            expiry=target_expiry,
+            calls=calls,
+            puts=puts,
+            spot_price=spot,
+            iv_rank=iv_rank,
+            hv_30=hv30,
+            atr14=max(atr14, 0.01),
+        )
+    
+    except Exception as e:
+        log.debug(f"{symbol}: Alpaca option chain fallback failed: {e}")
+        return None
     """Fetch option chain via Schwab API with retry logic for transient errors.
     
     Schwab returns a nested dict structure:
