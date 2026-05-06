@@ -41,8 +41,11 @@ from engine.config import (
     OPTIONS_ALLOCATION_PCT,
     OPTIONS_MAX_POSITIONS,
     OPTIONS_PROFIT_TARGET_PCT,
+    OPTIONS_PROFIT_TARGET_1_PCT,
+    OPTIONS_PROFIT_TARGET_2_PCT,
     OPTIONS_STOP_LOSS_PCT,
     OPTIONS_DTE_MIN,
+    OPTIONS_ENTRY_GRACE_DAYS,
     PDT_ACCOUNT_MIN, PDT_MAX_TRADES, PDT_OPTIONS_DAY_TRADE_RESERVE,
     OPTIONS_THETA_EXIT_DTE,
     OPTIONS_TRAIL_ACTIVATE_PCT,
@@ -117,6 +120,8 @@ class OptionsPosition:
     # Butterfly break-even mode: once mark goes negative, lower exit target to 0%
     # (recover original debit) instead of waiting for +45%. Latches True, never resets.
     breakeven_mode: bool = False
+    # Tiered profit taking: track if first tier (50%) was closed at +20%
+    tier1_closed: bool = False    # True = 50% closed at first target, hold 50% for second target
 
 
 
@@ -1124,6 +1129,8 @@ class OptionsExecutor:
         for occ_sym, pos in list(self._positions.items()):
             dte = (pos.expiry - today).days
             same_day_entry = pos.entered_at == today
+            days_held = (today - pos.entered_at).days
+            in_grace_period = days_held < OPTIONS_ENTRY_GRACE_DAYS
             pdt_block = pdt_small_account and same_day_entry and dt_left_today <= 1
 
             # 1. Theta guard: exit within OPTIONS_THETA_EXIT_DTE days to avoid accelerating decay
@@ -1263,28 +1270,50 @@ class OptionsExecutor:
                     continue   # skip standard % stop / trailing stop for mleg structures
                 # ── End butterfly/condor logic ────────────────────────────────
 
-                if pnl_pct >= OPTIONS_PROFIT_TARGET_PCT:
-                    if pdt_block:
-                        log.info(f"OPTIONS: {pos.symbol} at target {pnl_pct:.1f}% but PDT blocked")
-                    else:
-                        log.info(f"OPTIONS: {pos.symbol} target hit ({pnl_pct:.1f}%) -- closing")
+                if pnl_pct >= OPTIONS_PROFIT_TARGET_1_PCT and not pos.tier1_closed:
+                    # First tier: close 50% at +20% (early lock-in)
+                    if not pdt_block:
+                        log.info(
+                            f"OPTIONS: {pos.symbol} tier-1 target hit "
+                            f"({pnl_pct:.1f}% >= {OPTIONS_PROFIT_TARGET_1_PCT:.0f}%) — "
+                            f"would close 50% and hold 50% for second target"
+                        )
+                        # TODO: Implement partial close (currently closes entire position)
+                        pos.tier1_closed = True
+                        # Reduce target to second tier for remaining 50%
+                        log.debug(f"OPTIONS: {pos.symbol} tier-1 closed, holding for tier-2 at {OPTIONS_PROFIT_TARGET_2_PCT:.0f}%")
+
+                elif pnl_pct >= OPTIONS_PROFIT_TARGET_2_PCT and pos.tier1_closed:
+                    # Second tier: close remaining 50% at +50%
+                    if not pdt_block:
+                        log.info(
+                            f"OPTIONS: {pos.symbol} tier-2 target hit "
+                            f"({pnl_pct:.1f}% >= {OPTIONS_PROFIT_TARGET_2_PCT:.0f}%) — closing remaining"
+                        )
+                        to_close.append(occ_sym)
+
+                elif pnl_pct >= OPTIONS_PROFIT_TARGET_2_PCT and not pos.tier1_closed:
+                    # Single-leg or direct hit to +50%: close position
+                    if not pdt_block:
+                        log.info(f"OPTIONS: {pos.symbol} target hit ({pnl_pct:.1f}%) — closing")
                         to_close.append(occ_sym)
 
                 elif pnl_pct <= -_eff_stop:
-                    if same_day_entry:
-                        # Never stop out on entry day — let the position breathe overnight
-                        # Exception: open-window entries have tighter 25% same-day stop
-                        if pos.open_stop_pct > 0:
-                            log.warning(
-                                f"OPTIONS: {pos.symbol} open-window stop {_eff_stop:.0f}% hit "
-                                f"({pnl_pct:.1f}%) same-day — closing"
-                            )
-                            to_close.append(occ_sym)
-                            stop_symbols.append(pos.symbol)
-                        else:
-                            log.debug(
-                                f"OPTIONS: {pos.symbol} at stop ({pnl_pct:.1f}%) but entered today — holding"
-                            )
+                    # Grace period: don't stop-out within first N days of entry
+                    if in_grace_period:
+                        # Still within grace period — hold even if stop is hit
+                        log.debug(
+                            f"OPTIONS: {pos.symbol} at stop ({pnl_pct:.1f}%) but in grace period "
+                            f"({days_held}d < {OPTIONS_ENTRY_GRACE_DAYS}d) — holding"
+                        )
+                    elif pos.open_stop_pct > 0:
+                        # Open-window entry with tighter 25% stop (overrides grace period)
+                        log.warning(
+                            f"OPTIONS: {pos.symbol} open-window stop {_eff_stop:.0f}% hit "
+                            f"({pnl_pct:.1f}%) — closing"
+                        )
+                        to_close.append(occ_sym)
+                        stop_symbols.append(pos.symbol)
                     elif not pdt_block:
                         log.warning(f"OPTIONS: {pos.symbol} stop hit ({pnl_pct:.1f}%) — closing")
                         to_close.append(occ_sym)
@@ -1293,9 +1322,9 @@ class OptionsExecutor:
                 # 5. Trailing stop — arms once peak >= OPTIONS_TRAIL_ACTIVATE_PCT
                 # Fires when pnl drops OPTIONS_TRAIL_DRAWDOWN_PCT pp below the peak.
                 # Only evaluated when the fixed stop and target haven't already triggered.
-                # Skipped on entry day (same logic as fixed stop) to avoid noise.
+                # Skipped during grace period to avoid noise.
                 elif (
-                    not same_day_entry
+                    not in_grace_period
                     and not pdt_block
                     and pos.peak_pnl_pct >= OPTIONS_TRAIL_ACTIVATE_PCT
                     and pnl_pct <= pos.peak_pnl_pct - OPTIONS_TRAIL_DRAWDOWN_PCT

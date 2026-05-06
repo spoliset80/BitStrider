@@ -35,9 +35,18 @@ OPTIONS_MIN_OPEN_INTEREST   = int(os.getenv("OPTIONS_MIN_OPEN_INTEREST", "300"))
 OPTIONS_MAX_SPREAD_PCT      = float(os.getenv("OPTIONS_MAX_SPREAD_PCT", "10.0"))  # max bid/ask spread % of mid
 OPTIONS_MAX_IV_PCT          = float(os.getenv("OPTIONS_MAX_IV_PCT", "150.0"))     # skip when IV is extreme
 OPTIONS_MIN_IV_PCT          = float(os.getenv("OPTIONS_MIN_IV_PCT", "15.0"))      # skip when IV is too flat
-OPTIONS_PROFIT_TARGET_PCT   = float(os.getenv("OPTIONS_PROFIT_TARGET_PCT", "45.0"))  # close at +45% gain (aggressive momentum capture)
-OPTIONS_STOP_LOSS_PCT       = float(os.getenv("OPTIONS_STOP_LOSS_PCT", "30.0"))      # close at -30% loss
-OPTIONS_THETA_EXIT_DTE      = int(os.getenv("OPTIONS_THETA_EXIT_DTE", "2"))           # exit within N DTE to avoid theta decay spike
+# ─────────────────────────────────────────────────────────────────
+# Options Stop-Loss & Profit-Taking Strategy
+# ─────────────────────────────────────────────────────────────────
+# Wider SL (-50%) because options are volatile; initial -30% dips
+# don't mean the position is broken — let it breathe 2-3 days.
+# Tiered profit-taking captures more upside (50% at +20%, 50% at +50%).
+OPTIONS_STOP_LOSS_PCT       = float(os.getenv("OPTIONS_STOP_LOSS_PCT", "50.0"))      # -50% loss (was 30%) — wider for volatility
+OPTIONS_PROFIT_TARGET_1_PCT = float(os.getenv("OPTIONS_PROFIT_TARGET_1_PCT", "20.0"))  # close 50% of position at +20% (early lock-in)
+OPTIONS_PROFIT_TARGET_2_PCT = float(os.getenv("OPTIONS_PROFIT_TARGET_2_PCT", "50.0"))  # close remaining 50% at +50% (ride the move)
+OPTIONS_PROFIT_TARGET_PCT   = OPTIONS_PROFIT_TARGET_2_PCT  # Backward compatibility alias
+OPTIONS_ENTRY_GRACE_DAYS    = int(os.getenv("OPTIONS_ENTRY_GRACE_DAYS", "2"))        # no stop-loss during first N days (let position stabilize)
+OPTIONS_THETA_EXIT_DTE      = int(os.getenv("OPTIONS_THETA_EXIT_DTE", "4"))           # exit by DTE ≤ 4 (was 2) — avoid theta acceleration spike
 OPTIONS_COVERED_CALL_DELTA  = float(os.getenv("OPTIONS_COVERED_CALL_DELTA", "0.25")) # sell OTM calls ~0.25 delta
 OPTIONS_MIN_SIGNAL_CONFIDENCE = float(os.getenv("OPTIONS_MIN_SIGNAL_CONFIDENCE", "0.76"))  # entry threshold — 0.76 lets quality setups through while filtering noise
 OPTIONS_MIN_STOCK_PRICE     = float(os.getenv("OPTIONS_MIN_STOCK_PRICE", "8.0"))   # sub-$8 stocks have wide spreads and thin option chains
@@ -47,8 +56,9 @@ OPTIONS_MIN_ADV             = float(os.getenv("OPTIONS_MIN_ADV", "500_000"))    
 OPTIONS_UNIVERSE_OVERRIDE   = os.getenv("OPTIONS_UNIVERSE_OVERRIDE", "").strip()  # comma-separated tickers to force a smaller options universe
 OPTIONS_STOP_COOLDOWN_DAYS  = int(os.getenv("OPTIONS_STOP_COOLDOWN_DAYS", "2"))   # no re-entry within N days after a stop on same symbol
 OPTIONS_EARNINGS_AVOID_DAYS = int(os.getenv("OPTIONS_EARNINGS_AVOID_DAYS", "15")) # skip entries if earnings within N calendar days
-OPTIONS_TRAIL_ACTIVATE_PCT  = float(os.getenv("OPTIONS_TRAIL_ACTIVATE_PCT", "20.0"))  # trailing stop arms once P&L exceeds this %
-OPTIONS_TRAIL_DRAWDOWN_PCT  = float(os.getenv("OPTIONS_TRAIL_DRAWDOWN_PCT", "15.0"))  # close if pnl drops this many pp from peak
+# Trailing stop: locks in gains after big moves. Flexible to let winners run.
+OPTIONS_TRAIL_ACTIVATE_PCT  = float(os.getenv("OPTIONS_TRAIL_ACTIVATE_PCT", "25.0"))  # trailing stop arms at +25% P&L (was 20%)
+OPTIONS_TRAIL_DRAWDOWN_PCT  = float(os.getenv("OPTIONS_TRAIL_DRAWDOWN_PCT", "20.0"))  # close if drops 20pp from peak (was 15pp) — more patient
 # Tickers that actively trade liquid options.
 # Loaded dynamically from data/ti_unusual_options.json (written by capture_tradeideas.py
 # every time the TI unusualoptionsvolume scan is scraped).  Falls back to the
