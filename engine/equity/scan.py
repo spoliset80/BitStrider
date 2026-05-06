@@ -43,12 +43,11 @@ def _mda_available() -> bool:
 
 
 def _is_iex_feed() -> bool:
-    """Return True only when MDA is unavailable AND Alpaca feed is IEX.
+    """Always return False since market data comes from Schwab (not Alpaca/MDA).
 
-    MDA provides full consolidated data equivalent to SIP, so IEX threshold
-    scaling is disabled whenever MDA is the active data source.
+    Schwab provides consolidated data, so IEX threshold scaling is not needed.
     """
-    return (not _mda_available()) and (_ALPACA_DATA_FEED != "sip")
+    return False
 from .universe import get_tier as _get_tier_live, get_latest_batch as _get_latest_batch, get_ti_primary as _get_ti_primary
 from .discovery import get_priority_scan_queue as _get_priority_scan_queue
 
