@@ -8,6 +8,8 @@ import requests
 import logging
 from typing import Dict, Optional
 from datetime import datetime, timedelta
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 log = logging.getLogger("ApexTrader")
 
@@ -121,6 +123,21 @@ class SchwabMarketDataClient:
             oauth_client = SchwabOAuthClient()
         self.oauth = oauth_client
         self.session = requests.Session()
+        
+        # Configure connection pooling: increase pool size from default 10 to 25
+        # Configure retry strategy with exponential backoff for transient errors
+        adapter = HTTPAdapter(
+            pool_connections=25,      # Max connections to pool per host
+            pool_maxsize=25,          # Max number of connections to save in pool
+            max_retries=Retry(
+                total=3,                           # Total retries across all methods
+                backoff_factor=0.5,               # Exponential backoff: 0.5s, 1s, 2s
+                status_forcelist=[502, 503, 504], # Retry on Bad Gateway, Service Unavailable, Timeout
+                raise_on_status=False             # Don't raise on 4xx (auth/validation errors)
+            )
+        )
+        self.session.mount("https://", adapter)
+        self.session.mount("http://", adapter)
     
     def get_quote(self, symbol: str) -> Optional[Dict]:
         """Get current quote for symbol."""
@@ -140,7 +157,7 @@ class SchwabMarketDataClient:
     def get_candles(self, symbol: str, period_type: str = "day", period: int = 5, 
                    frequency_type: str = "minute", frequency: int = 15) -> Optional[Dict]:
         """
-        Get candles (OHLCV bars) for symbol.
+        Get candles (OHLCV bars) for symbol with exponential backoff on transient failures.
         
         Args:
             symbol: Stock symbol
@@ -149,51 +166,114 @@ class SchwabMarketDataClient:
             frequency_type: "minute", "daily", "weekly", "monthly"
             frequency: 1, 5, 10, 15, 30 for minute; 1 for daily/weekly/monthly
         """
-        try:
-            params = {
-                "periodType": period_type,
-                "period": period,
-                "frequencyType": frequency_type,
-                "frequency": frequency
-            }
-            url = f"{SCHWAB_MARKET_DATA_URL}/pricehistory"
-            response = self.session.get(
-                url,
-                headers=self.oauth.get_headers(),
-                params={**params, "symbol": symbol},
-                timeout=15
-            )
-            response.raise_for_status()
-            return response.json()
-        except Exception as e:
-            log.warning(f"Schwab: Failed to get candles for {symbol}: {e}")
-            return None
+        max_retries = 3
+        backoff_times = [0.5, 1.0, 2.0]
+        
+        for attempt in range(max_retries):
+            try:
+                params = {
+                    "periodType": period_type,
+                    "period": period,
+                    "frequencyType": frequency_type,
+                    "frequency": frequency,
+                    "symbol": symbol
+                }
+                url = f"{SCHWAB_MARKET_DATA_URL}/pricehistory"
+                
+                response = self.session.get(
+                    url,
+                    headers=self.oauth.get_headers(),
+                    params=params,
+                    timeout=15
+                )
+                
+                # 502, 503, 504 are transient — retry with backoff
+                if response.status_code in (502, 503, 504):
+                    if attempt < max_retries - 1:
+                        wait_time = backoff_times[attempt]
+                        log.debug(
+                            f"Schwab: {symbol} candles returned {response.status_code} "
+                            f"— retrying in {wait_time:.1f}s"
+                        )
+                        time.sleep(wait_time)
+                        continue
+                    else:
+                        log.warning(f"Schwab: {symbol} candles failed after {max_retries} attempts")
+                        return None
+                
+                response.raise_for_status()
+                return response.json()
+            
+            except requests.exceptions.RequestException as e:
+                if attempt < max_retries - 1:
+                    wait_time = backoff_times[attempt]
+                    log.debug(f"Schwab: {symbol} candles retry in {wait_time:.1f}s")
+                    time.sleep(wait_time)
+                else:
+                    log.warning(f"Schwab: Failed to get candles for {symbol}: {e}")
+                    return None
     
     def get_option_chains(self, symbol: str, contract_type: str = "ALL") -> Optional[Dict]:
         """
-        Get options chains for symbol.
+        Get options chains for symbol with exponential backoff retry on transient failures.
         
         Args:
             symbol: Stock symbol
             contract_type: "CALL", "PUT", "ALL"
+        
+        Returns:
+            Options chain data or None on persistent failure
         """
-        try:
-            params = {
-                "symbol": symbol,
-                "contractType": contract_type
-            }
-            url = f"{SCHWAB_MARKET_DATA_URL}/chains"
-            response = self.session.get(
-                url,
-                headers=self.oauth.get_headers(),
-                params=params,
-                timeout=15
-            )
-            response.raise_for_status()
-            return response.json()
-        except Exception as e:
-            log.warning(f"Schwab: Failed to get options chains for {symbol}: {e}")
-            return None
+        max_retries = 3
+        backoff_times = [0.5, 1.0, 2.0]  # Exponential: 0.5s, 1s, 2s
+        
+        for attempt in range(max_retries):
+            try:
+                params = {
+                    "symbol": symbol,
+                    "contractType": contract_type
+                }
+                url = f"{SCHWAB_MARKET_DATA_URL}/chains"
+                
+                response = self.session.get(
+                    url,
+                    headers=self.oauth.get_headers(),
+                    params=params,
+                    timeout=15
+                )
+                
+                # 502, 503, 504 are transient — retry with backoff
+                if response.status_code in (502, 503, 504):
+                    if attempt < max_retries - 1:
+                        wait_time = backoff_times[attempt]
+                        log.warning(
+                            f"Schwab: {symbol} chain returned {response.status_code} "
+                            f"— retrying in {wait_time:.1f}s (attempt {attempt + 1}/{max_retries})"
+                        )
+                        time.sleep(wait_time)
+                        continue
+                    else:
+                        log.warning(
+                            f"Schwab: {symbol} chain failed with {response.status_code} "
+                            f"after {max_retries} attempts — giving up"
+                        )
+                        return None
+                
+                # All other status codes: use standard raise_for_status
+                response.raise_for_status()
+                return response.json()
+            
+            except requests.exceptions.RequestException as e:
+                if attempt < max_retries - 1:
+                    wait_time = backoff_times[attempt]
+                    log.warning(
+                        f"Schwab: {symbol} chain request error: {e} "
+                        f"— retrying in {wait_time:.1f}s (attempt {attempt + 1}/{max_retries})"
+                    )
+                    time.sleep(wait_time)
+                else:
+                    log.warning(f"Schwab: Failed to get options chains for {symbol}: {e}")
+                    return None
 
 
 # Singleton instances
