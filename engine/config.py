@@ -688,6 +688,17 @@ ALPACA_MOVER_SCAN_INTERVAL_MIN = 10   # Re-poll Alpaca screener every 10 min (re
 MIN_DOLLAR_VOLUME        = 1_000_000   # Skip illiquid setups: price × day_vol < $1M
 MAX_GAP_CHASE_PCT        = 15.0       # Skip if already up >15% without consolidation
 GAP_CHASE_CONSOL_BARS    = 5          # Number of 1-min bars to check for tight base
+
+# ─────────────────────────────────────────────────────────────────
+# Trade Ideas (TI) Momentum/HSF Stocks — Tighter Guardrails
+# ─────────────────────────────────────────────────────────────────
+# TI stocks run hard and fast; earlier entries are preferred to avoid chasing
+# tail-end moves with poor risk/reward. These thresholds prevent late entries.
+TI_MAX_GAP_CHASE_PCT     = 10.0       # Stricter: only enter if <10% up from open
+TI_RVOL_MIN              = 1.3        # Require 1.3x relative volume (vs 1.0x base)
+TI_MIN_DOLLAR_VOLUME     = 1_500_000  # Higher liquidity requirement ($1.5M vs $1M)
+TI_MAX_OVERNIGHT_GAP_PCT = 12.0       # Skip if >12% overnight/pre-market gap
+
 USE_MARKET_REGIME_FILTER = True       # SPY below 200-day MA → cut signals to 1
 MARKET_REGIME_SIGNALS_CAP  = 5        # Max LONG entries per cycle in bear regime (swap-only); tries until one succeeds
 BEAR_SHORT_SIGNALS_CAP     = 3        # Max SHORT entries per cycle in bear regime

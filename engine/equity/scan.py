@@ -22,6 +22,10 @@ from engine.config import (
     RVOL_MIN,
     MAX_GAP_CHASE_PCT,
     GAP_CHASE_CONSOL_BARS,
+    TI_MAX_GAP_CHASE_PCT,
+    TI_RVOL_MIN,
+    TI_MIN_DOLLAR_VOLUME,
+    TI_MAX_OVERNIGHT_GAP_PCT,
     BEAR_SHORT_UNIVERSE,
 )
 from engine.utils import MarketState, clear_bar_cache, get_bars, is_dead_ticker
@@ -72,6 +76,12 @@ from engine.utils.market import _is_bull_regime, _INVERSE_ETFS
 # slices of the universe are covered across consecutive cycles.
 _scan_offset: int = 0
 
+# ── TI stocks tracking ─────────────────────────────────────────────────────────
+# Set of symbols from Trade Ideas (momentum/HSF stocks).
+# Populated by get_scan_targets() and used by _passes_guardrails() to apply
+# stricter guardrails (lower gap%, higher RVOL, higher dollar-vol).
+_ti_stocks: Set[str] = set()
+
 # ── Batch snapshot caches ─────────────────────────────────────────────────────
 # _snapshot_cache    : Alpaca snapshot objects (fallback when MDA unavailable)
 # _mda_snapshot_cache: MDA bulk-quote dicts {price, volume, open} (primary)
@@ -100,7 +110,7 @@ def _prefetch_snapshots(symbols: List[str]) -> None:
     # MDA bulk quotes removed — relying on per-symbol bar fetch in _passes_guardrails
 
 
-def _passes_guardrails(symbol: str, bull_regime: bool = None, market_state: Optional[MarketState] = None, return_reason: bool = False) -> bool:
+def _passes_guardrails(symbol: str, bull_regime: bool = None, market_state: Optional[MarketState] = None, return_reason: bool = False, is_ti_stock: bool = False) -> bool:
     """Pre-scan gates: dollar-volume, RVOL, and gap-chase guard.
     Returns False to skip the symbol; never raises.
 
@@ -110,6 +120,10 @@ def _passes_guardrails(symbol: str, bull_regime: bool = None, market_state: Opti
 
     market_state: shared MarketState for the current scan cycle. If None,
     it will be created lazily.
+
+    is_ti_stock: True if this symbol is from Trade Ideas (momentum/HSF stocks).
+    When True, applies stricter guardrails: lower gap-chase %, higher RVOL,
+    higher dollar-volume, and checks for large overnight gaps.
     """
     # return_reason is now an explicit argument
     try:
@@ -142,6 +156,28 @@ def _passes_guardrails(symbol: str, bull_regime: bool = None, market_state: Opti
             day_vol = float(intraday["volume"].sum())
             open_px = float(intraday["open"].iloc[0])
 
+        # ── TI OVERNIGHT GAP CHECK: Skip if massive pre-market move ────────────
+        # Trade Ideas momentum stocks often gap hard overnight. Skip if >12% gap
+        # to avoid chasing already-extended moves on poor risk/reward.
+        if is_ti_stock and open_px > 0:
+            try:
+                # Fetch yesterday's daily bar to calc overnight gap
+                yesterday_bars = get_bars(symbol, "2d", "1d")
+                if not yesterday_bars.empty and len(yesterday_bars) >= 1:
+                    yesterday_close = float(yesterday_bars["close"].iloc[-2]) if len(yesterday_bars) >= 2 else None
+                    if yesterday_close and yesterday_close > 0:
+                        overnight_gap = ((open_px - yesterday_close) / yesterday_close) * 100
+                        if abs(overnight_gap) > TI_MAX_OVERNIGHT_GAP_PCT:
+                            _log.debug(
+                                f"[GUARDRAIL] {symbol} blocked: TI stock overnight gap {overnight_gap:.1f}% > "
+                                f"TI_MAX_OVERNIGHT_GAP_PCT {TI_MAX_OVERNIGHT_GAP_PCT}%"
+                            )
+                            if return_reason:
+                                return False, 'overnight_gap'
+                            return False
+            except Exception as _gap_err:
+                _log.debug(f"[TI] {symbol}: overnight gap check failed ({_gap_err}) — continuing")
+
         # Resolve regime, VIX, and IEX-feed status once — reused throughout
         vix = None
         if hasattr(market_state, 'vix') and market_state.vix is not None:
@@ -155,6 +191,11 @@ def _passes_guardrails(symbol: str, bull_regime: bool = None, market_state: Opti
         base_min_price = MIN_STOCK_PRICE
         base_dollar_vol = MIN_DOLLAR_VOLUME
         base_rvol = RVOL_MIN
+
+        # ── TI STOCK OVERRIDES: Stricter guardrails for momentum/HSF stocks ────
+        if is_ti_stock:
+            base_dollar_vol = TI_MIN_DOLLAR_VOLUME
+            base_rvol = TI_RVOL_MIN
 
         if bull:
             if vix and vix > 25:
@@ -416,7 +457,8 @@ def _passes_guardrails(symbol: str, bull_regime: bool = None, market_state: Opti
                         return False
 
         # Adaptive MAX_GAP_CHASE_PCT using market regime and VIX (already resolved above)
-        base_gap = MAX_GAP_CHASE_PCT
+        # For TI stocks, use stricter base_gap to avoid chasing tail-end momentum
+        base_gap = TI_MAX_GAP_CHASE_PCT if is_ti_stock else MAX_GAP_CHASE_PCT
         if bull:
             if vix and vix > 25:
                 adaptive_gap = min(20.0, base_gap + 5.0)
@@ -586,6 +628,10 @@ def get_scan_targets(excluded: Set[str] = None) -> List[str]:
         except Exception:
             pass
 
+    # Track TI stocks for guardrail filtering
+    global _ti_stocks
+    _ti_stocks = set(ti_primary) if ti_primary else set()
+
     return targets
 
 
@@ -613,6 +659,7 @@ def scan_universe(scan_targets: List[str], sentiment: str, market_state: MarketS
         'rvol': 0,
         'gap_chase': 0,
         'min_price': 0,
+        'overnight_gap': 0,
         'other': 0
     }
 
@@ -620,7 +667,8 @@ def scan_universe(scan_targets: List[str], sentiment: str, market_state: MarketS
         # Dead-ticker check already done in get_scan_targets() — skip here.
         # Pass pre-computed regime into guardrails to avoid re-calling _is_bull_regime()
         # Custom: get rejection reason from _passes_guardrails
-        passed, reason = _passes_guardrails(symbol, bull_regime=bull_regime, market_state=market_state, return_reason=True)
+        is_ti = symbol in _ti_stocks
+        passed, reason = _passes_guardrails(symbol, bull_regime=bull_regime, market_state=market_state, return_reason=True, is_ti_stock=is_ti)
         if not passed:
             if reason in guardrail_rejections:
                 guardrail_rejections[reason] += 1
