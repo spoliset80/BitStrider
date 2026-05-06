@@ -24,6 +24,14 @@ import pytz
 ET = pytz.timezone("America/New_York")
 
 
+# ── Schwab rate limiting ──────────────────────────────────────────────────────
+# Schwab has aggressive rate limits (~10 req/sec). Use a global lock with min
+# interval between requests to avoid 429 errors.
+_schwab_request_lock = threading.Lock()
+_schwab_last_request_time = 0.0
+_SCHWAB_MIN_REQUEST_INTERVAL = 0.15  # 150ms between requests (≈6-7 req/sec)
+
+
 # ── Per-cycle bar cache ───────────────────────────────────────────────────────
 # Keyed by (symbol, period, interval). Thread-safe via lock.
 _bar_cache: Dict[Tuple[str, str, str], pd.DataFrame] = {}
@@ -93,12 +101,42 @@ def _normalize_df(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def _enforce_schwab_rate_limit():
+    """Enforce minimum interval between Schwab API requests to avoid 429 errors."""
+    global _schwab_last_request_time
+    with _schwab_request_lock:
+        now = time.time()
+        elapsed = now - _schwab_last_request_time
+        if elapsed < _SCHWAB_MIN_REQUEST_INTERVAL:
+            time.sleep(_SCHWAB_MIN_REQUEST_INTERVAL - elapsed)
+        _schwab_last_request_time = time.time()
+
+
 # ── Core bar fetch ────────────────────────────────────────────────────────────
 
 def _get_bars_schwab(symbol: str, period: str, interval: str, log) -> pd.DataFrame:
-    """Fetch OHLCV bars via Schwab API."""
+    """Fetch OHLCV bars via Schwab API with rate limiting and retry logic.
+    
+    NOTE: Schwab does not support historical candles for index/volatility symbols
+    like ^VIX, ^VXN, ^RVX, etc. These symbols are silently skipped (return empty DataFrame).
+    
+    Rate limits: Schwab enforces ~10 req/sec globally. This function enforces a
+    minimum 150ms interval between requests to stay well under the limit.
+    
+    Retries: 429 errors are retried up to 3 times with exponential backoff.
+    """
+    # Skip unsupported index/volatility symbols
+    unsupported = {"^VIX", "^VXN", "^RVX", "VIX", "VXN", "RVX"}
+    if symbol.upper() in unsupported:
+        log.debug(f"{symbol}: Schwab does not support index/volatility symbols — skipping")
+        return pd.DataFrame()
+    
+    # Enforce rate limit before making request
+    _enforce_schwab_rate_limit()
+    
     try:
         from engine.broker.schwab_client import get_schwab_market_data_client
+        from requests.exceptions import HTTPError
     except ImportError:
         return pd.DataFrame()
     
@@ -129,13 +167,33 @@ def _get_bars_schwab(symbol: str, period: str, interval: str, log) -> pd.DataFra
             period_type = "year"
             period_val = 1
         
-        response = client.get_candles(
-            symbol,
-            period_type=period_type,
-            period=period_val,
-            frequency_type=frequency_type,
-            frequency=frequency
-        )
+        # Retry on 429 (rate limit) with exponential backoff
+        def _fetch_with_retry():
+            from requests.exceptions import HTTPError
+            for attempt in range(3):
+                try:
+                    resp = client.get_candles(
+                        symbol,
+                        period_type=period_type,
+                        period=period_val,
+                        frequency_type=frequency_type,
+                        frequency=frequency
+                    )
+                    return resp
+                except HTTPError as e:
+                    if e.response.status_code == 429:
+                        if attempt < 2:  # Not the last attempt
+                            wait_time = (2 ** attempt) * 0.5  # 0.5s, 1s, 2s
+                            log.debug(f"{symbol}: Schwab rate limited (429) — retrying in {wait_time:.1f}s")
+                            time.sleep(wait_time)
+                        else:
+                            log.warning(f"{symbol}: Schwab rate limited (429) — giving up after 3 attempts")
+                            raise
+                    else:
+                        raise
+            return None
+        
+        response = _fetch_with_retry()
         
         if not response or "candles" not in response or not response["candles"]:
             return pd.DataFrame()
@@ -199,11 +257,11 @@ def get_bars(symbol: str, period: str = "5d", interval: str = "15m") -> pd.DataF
 
 
 def get_bars_batch(symbols, period: str = "5d", interval: str = "15m") -> Dict[str, pd.DataFrame]:
-    """Fetch OHLCV bars for multiple symbols via Alpaca batch endpoint.
+    """Fetch OHLCV bars for multiple symbols via Schwab.
 
     Cache-backed: already-fetched symbols in the current cycle are returned
-    immediately without a network call. Uncached symbols are batched in groups
-    of 5 with 400 ms throttle between batches.
+    immediately without a network call. Uncached symbols are fetched with
+    per-request rate limiting (150ms minimum interval) to avoid 429 errors.
     """
     log     = logging.getLogger("ApexTrader")
     symbols = [s.strip().upper().lstrip("$") for s in symbols]
@@ -219,13 +277,9 @@ def get_bars_batch(symbols, period: str = "5d", interval: str = "15m") -> Dict[s
             else:
                 uncached.append(s)
 
-    BATCH_SIZE   = 5
-    THROTTLE_SEC = 0.4
-
-    # ── Schwab batch path (only source) ──
-    for i, s in enumerate(uncached):
-        if i > 0:
-            time.sleep(THROTTLE_SEC)
+    # ── Schwab path (only source) ──
+    # Rate limiting is enforced per-request in _get_bars_schwab
+    for s in uncached:
         try:
             data = _get_bars_schwab(s, period, interval, log)
             if not data.empty:
