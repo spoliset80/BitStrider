@@ -308,6 +308,15 @@ def _get_options_chain(symbol: str) -> Optional[OptionsChainInfo]:
         except Exception as e:
             log.debug(f"{symbol}: Alpaca option chain failed: {e}")
 
+    # ── Schwab option chain (second fallback) ────────────────────
+    try:
+        result = _get_chain_schwab(symbol, spot, exp_gte, exp_lte, hv30, atr14, hist)
+        if result is not None:
+            _chain_cache[symbol] = (now, result)
+            return result
+    except Exception as e:
+        log.debug(f"{symbol}: Schwab option chain failed: {e}")
+
     return None
 
 
@@ -601,6 +610,118 @@ def _get_chain_marketdata(
         hv_30=hv30,
         atr14=max(atr14, 0.01),
     )
+
+
+def _get_chain_schwab(
+    symbol: str, spot: float,
+    exp_gte: datetime.date, exp_lte: datetime.date,
+    hv30: float, atr14: float, hist: pd.DataFrame,
+) -> Optional[OptionsChainInfo]:
+    """Fetch option chain via Schwab API.
+    
+    Returns calls/puts DataFrames with the same structure as Alpaca/MDA.
+    """
+    try:
+        from engine.broker.schwab_client import get_schwab_market_data_client
+    except ImportError:
+        return None
+    
+    try:
+        client = get_schwab_market_data_client()
+        response = client.get_option_chains(symbol, contract_type="ALL")
+        
+        if not response or "chains" not in response or not response["chains"]:
+            return None
+        
+        chains = response["chains"]
+        
+        # Find option expirations within our DTE range
+        valid_chains = []
+        for chain in chains:
+            exp_str = chain.get("expirationDate", "")
+            try:
+                exp = datetime.datetime.strptime(exp_str, "%Y-%m-%d").date()
+                if exp_gte <= exp <= exp_lte:
+                    valid_chains.append((exp, chain))
+            except (ValueError, KeyError):
+                continue
+        
+        if not valid_chains:
+            return None
+        
+        # Pick the closest expiry
+        valid_chains.sort(key=lambda x: x[0])
+        target_expiry = valid_chains[0][0]
+        target_chain = valid_chains[0][1]
+        
+        calls = []
+        puts = []
+        
+        # Process options in the target chain
+        for opt in target_chain.get("options", []):
+            strike = float(opt.get("strikePrice", 0))
+            bid = float(opt.get("bidPrice", 0))
+            ask = float(opt.get("askPrice", 0))
+            mid = (bid + ask) / 2 if (bid > 0 and ask > 0) else 0
+            last = float(opt.get("lastPrice", mid)) if opt.get("lastPrice") else mid
+            iv = float(opt.get("impliedVolatility", 0)) or 0
+            delta = float(opt.get("delta", 0)) or 0
+            oi = int(opt.get("openInterest", 0)) or 0
+            opt_type = opt.get("optionType", "").upper()
+            symbol_opt = opt.get("symbol", "")
+            
+            # Skip if outside strike range (70-130% of spot)
+            if strike < spot * 0.70 or strike > spot * 1.30:
+                continue
+            
+            row = {
+                "contractsymbol": symbol_opt,
+                "strike": strike,
+                "bid": bid,
+                "ask": ask,
+                "mid": mid,
+                "lastprice": last if last > 0 else mid,
+                "impliedvolatility": iv,
+                "iv_pct": iv * 100,
+                "delta": delta,
+                "openinterest": oi,
+                "expiry": target_expiry,
+            }
+            
+            if opt_type == "CALL":
+                calls.append(row)
+            elif opt_type == "PUT":
+                puts.append(row)
+        
+        if not calls and not puts:
+            return None
+        
+        calls_df = pd.DataFrame(calls) if calls else pd.DataFrame()
+        puts_df = pd.DataFrame(puts) if puts else pd.DataFrame()
+        
+        # IV rank from ATM call IV
+        if not calls_df.empty:
+            mid_c = calls_df[(calls_df["strike"] >= spot * 0.95) & (calls_df["strike"] <= spot * 1.05)]
+            cur_iv = float(mid_c["impliedvolatility"].mean()) * 100 if not mid_c.empty else hv30
+        else:
+            cur_iv = hv30
+        iv_rank = _calc_iv_rank(cur_iv, hist["close"])
+        
+        log.debug(f"{symbol}: Schwab chain OK — {len(calls_df)} calls, {len(puts_df)} puts, exp={target_expiry}")
+        return OptionsChainInfo(
+            symbol=symbol,
+            expiry=target_expiry,
+            calls=calls_df,
+            puts=puts_df,
+            spot_price=spot,
+            iv_rank=iv_rank,
+            hv_30=hv30,
+            atr14=max(atr14, 0.01),
+        )
+    
+    except Exception as e:
+        log.debug(f"{symbol}: Schwab option chain parse error: {e}")
+        return None
 
 
 def _pick_strike(

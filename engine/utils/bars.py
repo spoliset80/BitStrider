@@ -294,6 +294,76 @@ def _get_bars_alpaca(symbol: str, period: str, interval: str, log) -> pd.DataFra
             log.warning(f"{symbol}: Alpaca returned empty or malformed data.")
     return pd.DataFrame()
 
+def _get_bars_schwab(symbol: str, period: str, interval: str, log) -> pd.DataFrame:
+    """Fetch OHLCV bars via Schwab API."""
+    try:
+        from engine.broker.schwab_client import get_schwab_market_data_client
+    except ImportError:
+        return pd.DataFrame()
+    
+    try:
+        client = get_schwab_market_data_client()
+        
+        # Map our period/interval to Schwab parameters
+        # period: "5d", "20d", "65d" etc
+        # interval: "1m", "5m", "15m", "30m", "60m", "1h", "1d"
+        
+        days_match = int(period[:-1]) if period.endswith("d") else 5
+        
+        # Schwab frequencyType options: minute, daily, weekly, monthly
+        if interval.endswith("m"):
+            frequency_type = "minute"
+            frequency = int(interval[:-1])
+            period_type = "day"
+            period_val = days_match if days_match <= 10 else 10  # Max 10 days for intraday
+        elif interval in ("1h", "60m"):
+            frequency_type = "minute"
+            frequency = 60
+            period_type = "day"
+            period_val = days_match if days_match <= 10 else 10
+        else:  # daily or longer
+            frequency_type = "daily"
+            frequency = 1
+            period_type = "month"
+            period_val = (days_match + 19) // 20  # ~20 days per month
+        
+        response = client.get_candles(
+            symbol,
+            period_type=period_type,
+            period=period_val,
+            frequency_type=frequency_type,
+            frequency=frequency
+        )
+        
+        if not response or "candles" not in response or not response["candles"]:
+            return pd.DataFrame()
+        
+        candles = response["candles"]
+        
+        # Normalize Schwab candle format to our standard format
+        df = pd.DataFrame({
+            "time": pd.to_datetime([c.get("datetime") for c in candles], unit="ms", utc=True).tz_convert(ET),
+            "open": [c.get("open", 0) for c in candles],
+            "high": [c.get("high", 0) for c in candles],
+            "low": [c.get("low", 0) for c in candles],
+            "close": [c.get("close", 0) for c in candles],
+            "volume": [c.get("volume", 0) for c in candles],
+        })
+        
+        if not df.empty:
+            _last_feed_used[symbol] = "schwab"
+            _record_ok_bars(symbol)
+            with _bar_cache_lock:
+                _bar_cache[(symbol, period, interval)] = df
+            log.debug(f"{symbol}: Schwab bars OK — {len(df)} rows ({period}/{interval})")
+            return df
+        
+        return pd.DataFrame()
+    
+    except Exception as e:
+        log.debug(f"{symbol}: Schwab bars failed: {e}")
+        return pd.DataFrame()
+
 @retry(wait=wait_exponential(multiplier=1, min=2, max=10), stop=stop_after_attempt(3),
        retry=retry_if_exception_type(Exception))
 def _get_bars_yfinance(symbol: str, period: str, interval: str, log) -> pd.DataFrame:
@@ -374,6 +444,14 @@ def get_bars(symbol: str, period: str = "5d", interval: str = "15m") -> pd.DataF
                 log.warning(f"{symbol}: Alpaca fetch failed: {e}")
         except Exception as e:
             log.warning(f"{symbol}: Alpaca fetch failed: {e}")
+
+    # ── Schwab path (no retry required — API handles it) ──
+    try:
+        data = _get_bars_schwab(symbol, period, interval, log)
+        if not data.empty:
+            return data
+    except Exception as e:
+        log.debug(f"{symbol}: Schwab fetch failed: {e}")
 
     # ── yfinance fallback with retry ──
     try:

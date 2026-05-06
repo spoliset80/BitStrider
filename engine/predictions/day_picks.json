@@ -1,8 +1,24 @@
 {
-  "generated_at": "2026-05-05T17:21:27-04:00",
+  "generated_at": "2026-05-05T22:28:54-04:00",
   "date": "2026-05-05",
   "market_regime": "bull",
   "picks": [
+    {
+      "symbol": "ATEC",
+      "action": "buy",
+      "price": 10.25,
+      "confidence": 0.92,
+      "strategy": "Sentiment",
+      "reason": "Sentiment bullish + vol x4.72 + price>20SMA"
+    },
+    {
+      "symbol": "LINC",
+      "action": "buy",
+      "price": 45.08,
+      "confidence": 0.92,
+      "strategy": "Sentiment",
+      "reason": "Sentiment bullish + vol x8.35 + price>20SMA"
+    },
     {
       "symbol": "WGS",
       "action": "buy",
@@ -10,6 +26,22 @@
       "confidence": 0.92,
       "strategy": "Sentiment",
       "reason": "Sentiment bullish + vol x4.85 + price>20SMA"
+    },
+    {
+      "symbol": "BRBR",
+      "action": "buy",
+      "price": 10.7,
+      "confidence": 0.9159,
+      "strategy": "Sentiment",
+      "reason": "Sentiment bullish + vol x4.66 + price>20SMA"
+    },
+    {
+      "symbol": "GBX",
+      "action": "buy",
+      "price": 50.16,
+      "confidence": 0.82,
+      "strategy": "Sweepea",
+      "reason": "Daily Sweepea pullback to 8-EMA | ATR $1.51"
     }
   ]
 }
