@@ -1615,9 +1615,11 @@ _squeeze_rs_cache: Dict[str, tuple] = {}
 
 
 def _fetch_squeeze_fundamentals(symbol: str) -> Optional[Dict]:
-    """Fetch short float %, gross margins, and revenue growth via yfinance (daily-cached)."""
-    if not _YF_AVAILABLE:
-        return None
+    """Fetch short float %, gross margins, and revenue growth via yfinance (daily-cached).
+    
+    NOTE: yfinance has been removed. This function always returns None.
+    """
+    return None
     today = datetime.date.today()
     if symbol in _squeeze_yf_cache:
         cached_date, data = _squeeze_yf_cache[symbol]
@@ -1694,8 +1696,8 @@ class ShortSqueezeStrategy:
         f = _get_filters()
         if not OPTIONS_ENABLED:
             return None
-        if not _YF_AVAILABLE:
-            return None
+        # yfinance removed — short squeeze strategy disabled
+        return None
         if symbol in _INVERSE_ETFS:
             return None
 
