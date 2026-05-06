@@ -214,6 +214,11 @@ _bar_ctx_cache: Dict[str, Optional["_BarCtx"]] = {}
 _schwab_failure_count: Dict[str, int] = {}   # symbol -> failure_count
 _fallback_source: Dict[str, str] = {}        # symbol -> "schwab" or "alpaca" (for logging)
 
+# Failed symbols cache — symbols with no liquid options chains (both Schwab + Alpaca returned None)
+# Prevents wasting API calls on illiquid symbols; retries once per hour
+_failed_symbols_cache: Dict[str, float] = {}  # symbol -> timestamp of last failure
+_FAILED_SYMBOLS_TTL = 3600  # 1 hour — retry failed symbols once per hour instead of every scan cycle
+
 # Module-level OI TradingClient singleton — avoids creating a new HTTP session
 # for every symbol during parallel OI prefetch (was 120+ instantiations per cycle).
 _oi_trading_client = None
@@ -250,11 +255,19 @@ def _get_options_chain(symbol: str) -> Optional[OptionsChainInfo]:
     """Fetch the best near-term options chain (14-30 DTE) with full quality metadata.
     
     Primary: Schwab (Stage 1 - connection pool + exponential backoff improvements)
-    Fallback: Alpaca when Schwab fails 3x (Stage 2)
+    Fallback: Alpaca when Schwab fails (Stage 2)
+    Optimization: Skip symbols with no liquid options chains (cached misses from both brokers)
     
     Logs which source provided the chain for monitoring.
     """
     now = time.monotonic()
+    
+    # Early exit: Skip symbols known to have no options chains (both brokers failed)
+    # Prevents wasting API calls on illiquid symbols; retries once per hour
+    failed_ts = _failed_symbols_cache.get(symbol)
+    if failed_ts and (now - failed_ts) < _FAILED_SYMBOLS_TTL:
+        return None
+    
     cached = _chain_cache.get(symbol)
     if cached and (now - cached[0]) < _CHAIN_TTL:
         return cached[1]
@@ -319,11 +332,13 @@ def _get_options_chain(symbol: str) -> Optional[OptionsChainInfo]:
             return result
         else:
             fail_count = _schwab_failure_count.get(symbol, 0)
-            log.warning(f"{symbol}: Alpaca fallback also returned None (Schwab failures: {fail_count})")
+            log.warning(f"{symbol}: No options chain (both Schwab + Alpaca failed, attempt {fail_count}); skipping for 1 hour")
     except Exception as e:
         fail_count = _schwab_failure_count.get(symbol, 0)
         log.warning(f"{symbol}: Alpaca fallback exception: {e} (Schwab failures: {fail_count})")
 
+    # Both sources failed — cache this symbol to avoid repeated API calls
+    _failed_symbols_cache[symbol] = now
     return None
 
 
