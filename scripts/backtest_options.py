@@ -695,10 +695,10 @@ def main():
     start   = datetime.date.fromisoformat(args.start)
     end     = datetime.date.fromisoformat(args.end)
 
-    print(f"\nOptions Backtest — {start} → {end}")
+    print(f"\nOptions Backtest - {start} to {end}")
     print(f"Symbols : {', '.join(symbols)} (from {universe_label})")
     print(f"Capital : ${args.capital:,.0f} | Options budget: ${args.capital * OPTIONS_ALLOCATION_PCT / 100:,.0f} (15%)")
-    print(f"Rules   : TP={OPTIONS_PROFIT_TARGET_PCT:.0f}%  SL=-{OPTIONS_STOP_LOSS_PCT:.0f}%  DTE={OPTIONS_DTE_MIN}–{OPTIONS_DTE_MAX}")
+    print(f"Rules   : TP={OPTIONS_PROFIT_TARGET_PCT:.0f}%  SL=-{OPTIONS_STOP_LOSS_PCT:.0f}%  DTE={OPTIONS_DTE_MIN}-{OPTIONS_DTE_MAX}")
     print("=" * 80)
 
     total_round_trades = []
