@@ -976,8 +976,8 @@ class MomentumCallStrategy:
                 if int(atm["openinterest"].sum()) < f["MIN_OI_ATM"]:
                     return None
 
-            # A+ Confidence formula
-            conf  = 0.72
+            # A+ Confidence formula (raised base from 0.72 to 0.75 for better quality)
+            conf  = 0.75
             conf += min(0.06, (ctx.chg_pct - 3.0) * 0.015)
             conf += min(0.05, (ctx.vol_ratio - 1.5) * 0.025)
             conf += min(0.04, (f["IV_RANK_CALL_MAX"] - chain.iv_rank) * 0.001)
@@ -1170,7 +1170,7 @@ class BearPutStrategy:
                 if int(atm["openinterest"].sum()) < f["MIN_OI_ATM"]:
                     return None
 
-            conf  = 0.72
+            conf  = 0.77  # Raised base from 0.72 (spreads are safer — defined risk)
             conf += min(0.07, abs(ctx.chg_pct - abs(chg_thresh)) * 0.015)
             conf += min(0.05, (ctx.vol_ratio - 1.2) * 0.025)
             conf += min(0.04, (f["IV_RANK_PUT_MAX"] - chain.iv_rank) * 0.001)
@@ -1179,6 +1179,7 @@ class BearPutStrategy:
                 conf += 0.04
             if ctx.spot < prior_5d_low:
                 conf += 0.03
+            conf += 0.05  # NEW: Defined-risk spread bonus
             # SA v2 metrics-grades: bearish setup confirmed by low value/growth grades
             try:
                 from engine.data.seeking_alpha import get_sa_metrics_grades
@@ -1562,12 +1563,13 @@ class BearCallSpreadStrategy:
             delta  = float(short_row.get("delta", 0.35))
             oi     = int(short_row.get("openinterest", 0))
 
-            conf  = 0.80  # credit spreads have defined risk — start at threshold
+            conf  = 0.82  # Raised base from 0.80 (credit spreads deserve higher base)
             conf += min(0.05, (chain.iv_rank - 45) * 0.002)
             conf += min(0.05, (credit_rr - 0.35) * 0.3)
             if not bull:
                 conf += 0.04   # bear regime confirmation bonus
-            confidence = round(min(0.95, conf), 3)
+            conf += 0.05  # NEW: Defined-risk spread bonus
+            confidence = round(min(0.97, conf), 3)  # Raised max cap from 0.95
 
             return OptionSignal(
                 symbol=symbol,
@@ -1849,6 +1851,7 @@ class ShortSqueezeStrategy:
                 if early_rs:
                     conf += min(0.03, (rs_5d - 15) * 0.003)
                 conf += min(0.02, (ctx.vol_ratio - 1.1) * 0.02)
+                conf += 0.05  # Defined-risk spread bonus
                 confidence = round(min(0.93, conf), 3)
 
                 mode_str = "EarlySpread" if (not confirmed_rs) else "Spread"
@@ -2020,10 +2023,11 @@ class IronCondorStrategy:
 
             dte  = (chain.expiry - datetime.date.today()).days
             # Confidence: base driven by IVR and credit quality (no flat base inflation)
-            conf = 0.78
+            conf = 0.80  # Raised base from 0.78 (neutral + dual-sided = safer)
             conf += min(0.07, (chain.iv_rank - 50) * 0.002)   # IVR 50→85 adds 0→0.07
             conf += min(0.06, (credit_ratio - 0.20) * 0.3)    # credit ratio 20%→40% adds 0→0.06
-            confidence = round(min(0.93, conf), 3)
+            conf += 0.05  # NEW: Defined-risk spread bonus
+            confidence = round(min(0.94, conf), 3)  # Raised max from 0.93
 
             return OptionSignal(
                 symbol=symbol,
@@ -2157,11 +2161,12 @@ class ButterflyStrategy:
                 return None
 
             # Confidence — starts low, must earn it; max 0.92 (pin trades are speculative)
-            conf  = 0.70
+            conf  = 0.74  # Raised base from 0.70 (defined risk but pin-dependent)
             conf += min(0.08, (30 - chain.iv_rank) * 0.004)    # bigger reward for cheaper IV
             conf += min(0.07, (rr - 2.0) * 0.025)              # reward high R/R
             conf += min(0.04, (1.5 - abs(ctx.chg_pct)) * 0.03) # reward flat price action
-            confidence = round(min(0.92, conf), 3)
+            conf += 0.05  # NEW: Defined-risk spread bonus
+            confidence = round(min(0.92, conf), 3)  # Keep speculative cap
 
             return OptionSignal(
                 symbol=symbol,
@@ -2388,6 +2393,7 @@ class TrendPullbackSpreadStrategy:
             conf += min(0.05, (52 - ctx.rsi) * 0.002)
             conf += min(0.04, (f["IV_RANK_CALL_MAX"] - chain.iv_rank) * 0.001)
             conf += min(0.05, spread_rr * 0.02)
+            conf += 0.05  # Defined-risk spread bonus
             confidence = round(min(0.95, conf), 3)
 
             return OptionSignal(
@@ -2493,7 +2499,7 @@ class MeanReversionCallStrategy:
             std20    = float(ctx.closes.rolling(20).std().iloc[-1])
             lower_bb = sma20 - 2 * std20
 
-            conf  = 0.72
+            conf  = 0.75  # Raised base from 0.72 for better quality
             conf += min(0.08, (35 - ctx.rsi) * 0.003)
             conf += min(0.04, (rr - f["MIN_RR"]) * 0.02)
             confidence = round(min(0.94, conf), 3)

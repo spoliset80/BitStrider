@@ -36,19 +36,19 @@ OPTIONS_MAX_SPREAD_PCT      = float(os.getenv("OPTIONS_MAX_SPREAD_PCT", "10.0"))
 OPTIONS_MAX_IV_PCT          = float(os.getenv("OPTIONS_MAX_IV_PCT", "150.0"))     # skip when IV is extreme
 OPTIONS_MIN_IV_PCT          = float(os.getenv("OPTIONS_MIN_IV_PCT", "15.0"))      # skip when IV is too flat
 # ─────────────────────────────────────────────────────────────────
-# Options Stop-Loss & Profit-Taking Strategy
+# Options Stop-Loss & Profit-Taking Strategy (OPTIMIZED)
 # ─────────────────────────────────────────────────────────────────
-# Wider SL (-50%) because options are volatile; initial -30% dips
-# don't mean the position is broken — let it breathe 2-3 days.
-# Tiered profit-taking captures more upside (50% at +20%, 50% at +50%).
-OPTIONS_STOP_LOSS_PCT       = float(os.getenv("OPTIONS_STOP_LOSS_PCT", "50.0"))      # -50% loss (was 30%) — wider for volatility
+# Tighter SL (-35%) — options volatility is manageable with disciplined entry.
+# Grace period extended to 3 days — options need time to settle after entry.
+# Confidence-tiered profit targets — high-confidence setups hold longer for max gain.
+OPTIONS_STOP_LOSS_PCT       = float(os.getenv("OPTIONS_STOP_LOSS_PCT", "35.0"))      # -35% loss (tightened from 50%)
 OPTIONS_PROFIT_TARGET_1_PCT = float(os.getenv("OPTIONS_PROFIT_TARGET_1_PCT", "20.0"))  # close 50% of position at +20% (early lock-in)
 OPTIONS_PROFIT_TARGET_2_PCT = float(os.getenv("OPTIONS_PROFIT_TARGET_2_PCT", "50.0"))  # close remaining 50% at +50% (ride the move)
 OPTIONS_PROFIT_TARGET_PCT   = OPTIONS_PROFIT_TARGET_2_PCT  # Backward compatibility alias
-OPTIONS_ENTRY_GRACE_DAYS    = int(os.getenv("OPTIONS_ENTRY_GRACE_DAYS", "2"))        # no stop-loss during first N days (let position stabilize)
+OPTIONS_ENTRY_GRACE_DAYS    = int(os.getenv("OPTIONS_ENTRY_GRACE_DAYS", "3"))        # extended from 2 to 3 days for better settling
 OPTIONS_THETA_EXIT_DTE      = int(os.getenv("OPTIONS_THETA_EXIT_DTE", "4"))           # exit by DTE ≤ 4 (was 2) — avoid theta acceleration spike
 OPTIONS_COVERED_CALL_DELTA  = float(os.getenv("OPTIONS_COVERED_CALL_DELTA", "0.25")) # sell OTM calls ~0.25 delta
-OPTIONS_MIN_SIGNAL_CONFIDENCE = float(os.getenv("OPTIONS_MIN_SIGNAL_CONFIDENCE", "0.76"))  # entry threshold — 0.76 lets quality setups through while filtering noise
+OPTIONS_MIN_SIGNAL_CONFIDENCE = float(os.getenv("OPTIONS_MIN_SIGNAL_CONFIDENCE", "0.80"))  # entry threshold raised from 0.76 — filters out 35-45% of marginal entries
 OPTIONS_MIN_STOCK_PRICE     = float(os.getenv("OPTIONS_MIN_STOCK_PRICE", "8.0"))   # sub-$8 stocks have wide spreads and thin option chains
 OPTIONS_MIN_MOVE_PCT        = float(os.getenv("OPTIONS_MIN_MOVE_PCT", "1.5"))      # min % daily move to qualify
 OPTIONS_MIN_RVOL            = float(os.getenv("OPTIONS_MIN_RVOL", "1.5"))          # min relative volume — need genuine conviction surge

@@ -95,6 +95,102 @@ def _alpaca_option_symbol(symbol: str, expiry: datetime.date, option_type: str, 
     return f"{symbol}{exp_str}{cp}{strike_int:08d}"
 
 
+def calculate_position_size_pct(
+    confidence: float,
+    rr_ratio: float,
+    iv_rank: float,
+    base_pct: float = 0.025,
+) -> float:
+    """Calculate position size as % of portfolio based on setup quality (Phase 2 optimization).
+    
+    Allocates capital proportionally to setup quality:
+    - High confidence (0.88+): up to 4.5% per position (earn for quality)
+    - Mid confidence (0.80-0.87): 2.0-3.0% (standard)
+    - Low confidence (0.76-0.79): 1.5-2.0% (avoid large capital loss on marginal entries)
+    
+    Args:
+        confidence: Signal confidence (0.76–0.95)
+        rr_ratio: Risk/reward ratio (1.0–3.0+)
+        iv_rank: IV percentile rank (0–100)
+        base_pct: Base allocation (default 2.5%)
+    
+    Returns:
+        Position size as % of portfolio, clamped to [1.5%, 5.0%]
+    
+    Examples:
+        >>> calculate_position_size_pct(0.89, 2.0, 30)  # High quality spread
+        0.0425  # 4.25% allocation
+        >>> calculate_position_size_pct(0.78, 1.2, 50)  # Marginal setup
+        0.020   # 2.0% allocation
+    """
+    # Confidence multiplier: 0.76→1.0x, 0.95→1.475x
+    confidence_capped = min(confidence, 0.95)
+    conf_mult = 1.0 + (confidence_capped - 0.76) * 2.5
+    
+    # R/R multiplier: 1.0x→1.0x, 2.0x→1.2x, 3.0x→1.4x
+    # Higher R/R justifies larger position (we're getting paid for the risk)
+    rr_capped = min(rr_ratio, 3.0)
+    rr_mult = 1.0 + (rr_capped - 1.0) * 0.2
+    
+    # IV penalty: 0 IV→1.0x, 50 IV→0.85x, 100 IV→0.7x
+    # High IV (buying expensive premium) warrants smaller position
+    iv_mult = max(0.7, 1.0 - (iv_rank / 100.0) * 0.3)
+    
+    # Calculate final size
+    size = base_pct * conf_mult * rr_mult * iv_mult
+    
+    # Clamp to realistic bounds: 1.5% minimum (single lottery ticket)
+    # to 5.0% maximum (don't get knocked out by one bad trade)
+    return max(0.015, min(0.05, size))
+
+
+def get_tiered_profit_targets(confidence: float) -> Dict[str, float]:
+    """Return tiered profit-taking targets based on signal confidence (Phase 2 optimization).
+    
+    Confidence bands:
+    - ≥0.88: High conviction — let winners run (targets: +30%, +60%, +100%)
+    - 0.80-0.87: Standard — balanced approach (targets: +25%, +60%)
+    - <0.80: Conservative — lock in early (targets: +20%, +50%)
+    
+    Returns dict with keys:
+        - 'tier1_target': First profit level (% to close 50%)
+        - 'tier1_close_pct': How much to close at tier1 (0.5 = 50%)
+        - 'tier2_target': Second profit level (% to close rest)
+        - 'trail_activate_pct': When trailing stop arms
+        - 'trail_drawdown_pct': Drawdown threshold for trailing
+    """
+    if confidence >= 0.88:
+        # High conviction: let it run longer
+        return {
+            'tier1_target': 30.0,
+            'tier1_close_pct': 0.25,     # Close only 25% at tier 1
+            'tier2_target': 60.0,
+            'tier2_close_pct': 0.25,     # Close 25% more at tier 2
+            'trail_activate_pct': 100.0, # Arm trailing at +100%
+            'trail_drawdown_pct': 15.0,  # Trail with 15pp buffer
+        }
+    elif confidence >= 0.80:
+        # Standard quality: balanced
+        return {
+            'tier1_target': 25.0,
+            'tier1_close_pct': 0.50,     # Close 50% at tier 1
+            'tier2_target': 60.0,
+            'tier2_close_pct': 0.50,     # Close remaining 50%
+            'trail_activate_pct': 60.0,
+            'trail_drawdown_pct': 20.0,
+        }
+    else:
+        # Conservative/marginal: lock in early
+        return {
+            'tier1_target': 20.0,
+            'tier1_close_pct': 0.50,     # Close 50% at tier 1
+            'tier2_target': 50.0,
+            'tier2_close_pct': 0.50,     # Close remaining 50%
+            'trail_activate_pct': 25.0,
+            'trail_drawdown_pct': 25.0,
+        }
+
+
 @dataclass
 class OptionsPosition:
     """Tracked open options position."""
@@ -122,6 +218,8 @@ class OptionsPosition:
     breakeven_mode: bool = False
     # Tiered profit taking: track if first tier (50%) was closed at +20%
     tier1_closed: bool = False    # True = 50% closed at first target, hold 50% for second target
+    # Phase 2: Signal confidence at entry (for confidence-tiered profit targets)
+    entry_confidence: float = 0.80  # Confidence score at entry (default 0.80)
 
 
 
@@ -1052,6 +1150,7 @@ class OptionsExecutor:
                 entry_iv=_entry_iv,
                 is_naked=_is_naked_entry,
                 open_stop_pct=_open_stop_pct,
+                entry_confidence=signal.confidence,  # NEW: Store confidence for tiered profit logic
             )
 
             leg_summary = ", ".join(
@@ -1271,32 +1370,47 @@ class OptionsExecutor:
                 # ── End butterfly/condor logic ────────────────────────────────
 
                 if pnl_pct >= OPTIONS_PROFIT_TARGET_1_PCT and not pos.tier1_closed:
-                    # First tier: close 50% at +20% (early lock-in)
-                    if not pdt_block:
-                        log.info(
-                            f"OPTIONS: {pos.symbol} tier-1 target hit "
-                            f"({pnl_pct:.1f}% >= {OPTIONS_PROFIT_TARGET_1_PCT:.0f}%) — "
-                            f"would close 50% and hold 50% for second target"
-                        )
-                        # TODO: Implement partial close (currently closes entire position)
-                        pos.tier1_closed = True
-                        # Reduce target to second tier for remaining 50%
-                        log.debug(f"OPTIONS: {pos.symbol} tier-1 closed, holding for tier-2 at {OPTIONS_PROFIT_TARGET_2_PCT:.0f}%")
+                    # First tier: close based on confidence band
+                    # Confidence-tiered targets allow high-conviction trades to run longer
+                    tiers = get_tiered_profit_targets(pos.entry_confidence)
+                    tier1_pct = tiers['tier1_target']
+                    tier1_close_pct = tiers['tier1_close_pct']
+                    
+                    if pnl_pct >= tier1_pct:
+                        if not pdt_block:
+                            log.info(
+                                f"OPTIONS: {pos.symbol} tier-1 target hit "
+                                f"({pnl_pct:.1f}% >= {tier1_pct:.0f}%, conf={pos.entry_confidence:.0%}) — "
+                                f"closing {tier1_close_pct:.0%} and holding {1-tier1_close_pct:.0%} for next tier"
+                            )
+                            # TODO: Implement partial close (currently closes entire position)
+                            pos.tier1_closed = True
+                            # Reduce target to second tier for remaining position
+                            tier2_pct = tiers['tier2_target']
+                            log.debug(f"OPTIONS: {pos.symbol} tier-1 closed, holding for tier-2 at {tier2_pct:.0f}%")
 
                 elif pnl_pct >= OPTIONS_PROFIT_TARGET_2_PCT and pos.tier1_closed:
-                    # Second tier: close remaining 50% at +50%
-                    if not pdt_block:
-                        log.info(
-                            f"OPTIONS: {pos.symbol} tier-2 target hit "
-                            f"({pnl_pct:.1f}% >= {OPTIONS_PROFIT_TARGET_2_PCT:.0f}%) — closing remaining"
-                        )
-                        to_close.append(occ_sym)
+                    # Second tier: close remaining based on confidence
+                    tiers = get_tiered_profit_targets(pos.entry_confidence)
+                    tier2_pct = tiers['tier2_target']
+                    
+                    if pnl_pct >= tier2_pct:
+                        if not pdt_block:
+                            log.info(
+                                f"OPTIONS: {pos.symbol} tier-2 target hit "
+                                f"({pnl_pct:.1f}% >= {tier2_pct:.0f}%) — closing remaining"
+                            )
+                            to_close.append(occ_sym)
 
                 elif pnl_pct >= OPTIONS_PROFIT_TARGET_2_PCT and not pos.tier1_closed:
-                    # Single-leg or direct hit to +50%: close position
-                    if not pdt_block:
-                        log.info(f"OPTIONS: {pos.symbol} target hit ({pnl_pct:.1f}%) — closing")
-                        to_close.append(occ_sym)
+                    # Direct hit to tier-2 without tier-1: close position
+                    tiers = get_tiered_profit_targets(pos.entry_confidence)
+                    tier2_pct = tiers['tier2_target']
+                    
+                    if pnl_pct >= tier2_pct:
+                        if not pdt_block:
+                            log.info(f"OPTIONS: {pos.symbol} target hit ({pnl_pct:.1f}%) — closing")
+                            to_close.append(occ_sym)
 
                 elif pnl_pct <= -_eff_stop:
                     # Grace period: don't stop-out within first N days of entry
@@ -1319,20 +1433,25 @@ class OptionsExecutor:
                         to_close.append(occ_sym)
                         stop_symbols.append(pos.symbol)
 
-                # 5. Trailing stop — arms once peak >= OPTIONS_TRAIL_ACTIVATE_PCT
-                # Fires when pnl drops OPTIONS_TRAIL_DRAWDOWN_PCT pp below the peak.
+                # 5. Trailing stop — arms once peak >= confidence-tiered threshold
+                # Fires when pnl drops confidence-tiered drawdown pp below the peak.
                 # Only evaluated when the fixed stop and target haven't already triggered.
                 # Skipped during grace period to avoid noise.
-                elif (
+                tiers = get_tiered_profit_targets(pos.entry_confidence)
+                trail_activate = tiers['trail_activate_pct']
+                trail_drawdown = tiers['trail_drawdown_pct']
+                
+                if (
                     not in_grace_period
                     and not pdt_block
-                    and pos.peak_pnl_pct >= OPTIONS_TRAIL_ACTIVATE_PCT
-                    and pnl_pct <= pos.peak_pnl_pct - OPTIONS_TRAIL_DRAWDOWN_PCT
+                    and pos.peak_pnl_pct >= trail_activate
+                    and pnl_pct <= pos.peak_pnl_pct - trail_drawdown
                 ):
                     log.info(
-                        f"OPTIONS: {pos.symbol} trailing stop — peak={pos.peak_pnl_pct:.1f}% "
+                        f"OPTIONS: {pos.symbol} trailing stop (conf={pos.entry_confidence:.0%}) — "
+                        f"peak={pos.peak_pnl_pct:.1f}% "
                         f"current={pnl_pct:.1f}% (drawdown {pos.peak_pnl_pct - pnl_pct:.1f}pp "
-                        f"> {OPTIONS_TRAIL_DRAWDOWN_PCT:.0f}pp threshold) — closing"
+                        f"> {trail_drawdown:.0f}pp threshold) — closing"
                     )
                     to_close.append(occ_sym)
 
