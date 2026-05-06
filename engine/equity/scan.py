@@ -25,14 +25,12 @@ from engine.config import (
     BEAR_SHORT_UNIVERSE,
 )
 from engine.utils import MarketState, clear_bar_cache, get_bars, is_dead_ticker
-from engine.utils.bars import get_data_client as _get_data_client, get_feed_used as _get_feed_used
+from engine.utils.bars import get_feed_used as _get_feed_used
 
 # IEX (free) feed captures roughly 15% of consolidated volume vs SIP.
 # MDA (Market Data App) provides full consolidated (SIP-equivalent) data, so
 # IEX scaling is disabled when MDA is the primary source.
 _IEX_THRESHOLD_SCALE = 0.15
-from alpaca.data import StockSnapshotRequest as _StockSnapshotRequest
-from engine.config import ALPACA_DATA_FEED as _ALPACA_DATA_FEED
 import os as _scan_os
 
 
@@ -100,52 +98,7 @@ def _prefetch_snapshots(symbols: List[str]) -> None:
     if not symbols:
         return
 
-    # ── Primary: MDA bulk quotes ───────────────────────────────────────────
-    if _mda_available():
-        try:
-            import requests as _req
-            mda_key = _scan_os.environ.get("MARKETDATA_API_KEY", "")
-            # MDA supports up to 100 symbols per bulk-quote call.
-            for _chunk_start in range(0, len(symbols), 100):
-                chunk = symbols[_chunk_start: _chunk_start + 100]
-                r = _req.get(
-                    "https://api.marketdata.app/v1/stocks/bulkquotes/",
-                    params={"symbols": ",".join(chunk)},
-                    headers={"Authorization": f"Bearer {mda_key}"},
-                    timeout=12,
-                )
-                if r.status_code not in (200, 203):
-                    break
-                data = r.json()
-                if data.get("s") != "ok":
-                    break
-                syms    = data.get("symbol", [])
-                lasts   = data.get("last",   [])
-                vols    = data.get("volume", [])
-                opens   = data.get("open",   [])
-                for sym, last, vol, opn in zip(syms, lasts, vols, opens):
-                    if last is not None and vol is not None:
-                        _mda_snapshot_cache[sym] = {
-                            "price":  float(last),
-                            "volume": float(vol),
-                            "open":   float(opn) if opn is not None else float(last),
-                        }
-        except Exception:
-            pass  # fall through to Alpaca fallback
-
-    # ── Fallback: Alpaca batch snapshot (for symbols MDA missed / MDA unavail) ─
-    mda_covered = set(_mda_snapshot_cache)
-    alpaca_needed = [s for s in symbols if s not in mda_covered]
-    if alpaca_needed:
-        try:
-            client = _get_data_client()
-            snaps = client.get_stock_snapshot(
-                _StockSnapshotRequest(symbol_or_symbols=alpaca_needed, feed=_ALPACA_DATA_FEED)
-            )
-            if isinstance(snaps, dict):
-                _snapshot_cache = snaps
-        except Exception:
-            pass  # per-symbol get_bars fallback in _passes_guardrails
+    # MDA bulk quotes removed — relying on per-symbol bar fetch in _passes_guardrails
 
 
 def _passes_guardrails(symbol: str, bull_regime: bool = None, market_state: Optional[MarketState] = None, return_reason: bool = False) -> bool:

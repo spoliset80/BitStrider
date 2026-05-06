@@ -16,22 +16,12 @@ import time
 from typing import Dict, Tuple
 
 # Add tenacity for retry logic
-from tenacity import retry, wait_exponential, stop_after_attempt, retry_if_exception_type, RetryError
+from tenacity import retry, wait_exponential, stop_after_attempt, retry_if_exception_type
 
 import pandas as pd
 import pytz
 
 ET = pytz.timezone("America/New_York")
-
-# ── Alpaca SDK availability ───────────────────────────────────────────────────
-try:
-    from alpaca.data.historical import StockHistoricalDataClient
-    from alpaca.data.historical import OptionHistoricalDataClient
-    from alpaca.data.requests import StockBarsRequest
-    from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
-    ALPACA_AVAILABLE = True
-except ImportError:
-    ALPACA_AVAILABLE = False
 
 # ── Market Data App availability ────────────────────────────────────────────
 import os as _os
@@ -42,12 +32,6 @@ _MDA_AVAILABLE: bool = bool(_MDA_API_KEY)
 # Keyed by (symbol, period, interval). Thread-safe via lock.
 _bar_cache: Dict[Tuple[str, str, str], pd.DataFrame] = {}
 _bar_cache_lock = threading.Lock()
-
-_ALPACA_MIN_INTERVAL = 0.35   # per-symbol throttle to reduce 429s
-_last_alpaca_bar_ts: float = 0.0
-
-_data_client = None
-_option_data_client = None
 
 # ── Feed tracking ────────────────────────────────────────────────────────────
 # _last_feed_used: records which feed was used per symbol in this cycle.
@@ -93,54 +77,7 @@ def get_feed_used(symbol: str) -> str:
     return _last_feed_used.get(symbol.strip().upper(), "iex")
 
 
-# ── Alpaca client singletons ──────────────────────────────────────────────────
-
-def get_data_client() -> "StockHistoricalDataClient":
-    global _data_client
-    if _data_client is None:
-        from engine.config import API_KEY, API_SECRET
-        if not API_KEY or not API_SECRET:
-            raise ValueError("Alpaca API credentials not found in environment")
-        _data_client = StockHistoricalDataClient(API_KEY, API_SECRET)
-        # Increase connection pool to match the 24-worker parallel prefetch
-        # (urllib3 default is 10 — causes 'pool full, discarding connection' at 24 workers)
-        try:
-            from requests.adapters import HTTPAdapter
-            adapter = HTTPAdapter(pool_connections=4, pool_maxsize=30)
-            _data_client._session.mount("https://", adapter)
-            _data_client._session.mount("http://", adapter)
-        except Exception:
-            pass
-    return _data_client
-
-
-def get_option_data_client() -> "OptionHistoricalDataClient":
-    global _option_data_client
-    if _option_data_client is None:
-        from engine.config import API_KEY, API_SECRET
-        if not API_KEY or not API_SECRET:
-            raise ValueError("Alpaca API credentials not found in environment")
-        _option_data_client = OptionHistoricalDataClient(API_KEY, API_SECRET)
-        try:
-            from requests.adapters import HTTPAdapter
-            adapter = HTTPAdapter(pool_connections=4, pool_maxsize=30)
-            _option_data_client._session.mount("https://", adapter)
-            _option_data_client._session.mount("http://", adapter)
-        except Exception:
-            pass
-    return _option_data_client
-
-
-# ── TimeFrame helper ──────────────────────────────────────────────────────────
-
-def _parse_timeframe(interval: str) -> "TimeFrame":
-    if interval.endswith("m"):
-        return TimeFrame(int(interval[:-1]), TimeFrameUnit.Minute)
-    if interval.endswith("h"):
-        return TimeFrame(int(interval[:-1]), TimeFrameUnit.Hour)
-    if interval.endswith("d"):
-        return TimeFrame(int(interval[:-1]), TimeFrameUnit.Day)
-    return TimeFrame(15, TimeFrameUnit.Minute)
+# ── TimeFrame helper (for other sources) ─────────────────────────────────────
 
 
 def _normalize_df(df: pd.DataFrame) -> pd.DataFrame:
@@ -228,71 +165,7 @@ def _get_bars_marketdata(symbol: str, period: str, interval: str, log) -> pd.Dat
     return df
 
 
-class _NoRetryError(Exception):
-    """Raised inside _get_bars_alpaca to bypass tenacity retry on non-transient errors."""
-    pass
 
-
-@retry(wait=wait_exponential(multiplier=1, min=2, max=10), stop=stop_after_attempt(3),
-       retry=retry_if_exception_type(Exception),
-       reraise=False)
-def _get_bars_alpaca(symbol: str, period: str, interval: str, log) -> pd.DataFrame:
-    """Fetch OHLCV bars via Alpaca only, with retry.
-
-    Non-transient HTTP errors (4xx) are wrapped in _NoRetryError and raised
-    immediately without consuming retry attempts.
-    """
-    client = get_data_client()
-    tf     = _parse_timeframe(interval)
-    days   = int(period[:-1]) if period.endswith("d") else 5
-    end_dt = datetime.datetime.now(ET)
-    start_dt = end_dt - datetime.timedelta(days=days)
-    start_iso = start_dt.astimezone(pytz.UTC).isoformat().replace("+00:00", "Z")
-    end_iso   = end_dt.astimezone(pytz.UTC).isoformat().replace("+00:00", "Z")
-
-    global _last_alpaca_bar_ts
-    elapsed = time.time() - _last_alpaca_bar_ts
-    if elapsed < _ALPACA_MIN_INTERVAL:
-        time.sleep(_ALPACA_MIN_INTERVAL - elapsed)
-
-    from engine.config import ALPACA_DATA_FEED
-    feed_used = ALPACA_DATA_FEED  # "sip" for paid subscribers, "iex" for free tier
-    try:
-        bars = client.get_stock_bars(StockBarsRequest(
-            symbol_or_symbols=symbol,
-            timeframe=tf,
-            start=start_iso,
-            end=end_iso,
-            feed=feed_used,
-        ))
-    except Exception as _api_err:
-        _msg = str(_api_err)
-        # 4xx errors are permanent for this symbol/feed combo — skip retries
-        import re as _re
-        if _re.search(r'\b4\d{2}\b', _msg):
-            raise _NoRetryError(_msg) from _api_err
-        raise
-    _last_alpaca_bar_ts = time.time()
-    _last_feed_used[symbol] = feed_used
-    if symbol in bars:
-        data = _normalize_df(bars[symbol].df.reset_index())
-        if not data.empty and "time" in data.columns:
-            # Forward-fill missing bars (close, volume, etc.)
-            data = data.ffill()
-            latest = pd.to_datetime(data["time"].iloc[-1])
-            if latest.tzinfo is None:
-                latest = ET.localize(latest)
-            staleness = (datetime.datetime.now(ET) - latest).total_seconds()
-            if interval.endswith("m") and staleness > 120:
-                log.warning(f"{symbol}: Alpaca data stale ({staleness:.0f}s) — skipping")
-            else:
-                _record_ok_bars(symbol)
-                with _bar_cache_lock:
-                    _bar_cache[(symbol, period, interval)] = data
-                return data
-        else:
-            log.warning(f"{symbol}: Alpaca returned empty or malformed data.")
-    return pd.DataFrame()
 
 def _get_bars_schwab(symbol: str, period: str, interval: str, log) -> pd.DataFrame:
     """Fetch OHLCV bars via Schwab API."""
@@ -425,27 +298,7 @@ def get_bars(symbol: str, period: str = "5d", interval: str = "15m") -> pd.DataF
         except Exception as e:
             log.debug(f"{symbol}: MDA bars failed: {e}")
 
-    # ── Alpaca path with retry ──
-    if ALPACA_AVAILABLE:
-        try:
-            data = _get_bars_alpaca(symbol, period, interval, log)
-            if not data.empty:
-                return data
-        except (_NoRetryError, RetryError) as e:
-            # Unwrap RetryError to show the actual cause, not just the future wrapper
-            _cause = getattr(e, 'last_attempt', None)
-            if _cause is not None:
-                try:
-                    _cause_exc = _cause.exception()
-                    log.warning(f"{symbol}: Alpaca fetch failed: {_cause_exc}")
-                except Exception:
-                    log.warning(f"{symbol}: Alpaca fetch failed: {e}")
-            else:
-                log.warning(f"{symbol}: Alpaca fetch failed: {e}")
-        except Exception as e:
-            log.warning(f"{symbol}: Alpaca fetch failed: {e}")
-
-    # ── Schwab path (no retry required — API handles it) ──
+    # ── Schwab path (primary Alpaca replacement) ──
     try:
         data = _get_bars_schwab(symbol, period, interval, log)
         if not data.empty:
@@ -506,44 +359,6 @@ def get_bars_batch(symbols, period: str = "5d", interval: str = "15m") -> Dict[s
                 mda_failed.append(s)
         uncached = mda_failed
 
-    if ALPACA_AVAILABLE and uncached:
-        try:
-            client = get_data_client()
-            tf     = _parse_timeframe(interval)
-            days   = int(period[:-1]) if period.endswith("d") else 5
-            start  = datetime.datetime.now(ET) - datetime.timedelta(days=days)
-
-            for i in range(0, len(uncached), BATCH_SIZE):
-                batch = uncached[i : i + BATCH_SIZE]
-                try:
-                    bars = client.get_stock_bars(StockBarsRequest(
-                        symbol_or_symbols=batch, timeframe=tf, start=start,
-                    ))
-                except Exception as e:
-                    log.debug(f"Alpaca batch failed for {batch}: {e}")
-                    bars = {}
-
-                for s in batch:
-                    if s not in bars:
-                        log.debug(f"{s}: Alpaca missing/stale [batch]")
-                        continue
-                    data = _normalize_df(bars[s].df.reset_index())
-                    if "time" in data.columns and not data.empty:
-                        latest    = pd.to_datetime(data["time"].iloc[-1])
-                        if latest.tzinfo is None:
-                            latest = ET.localize(latest)
-                        staleness = (datetime.datetime.now(ET) - latest).total_seconds()
-                        if interval.endswith("m") and staleness > 120:
-                            log.warning(f"{s}: Alpaca data stale ({staleness:.0f}s) [batch]")
-                            continue
-                    _record_ok_bars(s)
-                    results[s] = data
-                    with _bar_cache_lock:
-                        _bar_cache[(s, period, interval)] = data
-                time.sleep(THROTTLE_SEC)
-        except Exception as e:
-            log.debug(f"Alpaca batch outer failure: {e}")
-
     # Fill missing entries with empty DataFrame
     for s in symbols:
         if s not in results:
@@ -565,6 +380,7 @@ def get_premarket_bars(symbol: str) -> pd.DataFrame:
     """Fetch today's 1-min bars from 4:00 AM ET (pre-market included).
 
     Cached under a '_prepost' period key — invalidated by clear_bar_cache().
+    Currently uses Schwab via get_bars() as the fallback.
     """
     log       = logging.getLogger("ApexTrader")
     cache_key = (symbol, "1d_prepost", "1m")
@@ -572,22 +388,8 @@ def get_premarket_bars(symbol: str) -> pd.DataFrame:
         if cache_key in _bar_cache:
             return _bar_cache[cache_key]
 
-    result = pd.DataFrame()
-    if ALPACA_AVAILABLE:
-        try:
-            client = get_data_client()
-            now_et = datetime.datetime.now(ET)
-            start  = now_et.replace(hour=4, minute=0, second=0, microsecond=0)
-            bars   = client.get_stock_bars(StockBarsRequest(
-                symbol_or_symbols=symbol,
-                timeframe=TimeFrame(1, TimeFrameUnit.Minute),
-                start=start,
-            ))
-            if symbol in bars:
-                result = _normalize_df(bars[symbol].df.reset_index())
-                log.debug(f"get_premarket_bars({symbol}): {len(result)} bars")
-        except Exception as e:
-            log.debug(f"get_premarket_bars({symbol}): failed: {e}")
+    # Try Schwab/MDA via the standard get_bars() path
+    result = get_bars(symbol, period="1d", interval="1m")
 
     with _bar_cache_lock:
         _bar_cache[cache_key] = result

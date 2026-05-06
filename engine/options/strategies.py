@@ -42,7 +42,7 @@ except ImportError:
     _YF_AVAILABLE = False
 import pytz
 from engine.options._options_today import _calc_iv_rank
-from engine.utils import MarketState, get_bars, calc_rsi, get_option_data_client, ALPACA_AVAILABLE
+from engine.utils import MarketState, get_bars, calc_rsi
 from engine.config import (
     OPTIONS_ENABLED,
     OPTIONS_DTE_MIN,
@@ -288,27 +288,7 @@ def _get_options_chain(symbol: str) -> Optional[OptionsChainInfo]:
     exp_gte = today + datetime.timedelta(days=OPTIONS_DTE_MIN)
     exp_lte = today + datetime.timedelta(days=OPTIONS_DTE_MAX)
 
-    # ── Market Data App option chain (primary) ───────────────────
-    if _MDA_AVAILABLE:
-        try:
-            result = _get_chain_marketdata(symbol, spot, exp_gte, exp_lte, hv30, atr14, hist)
-            if result is not None:
-                _chain_cache[symbol] = (now, result)
-                return result
-        except Exception as e:
-            log.debug(f"{symbol}: MDA option chain failed: {e}")
-
-    # ── Alpaca option chain (fallback) ───────────────────────────
-    if ALPACA_AVAILABLE:
-        try:
-            result = _get_chain_alpaca(symbol, spot, exp_gte, exp_lte, hv30, atr14, hist)
-            if result is not None:
-                _chain_cache[symbol] = (now, result)
-                return result
-        except Exception as e:
-            log.debug(f"{symbol}: Alpaca option chain failed: {e}")
-
-    # ── Schwab option chain (second fallback) ────────────────────
+    # ── Schwab option chain (primary) ────────────────────────────
     try:
         result = _get_chain_schwab(symbol, spot, exp_gte, exp_lte, hv30, atr14, hist)
         if result is not None:
@@ -421,77 +401,6 @@ def _apply_oi_to_df(df: pd.DataFrame, oi_map: Dict[str, int]) -> pd.DataFrame:
     df = df.copy()
     df["openinterest"] = df["contractsymbol"].map(oi_map).fillna(0).astype(int)
     return df
-
-
-def _get_chain_alpaca(
-    symbol: str, spot: float,
-    exp_gte: datetime.date, exp_lte: datetime.date,
-    hv30: float, atr14: float, hist: pd.DataFrame,
-) -> Optional[OptionsChainInfo]:
-    """Fetch option chain via Alpaca OptionHistoricalDataClient.
-
-    Bid/ask/greeks come from the snapshots endpoint (real-time intraday).
-    Open Interest comes from the contracts endpoint (OCC daily settlement data).
-    """
-    from alpaca.data.requests import OptionChainRequest
-
-    client = get_option_data_client()
-    req = OptionChainRequest(
-        underlying_symbol=symbol,
-        expiration_date_gte=exp_gte,
-        expiration_date_lte=exp_lte,
-        strike_price_gte=round(spot * 0.70, 2),
-        strike_price_lte=round(spot * 1.30, 2),
-    )
-    snapshots = client.get_option_chain(req)
-    if not snapshots:
-        return None
-
-    calls = _snapshots_to_df(snapshots, "call")
-    puts  = _snapshots_to_df(snapshots, "put")
-
-    if calls.empty and puts.empty:
-        return None
-
-    # Pick the closest expiry from the returned data
-    all_expiries = set()
-    if not calls.empty:
-        all_expiries.update(calls["expiry"].unique())
-    if not puts.empty:
-        all_expiries.update(puts["expiry"].unique())
-    target_expiry = min(all_expiries) if all_expiries else exp_gte
-
-    # Filter to just that expiry
-    if not calls.empty:
-        calls = calls[calls["expiry"] == target_expiry].drop(columns=["expiry"])
-    if not puts.empty:
-        puts = puts[puts["expiry"] == target_expiry].drop(columns=["expiry"])
-
-    # Merge real OI from /v2/options/contracts (snapshots always return 0)
-    oi_map = _fetch_oi_from_contracts(symbol, exp_gte, exp_lte)
-    if oi_map:
-        calls = _apply_oi_to_df(calls, oi_map)
-        puts  = _apply_oi_to_df(puts,  oi_map)
-
-    # IV rank from ATM call IV
-    mid_c = calls[(calls["strike"] >= spot * 0.95) & (calls["strike"] <= spot * 1.05)]
-    if not mid_c.empty and "impliedvolatility" in mid_c.columns:
-        cur_iv = float(mid_c["impliedvolatility"].mean()) * 100
-    else:
-        cur_iv = hv30
-    iv_rank = _calc_iv_rank(cur_iv, hist["close"])
-
-    log.debug(f"{symbol}: Alpaca chain OK — {len(calls)} calls, {len(puts)} puts, exp={target_expiry}")
-    return OptionsChainInfo(
-        symbol=symbol,
-        expiry=target_expiry,
-        calls=calls,
-        puts=puts,
-        spot_price=spot,
-        iv_rank=iv_rank,
-        hv_30=hv30,
-        atr14=max(atr14, 0.01),
-    )
 
 
 def _get_chain_marketdata(
@@ -619,6 +528,10 @@ def _get_chain_schwab(
 ) -> Optional[OptionsChainInfo]:
     """Fetch option chain via Schwab API.
     
+    Schwab returns a nested dict structure:
+    - callExpDateMap: {expiration_str: {strike_str: [option_list]}}
+    - putExpDateMap: {expiration_str: {strike_str: [option_list]}}
+    
     Returns calls/puts DataFrames with the same structure as Alpaca/MDA.
     """
     try:
@@ -630,70 +543,124 @@ def _get_chain_schwab(
         client = get_schwab_market_data_client()
         response = client.get_option_chains(symbol, contract_type="ALL")
         
-        if not response or "chains" not in response or not response["chains"]:
+        if not response or response.get("status") != "SUCCESS":
+            log.debug(f"{symbol}: Schwab response status not SUCCESS: {response}")
             return None
         
-        chains = response["chains"]
+        # Extract expiration date maps
+        call_map = response.get("callExpDateMap", {})
+        put_map = response.get("putExpDateMap", {})
         
-        # Find option expirations within our DTE range
-        valid_chains = []
-        for chain in chains:
-            exp_str = chain.get("expirationDate", "")
+        if not call_map and not put_map:
+            log.debug(f"{symbol}: Schwab no call or put maps found")
+            return None
+        
+        # Find valid expirations in our DTE range
+        target_expiry = None
+        target_call_key = None
+        target_put_key = None
+        
+        for call_key in call_map.keys():
             try:
-                exp = datetime.datetime.strptime(exp_str, "%Y-%m-%d").date()
+                # Format is "2026-05-20:15" (date:DTE)
+                date_part = call_key.split(":")[0]
+                exp = datetime.datetime.strptime(date_part, "%Y-%m-%d").date()
                 if exp_gte <= exp <= exp_lte:
-                    valid_chains.append((exp, chain))
-            except (ValueError, KeyError):
+                    if target_expiry is None or exp < target_expiry:
+                        target_expiry = exp
+                        target_call_key = call_key
+            except (ValueError, IndexError):
                 continue
         
-        if not valid_chains:
-            return None
+        for put_key in put_map.keys():
+            try:
+                date_part = put_key.split(":")[0]
+                exp = datetime.datetime.strptime(date_part, "%Y-%m-%d").date()
+                if exp_gte <= exp <= exp_lte:
+                    if target_expiry is None or exp < target_expiry:
+                        target_expiry = exp
+                        target_put_key = put_key
+            except (ValueError, IndexError):
+                continue
         
-        # Pick the closest expiry
-        valid_chains.sort(key=lambda x: x[0])
-        target_expiry = valid_chains[0][0]
-        target_chain = valid_chains[0][1]
+        if target_expiry is None:
+            log.debug(f"{symbol}: Schwab no valid expirations in [{exp_gte}, {exp_lte}]")
+            return None
         
         calls = []
         puts = []
         
-        # Process options in the target chain
-        for opt in target_chain.get("options", []):
-            strike = float(opt.get("strikePrice", 0))
-            bid = float(opt.get("bidPrice", 0))
-            ask = float(opt.get("askPrice", 0))
-            mid = (bid + ask) / 2 if (bid > 0 and ask > 0) else 0
-            last = float(opt.get("lastPrice", mid)) if opt.get("lastPrice") else mid
-            iv = float(opt.get("impliedVolatility", 0)) or 0
-            delta = float(opt.get("delta", 0)) or 0
-            oi = int(opt.get("openInterest", 0)) or 0
-            opt_type = opt.get("optionType", "").upper()
-            symbol_opt = opt.get("symbol", "")
-            
-            # Skip if outside strike range (70-130% of spot)
-            if strike < spot * 0.70 or strike > spot * 1.30:
-                continue
-            
-            row = {
-                "contractsymbol": symbol_opt,
-                "strike": strike,
-                "bid": bid,
-                "ask": ask,
-                "mid": mid,
-                "lastprice": last if last > 0 else mid,
-                "impliedvolatility": iv,
-                "iv_pct": iv * 100,
-                "delta": delta,
-                "openinterest": oi,
-                "expiry": target_expiry,
-            }
-            
-            if opt_type == "CALL":
-                calls.append(row)
-            elif opt_type == "PUT":
-                puts.append(row)
+        # Process calls using the actual key from the map
+        if target_call_key and target_call_key in call_map:
+            for strike_str, option_list in call_map[target_call_key].items():
+                try:
+                    strike = float(strike_str)
+                    # Skip strikes outside range
+                    if strike < spot * 0.70 or strike > spot * 1.30:
+                        continue
+                    
+                    # Schwab returns array per strike, usually 1 option but take first
+                    if option_list and len(option_list) > 0:
+                        opt = option_list[0]
+                        bid = float(opt.get("bid", 0) or 0)
+                        ask = float(opt.get("ask", 0) or 0)
+                        mid = (bid + ask) / 2 if (bid > 0 and ask > 0) else 0
+                        last = float(opt.get("last", mid) or mid)
+                        iv = float(opt.get("volatility", 0) or 0) / 100  # Schwab gives IV as percentage
+                        delta = float(opt.get("delta", 0) or 0)
+                        oi = int(opt.get("openInterest", 0) or 0)
+                        
+                        calls.append({
+                            "contractsymbol": opt.get("symbol", ""),
+                            "strike": strike,
+                            "bid": bid,
+                            "ask": ask,
+                            "mid": mid,
+                            "lastprice": last,
+                            "impliedvolatility": iv,
+                            "iv_pct": iv * 100,
+                            "delta": delta,
+                            "openinterest": oi,
+                        })
+                except (ValueError, TypeError, KeyError):
+                    continue
+        
+        # Process puts using the actual key from the map
+        if target_put_key and target_put_key in put_map:
+            for strike_str, option_list in put_map[target_put_key].items():
+                try:
+                    strike = float(strike_str)
+                    # Skip strikes outside range
+                    if strike < spot * 0.70 or strike > spot * 1.30:
+                        continue
+                    
+                    if option_list and len(option_list) > 0:
+                        opt = option_list[0]
+                        bid = float(opt.get("bid", 0) or 0)
+                        ask = float(opt.get("ask", 0) or 0)
+                        mid = (bid + ask) / 2 if (bid > 0 and ask > 0) else 0
+                        last = float(opt.get("last", mid) or mid)
+                        iv = float(opt.get("volatility", 0) or 0) / 100  # Schwab gives IV as percentage
+                        delta = float(opt.get("delta", 0) or 0)
+                        oi = int(opt.get("openInterest", 0) or 0)
+                        
+                        puts.append({
+                            "contractsymbol": opt.get("symbol", ""),
+                            "strike": strike,
+                            "bid": bid,
+                            "ask": ask,
+                            "mid": mid,
+                            "lastprice": last,
+                            "impliedvolatility": iv,
+                            "iv_pct": iv * 100,
+                            "delta": delta,
+                            "openinterest": oi,
+                        })
+                except (ValueError, TypeError, KeyError):
+                    continue
         
         if not calls and not puts:
+            log.debug(f"{symbol}: Schwab found no valid calls/puts for {target_expiry}")
             return None
         
         calls_df = pd.DataFrame(calls) if calls else pd.DataFrame()
@@ -721,6 +688,8 @@ def _get_chain_schwab(
     
     except Exception as e:
         log.debug(f"{symbol}: Schwab option chain parse error: {e}")
+        import traceback
+        log.debug(traceback.format_exc())
         return None
 
 

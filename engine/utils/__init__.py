@@ -12,12 +12,9 @@ Submodules:
 """
 
 from engine.utils.bars import (
-    ALPACA_AVAILABLE,
     clear_bar_cache,
     get_feed_used,
     is_dead_ticker,
-    get_data_client,
-    get_option_data_client,
     get_bars,
     get_bars_batch,
     get_price,
@@ -68,9 +65,7 @@ from engine.utils.data import (
 )
 
 __all__ = [
-    "ALPACA_AVAILABLE",
-    "clear_bar_cache", "is_dead_ticker",
-    "get_data_client", "get_option_data_client",
+    "clear_bar_cache", "is_dead_ticker", "get_feed_used",
     "get_bars", "get_bars_batch", "get_price", "get_premarket_bars", "get_finnhub_bars",
     "calc_rsi", "calc_macd", "calculate_atr",
     "MarketState", "is_market_open", "is_regular_hours", "is_options_lull_hours", "is_open_window",
