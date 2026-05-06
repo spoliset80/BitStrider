@@ -915,17 +915,8 @@ def _get_float_shares(symbol: str) -> Optional[float]:
                 return float(shares)
     except Exception:
         pass
-    # ── Fallback: yfinance ────────────────────────────────────────────────────────
-    try:
-        import yfinance as _yf
-        info   = _yf.Ticker(symbol).info
-        shares = info.get("floatShares") or info.get("sharesOutstanding")
-        if shares and float(shares) > 0:
-            _float_info_cache[symbol] = float(shares)
-            return float(shares)
-    except Exception:
-        pass
-    _float_info_cache[symbol] = 0.0   # cache miss so we don't re-fetch this session
+    
+    _float_info_cache[symbol] = 0.0   # cache miss
     return None
 
 

@@ -32,14 +32,6 @@ from typing import Optional, List, Dict, Tuple
 
 import pandas as pd
 import psutil
-try:
-    import yfinance as _yf
-    _YF_AVAILABLE = True
-    # yfinance logs Yahoo Finance HTTP errors (429, 500) at ERROR level internally.
-    # These are transient API failures we already handle via try/except — suppress the noise.
-    logging.getLogger("yfinance").setLevel(logging.CRITICAL)
-except ImportError:
-    _YF_AVAILABLE = False
 import pytz
 from engine.options._options_today import _calc_iv_rank
 from engine.utils import MarketState, get_bars, calc_rsi
