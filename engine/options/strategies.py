@@ -219,6 +219,13 @@ _fallback_source: Dict[str, str] = {}        # symbol -> "schwab" or "alpaca" (f
 _failed_symbols_cache: Dict[str, float] = {}  # symbol -> timestamp of last failure
 _FAILED_SYMBOLS_TTL = 3600  # 1 hour — retry failed symbols once per hour instead of every scan cycle
 
+# Schwab API health monitor (Stage 4) — switches to Alpaca-first if Schwab is degraded
+# Tracks success/failure per scan cycle; if success rate <80%, use Alpaca-first strategy
+_schwab_health_success: int = 0      # Successful Schwab fetches this cycle
+_schwab_health_failure: int = 0      # Failed Schwab fetches this cycle
+_schwab_health_use_alpaca_first = False  # If True, try Alpaca before Schwab (Schwab degraded)
+_SCHWAB_HEALTH_THRESHOLD = 0.80  # Switch to Alpaca-first if success rate < 80%
+
 # Module-level OI TradingClient singleton — avoids creating a new HTTP session
 # for every symbol during parallel OI prefetch (was 120+ instantiations per cycle).
 _oi_trading_client = None
@@ -254,12 +261,14 @@ def _calc_hv30(closes: pd.Series) -> float:
 def _get_options_chain(symbol: str) -> Optional[OptionsChainInfo]:
     """Fetch the best near-term options chain (14-30 DTE) with full quality metadata.
     
-    Primary: Schwab (Stage 1 - connection pool + exponential backoff improvements)
-    Fallback: Alpaca when Schwab fails (Stage 2)
+    Primary: Schwab (Stage 1 - connection pool + exponential backoff) OR Alpaca (Stage 4 adaptive)
+    Fallback: Alpaca when primary fails (Stage 2)
     Optimization: Skip symbols with no liquid options chains (cached misses from both brokers)
+    Health Monitor: If Schwab success rate <80%, switch to Alpaca-first strategy (Stage 4)
     
-    Logs which source provided the chain for monitoring.
+    Logs which source provided the chain and Schwab health status for monitoring.
     """
+    global _schwab_health_success, _schwab_health_failure
     now = time.monotonic()
     
     # Early exit: Skip symbols known to have no options chains (both brokers failed)
@@ -302,40 +311,68 @@ def _get_options_chain(symbol: str) -> Optional[OptionsChainInfo]:
     exp_gte = today + datetime.timedelta(days=OPTIONS_DTE_MIN)
     exp_lte = today + datetime.timedelta(days=OPTIONS_DTE_MAX)
 
-    # ── Stage 1 & 2: Schwab primary with Alpaca fallback ──────────────────
-    # Try Schwab first (Stage 1 improvements: connection pool 10→25 + exponential backoff)
-    try:
-        result = _get_chain_schwab(symbol, spot, exp_gte, exp_lte, hv30, atr14, hist)
-        if result is not None:
-            _schwab_failure_count[symbol] = 0  # Reset on success
-            _fallback_source[symbol] = "schwab"
-            _chain_cache[symbol] = (now, result)
-            return result
-        else:
-            # Schwab returned None — increment failure count and prepare for fallback
+    # ── Stage 4: Health-aware broker selection ────────────────────────────
+    # If Schwab success rate <80% (degraded), try Alpaca FIRST to avoid wasted retries
+    # Otherwise, try Schwab first (Stage 1 improvements: connection pool + exponential backoff)
+    
+    if _schwab_health_use_alpaca_first:
+        # Schwab is degraded — try Alpaca first, Schwab as fallback
+        try:
+            result = _get_chain_alpaca(symbol, spot, exp_gte, exp_lte, hv30, atr14, hist)
+            if result is not None:
+                _fallback_source[symbol] = "alpaca"
+                _chain_cache[symbol] = (now, result)
+                return result
+        except Exception as e:
+            log.debug(f"{symbol}: Alpaca (primary in degraded mode) failed: {e}")
+        
+        # Alpaca failed — fall through to Schwab as secondary
+        try:
+            result = _get_chain_schwab(symbol, spot, exp_gte, exp_lte, hv30, atr14, hist)
+            if result is not None:
+                _schwab_health_success += 1
+                _fallback_source[symbol] = "schwab"
+                _chain_cache[symbol] = (now, result)
+                return result
+            else:
+                _schwab_health_failure += 1
+                log.debug(f"{symbol}: Schwab secondary returned None (degraded mode)")
+        except Exception as e:
+            _schwab_health_failure += 1
+            log.debug(f"{symbol}: Schwab secondary error: {e} (degraded mode)")
+    else:
+        # Schwab is healthy — try Schwab first, Alpaca as fallback (Stage 1 & 2 logic)
+        try:
+            result = _get_chain_schwab(symbol, spot, exp_gte, exp_lte, hv30, atr14, hist)
+            if result is not None:
+                _schwab_health_success += 1
+                _schwab_failure_count[symbol] = 0  # Reset on success
+                _fallback_source[symbol] = "schwab"
+                _chain_cache[symbol] = (now, result)
+                return result
+            else:
+                _schwab_health_failure += 1
+                current_fail_count = _schwab_failure_count.get(symbol, 0)
+                _schwab_failure_count[symbol] = current_fail_count + 1
+                log.debug(f"{symbol}: Schwab chain failed (attempt {current_fail_count + 1}/3) — trying Alpaca fallback")
+        except Exception as e:
+            _schwab_health_failure += 1
             current_fail_count = _schwab_failure_count.get(symbol, 0)
             _schwab_failure_count[symbol] = current_fail_count + 1
-            log.warning(f"{symbol}: Schwab chain failed (attempt {current_fail_count + 1}/3) — trying Alpaca fallback")
-    except Exception as e:
-        current_fail_count = _schwab_failure_count.get(symbol, 0)
-        _schwab_failure_count[symbol] = current_fail_count + 1
-        log.warning(f"{symbol}: Schwab chain error: {e} (attempt {current_fail_count + 1}/3) — trying Alpaca fallback")
-    
-    # ── Stage 2: Immediate Alpaca fallback on any Schwab failure ──────────
-    # Always try Alpaca if Schwab failed (don't wait for 3 failures)
-    try:
-        result = _get_chain_alpaca(symbol, spot, exp_gte, exp_lte, hv30, atr14, hist)
-        if result is not None:
-            _fallback_source[symbol] = "alpaca"
-            log.info(f"{symbol}: Alpaca fallback succeeded (Schwab failed)")
-            _chain_cache[symbol] = (now, result)
-            return result
-        else:
-            fail_count = _schwab_failure_count.get(symbol, 0)
-            log.warning(f"{symbol}: No options chain (both Schwab + Alpaca failed, attempt {fail_count}); skipping for 1 hour")
-    except Exception as e:
-        fail_count = _schwab_failure_count.get(symbol, 0)
-        log.warning(f"{symbol}: Alpaca fallback exception: {e} (Schwab failures: {fail_count})")
+            log.debug(f"{symbol}: Schwab chain error: {e} (attempt {current_fail_count + 1}/3) — trying Alpaca fallback")
+        
+        # Schwab failed — try Alpaca fallback
+        try:
+            result = _get_chain_alpaca(symbol, spot, exp_gte, exp_lte, hv30, atr14, hist)
+            if result is not None:
+                _fallback_source[symbol] = "alpaca"
+                log.info(f"{symbol}: Alpaca fallback succeeded (Schwab failed)")
+                _chain_cache[symbol] = (now, result)
+                return result
+            else:
+                log.debug(f"{symbol}: No options chain (both Schwab + Alpaca failed); skipping for 1 hour")
+        except Exception as e:
+            log.debug(f"{symbol}: Alpaca fallback exception: {e}")
 
     # Both sources failed — cache this symbol to avoid repeated API calls
     _failed_symbols_cache[symbol] = now
@@ -2880,8 +2917,21 @@ def scan_options_universe(
 
     # Strategies call _get_filters() per scan() — no global refresh needed here
 
-    global _market_state
+    global _market_state, _schwab_health_success, _schwab_health_failure, _schwab_health_use_alpaca_first
     _market_state = market_state
+    
+    # Reset Schwab health counters at start of scan; evaluate recovery/degradation
+    if _schwab_health_success + _schwab_health_failure > 0:
+        success_rate = _schwab_health_success / (_schwab_health_success + _schwab_health_failure)
+        if success_rate < _SCHWAB_HEALTH_THRESHOLD:
+            log.warning(f"Schwab API degraded: {success_rate*100:.1f}% success rate (threshold {_SCHWAB_HEALTH_THRESHOLD*100:.0f}%) — using Alpaca-first strategy")
+            _schwab_health_use_alpaca_first = True
+        elif _schwab_health_use_alpaca_first:
+            log.info(f"Schwab API recovered: {success_rate*100:.1f}% success rate — switching back to Schwab-first")
+            _schwab_health_use_alpaca_first = False
+    
+    _schwab_health_success = 0
+    _schwab_health_failure = 0
 
     ti_universe = get_options_universe()
     if not ti_universe:
