@@ -290,42 +290,39 @@ def _get_options_chain(symbol: str) -> Optional[OptionsChainInfo]:
     exp_lte = today + datetime.timedelta(days=OPTIONS_DTE_MAX)
 
     # ── Stage 1 & 2: Schwab primary with Alpaca fallback ──────────────────
-    # Track Schwab failures — after 3 failures, use Alpaca fallback
-    schwab_fail_count = _schwab_failure_count.get(symbol, 0)
-    use_alpaca_fallback = schwab_fail_count >= 3
+    # Try Schwab first (Stage 1 improvements: connection pool 10→25 + exponential backoff)
+    try:
+        result = _get_chain_schwab(symbol, spot, exp_gte, exp_lte, hv30, atr14, hist)
+        if result is not None:
+            _schwab_failure_count[symbol] = 0  # Reset on success
+            _fallback_source[symbol] = "schwab"
+            _chain_cache[symbol] = (now, result)
+            return result
+        else:
+            # Schwab returned None — increment failure count and prepare for fallback
+            current_fail_count = _schwab_failure_count.get(symbol, 0)
+            _schwab_failure_count[symbol] = current_fail_count + 1
+            log.warning(f"{symbol}: Schwab chain failed (attempt {current_fail_count + 1}/3) — trying Alpaca fallback")
+    except Exception as e:
+        current_fail_count = _schwab_failure_count.get(symbol, 0)
+        _schwab_failure_count[symbol] = current_fail_count + 1
+        log.warning(f"{symbol}: Schwab chain error: {e} (attempt {current_fail_count + 1}/3) — trying Alpaca fallback")
     
-    if not use_alpaca_fallback:
-        # Try Schwab (Stage 1 improvements: connection pool 10→25 + exponential backoff)
-        try:
-            result = _get_chain_schwab(symbol, spot, exp_gte, exp_lte, hv30, atr14, hist)
-            if result is not None:
-                _schwab_failure_count[symbol] = 0  # Reset on success
-                _fallback_source[symbol] = "schwab"
-                _chain_cache[symbol] = (now, result)
-                return result
-            else:
-                # Schwab returned None — increment failure count
-                _schwab_failure_count[symbol] = schwab_fail_count + 1
-                log.debug(f"{symbol}: Schwab chain failed (attempt {schwab_fail_count + 1}/3)")
-        except Exception as e:
-            _schwab_failure_count[symbol] = schwab_fail_count + 1
-            log.debug(f"{symbol}: Schwab chain exception: {e} (attempt {schwab_fail_count + 1}/3)")
-    
-    # ── Stage 2: Alpaca fallback ─────────────────────────────────────────
-    # Use Alpaca if Schwab failed 3x or was already skipped
-    if use_alpaca_fallback or schwab_fail_count >= 3:
-        try:
-            result = _get_chain_alpaca(symbol, spot, exp_gte, exp_lte, hv30, atr14, hist)
-            if result is not None:
-                _fallback_source[symbol] = "alpaca"
-                if use_alpaca_fallback:
-                    log.info(f"{symbol}: Using Alpaca fallback (Schwab failed 3x)")
-                _chain_cache[symbol] = (now, result)
-                return result
-            else:
-                log.warning(f"{symbol}: Both Schwab (failed {schwab_fail_count + 1}x) and Alpaca fallback returned None")
-        except Exception as e:
-            log.warning(f"{symbol}: Alpaca fallback exception: {e}")
+    # ── Stage 2: Immediate Alpaca fallback on any Schwab failure ──────────
+    # Always try Alpaca if Schwab failed (don't wait for 3 failures)
+    try:
+        result = _get_chain_alpaca(symbol, spot, exp_gte, exp_lte, hv30, atr14, hist)
+        if result is not None:
+            _fallback_source[symbol] = "alpaca"
+            log.info(f"{symbol}: Alpaca fallback succeeded (Schwab failed)")
+            _chain_cache[symbol] = (now, result)
+            return result
+        else:
+            fail_count = _schwab_failure_count.get(symbol, 0)
+            log.warning(f"{symbol}: Alpaca fallback also returned None (Schwab failures: {fail_count})")
+    except Exception as e:
+        fail_count = _schwab_failure_count.get(symbol, 0)
+        log.warning(f"{symbol}: Alpaca fallback exception: {e} (Schwab failures: {fail_count})")
 
     return None
 
