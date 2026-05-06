@@ -518,22 +518,50 @@ def _get_chain_schwab(
     exp_gte: datetime.date, exp_lte: datetime.date,
     hv30: float, atr14: float, hist: pd.DataFrame,
 ) -> Optional[OptionsChainInfo]:
-    """Fetch option chain via Schwab API.
+    """Fetch option chain via Schwab API with retry logic for transient errors.
     
     Schwab returns a nested dict structure:
     - callExpDateMap: {expiration_str: {strike_str: [option_list]}}
     - putExpDateMap: {expiration_str: {strike_str: [option_list]}}
     
+    Retries: 502, 503, 504 server errors up to 3 times with exponential backoff
+    (0.5s, 1s, 2s) to handle temporary Schwab API outages/overload.
+    
     Returns calls/puts DataFrames with the same structure as Alpaca/MDA.
     """
     try:
         from engine.broker.schwab_client import get_schwab_market_data_client
+        from requests.exceptions import HTTPError
     except ImportError:
         return None
     
     try:
         client = get_schwab_market_data_client()
-        response = client.get_option_chains(symbol, contract_type="ALL")
+        
+        # Retry transient 5xx errors (502, 503, 504)
+        def _fetch_with_retry():
+            for attempt in range(3):
+                try:
+                    resp = client.get_option_chains(symbol, contract_type="ALL")
+                    return resp
+                except HTTPError as e:
+                    status_code = e.response.status_code
+                    # Retry on 502 (Bad Gateway), 503 (Service Unavailable), 504 (Gateway Timeout)
+                    if status_code in (502, 503, 504):
+                        if attempt < 2:  # Not the last attempt
+                            wait_time = (2 ** attempt) * 0.5  # 0.5s, 1s, 2s
+                            log.debug(f"{symbol}: Schwab {status_code} error — retrying in {wait_time:.1f}s")
+                            import time
+                            time.sleep(wait_time)
+                        else:
+                            log.warning(f"{symbol}: Schwab {status_code} error — giving up after 3 attempts")
+                            raise
+                    else:
+                        # Don't retry other HTTP errors (400, 401, 429, etc.)
+                        raise
+            return None
+        
+        response = _fetch_with_retry()
         
         if not response or response.get("status") != "SUCCESS":
             log.debug(f"{symbol}: Schwab response status not SUCCESS: {response}")
