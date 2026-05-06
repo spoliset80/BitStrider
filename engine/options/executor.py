@@ -138,7 +138,7 @@ class OptionsExecutor:
         log.info(f"[OPTIONS][RETRY] Waiting {self._ORDER_RETRY_TIMEOUT}s before checking order {order_id} for {symbol}")
         time.sleep(self._ORDER_RETRY_TIMEOUT)
         # Check if order is still open
-        open_orders = self.client.get_orders(status="OPEN")
+        open_orders = self.client.get_orders()
         log.debug(f"[OPTIONS][RETRY] Open orders after timeout: {[getattr(o, 'id', None) for o in open_orders]}")
         order = next((o for o in open_orders if getattr(o, "id", None) == order_id), None)
         if order is None:

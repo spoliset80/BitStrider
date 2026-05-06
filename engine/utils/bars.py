@@ -16,7 +16,7 @@ import time
 from typing import Dict, Tuple
 
 # Add tenacity for retry logic
-from tenacity import retry, wait_exponential, stop_after_attempt, retry_if_exception_type
+from tenacity import retry, wait_exponential, stop_after_attempt, retry_if_exception_type, RetryError
 
 import pandas as pd
 import pytz
@@ -228,10 +228,20 @@ def _get_bars_marketdata(symbol: str, period: str, interval: str, log) -> pd.Dat
     return df
 
 
+class _NoRetryError(Exception):
+    """Raised inside _get_bars_alpaca to bypass tenacity retry on non-transient errors."""
+    pass
+
+
 @retry(wait=wait_exponential(multiplier=1, min=2, max=10), stop=stop_after_attempt(3),
-       retry=retry_if_exception_type(Exception))
+       retry=retry_if_exception_type(Exception),
+       reraise=False)
 def _get_bars_alpaca(symbol: str, period: str, interval: str, log) -> pd.DataFrame:
-    """Fetch OHLCV bars via Alpaca only, with retry."""
+    """Fetch OHLCV bars via Alpaca only, with retry.
+
+    Non-transient HTTP errors (4xx) are wrapped in _NoRetryError and raised
+    immediately without consuming retry attempts.
+    """
     client = get_data_client()
     tf     = _parse_timeframe(interval)
     days   = int(period[:-1]) if period.endswith("d") else 5
@@ -247,13 +257,21 @@ def _get_bars_alpaca(symbol: str, period: str, interval: str, log) -> pd.DataFra
 
     from engine.config import ALPACA_DATA_FEED
     feed_used = ALPACA_DATA_FEED  # "sip" for paid subscribers, "iex" for free tier
-    bars = client.get_stock_bars(StockBarsRequest(
-        symbol_or_symbols=symbol,
-        timeframe=tf,
-        start=start_iso,
-        end=end_iso,
-        feed=feed_used,
-    ))
+    try:
+        bars = client.get_stock_bars(StockBarsRequest(
+            symbol_or_symbols=symbol,
+            timeframe=tf,
+            start=start_iso,
+            end=end_iso,
+            feed=feed_used,
+        ))
+    except Exception as _api_err:
+        _msg = str(_api_err)
+        # 4xx errors are permanent for this symbol/feed combo — skip retries
+        import re as _re
+        if _re.search(r'\b4\d{2}\b', _msg):
+            raise _NoRetryError(_msg) from _api_err
+        raise
     _last_alpaca_bar_ts = time.time()
     _last_feed_used[symbol] = feed_used
     if symbol in bars:
@@ -343,6 +361,17 @@ def get_bars(symbol: str, period: str = "5d", interval: str = "15m") -> pd.DataF
             data = _get_bars_alpaca(symbol, period, interval, log)
             if not data.empty:
                 return data
+        except (_NoRetryError, RetryError) as e:
+            # Unwrap RetryError to show the actual cause, not just the future wrapper
+            _cause = getattr(e, 'last_attempt', None)
+            if _cause is not None:
+                try:
+                    _cause_exc = _cause.exception()
+                    log.warning(f"{symbol}: Alpaca fetch failed: {_cause_exc}")
+                except Exception:
+                    log.warning(f"{symbol}: Alpaca fetch failed: {e}")
+            else:
+                log.warning(f"{symbol}: Alpaca fetch failed: {e}")
         except Exception as e:
             log.warning(f"{symbol}: Alpaca fetch failed: {e}")
 
