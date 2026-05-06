@@ -168,6 +168,7 @@ class SchwabMarketDataClient:
         """
         max_retries = 3
         backoff_times = [0.5, 1.0, 2.0]
+        timeout_values = [25, 30, 35]  # Progressive timeout: 25s → 30s → 35s on retries
         
         for attempt in range(max_retries):
             try:
@@ -184,7 +185,7 @@ class SchwabMarketDataClient:
                     url,
                     headers=self.oauth.get_headers(),
                     params=params,
-                    timeout=15
+                    timeout=timeout_values[attempt]
                 )
                 
                 # 502, 503, 504 are transient — retry with backoff
@@ -226,6 +227,7 @@ class SchwabMarketDataClient:
         """
         max_retries = 3
         backoff_times = [0.5, 1.0, 2.0]  # Exponential: 0.5s, 1s, 2s
+        timeout_values = [25, 30, 35]    # Progressive timeout: 25s → 30s → 35s on retries
         
         for attempt in range(max_retries):
             try:
@@ -239,7 +241,7 @@ class SchwabMarketDataClient:
                     url,
                     headers=self.oauth.get_headers(),
                     params=params,
-                    timeout=15
+                    timeout=timeout_values[attempt]
                 )
                 
                 # 502, 503, 504 are transient — retry with backoff
