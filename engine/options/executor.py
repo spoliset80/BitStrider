@@ -1684,7 +1684,7 @@ class OptionsExecutor:
                             close_request = MarketOrderRequest(
                                 symbol=occ_sym,
                                 qty=qty_to_close,
-                                side=OrderSide.sell if pos.action == "buy_to_open" else OrderSide.buy,
+                                side=OrderSide.SELL if pos.action == "buy_to_open" else OrderSide.BUY,
                                 time_in_force=TimeInForce.day,
                             )
                             order = self.client.submit_order(close_request)
