@@ -1676,20 +1676,43 @@ class OptionsExecutor:
                     # SCALE-OUT: Close 50% of position at +50%, hold 50% with new +20% stop
                     if not pdt_block:
                         _is_short = pos.action == "sell_to_open"
-                        if _is_mleg or _is_short:
-                            # Multi-leg spreads and naked shorts: close full position at target
-                            # - Spreads require atomic leg closing (can't partial close)
-                            # - Naked shorts require BUY-to-close which needs buying power;
-                            #   partial close still requires same margin as full close
-                            reason = "multi-leg atomic" if _is_mleg else "naked short (buying power)"
+                        if _is_mleg:
+                            # Multi-leg spreads: use partial close if 2+ contracts, else close all
+                            qty_to_close = int(pos.contracts) // 2
+                            if qty_to_close < 1:
+                                # 1-spread position: close full
+                                log.info(
+                                    f"OPTIONS: {pos.symbol} single spread at +{pnl_pct:.1f}% "
+                                    f"— closing full position (can't scale out 1 spread)"
+                                )
+                                to_close.append(occ_sym)
+                                pos.tier1_closed = True
+                            else:
+                                # Scale-out: close half spreads atomically, hold rest
+                                qty_remaining = int(pos.contracts) - qty_to_close
+                                log.info(
+                                    f"OPTIONS: {pos.symbol} spread scale-out at +{pnl_pct:.1f}% "
+                                    f"— closing {qty_to_close}/{int(pos.contracts)} spreads"
+                                )
+                                self._close_option(occ_sym, all_positions=all_positions, qty=qty_to_close)
+                                pos.scaled_out_qty = qty_to_close
+                                pos.tier1_closed = True
+                                pos.tier1_scale_out_stop = entry_mark * (1 + OPTIONS_PROFIT_TARGET_1_STOP_PCT / 100)
+                                log.info(
+                                    f"OPTIONS: {pos.symbol} second half: {qty_remaining} spreads, "
+                                    f"new stop at +{OPTIONS_PROFIT_TARGET_1_STOP_PCT:.0f}%, "
+                                    f"target at +{OPTIONS_PROFIT_TARGET_2_PCT:.0f}%"
+                                )
+                        elif _is_short:
+                            # Naked SHORT: close full position at target (BUY-to-close needs margin)
                             log.info(
-                                f"OPTIONS: {pos.symbol} hit +{pnl_pct:.1f}% "
-                                f"— closing full position ({reason})"
+                                f"OPTIONS: {pos.symbol} naked short at +{pnl_pct:.1f}% "
+                                f"— closing full position (buying power constraint)"
                             )
                             to_close.append(occ_sym)
                             pos.tier1_closed = True
                         else:
-                            # Naked options: Scale out 50% at +50%
+                            # Naked LONG: scale out 50% at +50%, hold 50% with +20% stop
                             # Alpaca requires integer qty — if only 1 contract, close all
                             qty_to_close = int(pos.contracts) // 2
                             
@@ -1709,31 +1732,19 @@ class OptionsExecutor:
                                     f"— closing {qty_to_close}/{int(pos.contracts)} contracts at market"
                                 )
                                 
-                                # Close first half at market
+                                # Close first half at market via _close_option partial
                                 try:
-                                    close_request = MarketOrderRequest(
-                                        symbol=occ_sym,
-                                        qty=qty_to_close,
-                                        side=OrderSide.SELL if pos.action == "buy_to_open" else OrderSide.BUY,
-                                        time_in_force=TimeInForce.DAY,
+                                    self._close_option(occ_sym, all_positions=all_positions, qty=qty_to_close)
+                                    log.info(
+                                        f"OPTIONS: {pos.symbol} first half closed: {qty_to_close} contracts "
+                                        f"(P&L: +{pnl_pct:.1f}%)"
                                     )
-                                    order = self.client.submit_order(close_request)
-                                    if order:
-                                        proceeds = current_mark * qty_to_close
-                                        log.info(
-                                            f"OPTIONS: {pos.symbol} first half closed: {qty_to_close} contracts @ ${current_mark:.2f} "
-                                            f"= ${proceeds:.2f} (P&L: +{pnl_pct:.1f}%)"
-                                        )
                                 except Exception as e:
                                     log.warning(f"OPTIONS: {pos.symbol} scale-out close failed: {e}")
                                     continue
                                 
-                                # Update position for second half
-                                pos.contracts = qty_remaining
                                 pos.scaled_out_qty = qty_to_close
                                 pos.tier1_closed = True
-                                
-                                # Set new stop for remaining half: +20% (breakeven guard)
                                 pos.tier1_scale_out_stop = entry_mark * (1 + OPTIONS_PROFIT_TARGET_1_STOP_PCT / 100)
                                 
                                 log.info(
@@ -1821,17 +1832,23 @@ class OptionsExecutor:
         # IV conversion check (rate-limited to every 10 min, touches only open naked positions)
         self._maybe_convert_to_spread()
 
-    def _close_option(self, occ_sym: str, all_positions: Optional[dict] = None) -> None:
+    def _close_option(self, occ_sym: str, all_positions: Optional[dict] = None, qty: Optional[int] = None) -> None:
         """Close an options position by reversing all stored legs atomically.
         Works identically for single, spread, butterfly, and condor positions.
 
         For multi-leg positions uses a limit order at current_net_mid * 0.97 to avoid
         market-maker slippage on wide bid/ask spreads (AEHR/EOSE/SOUN style names).
         Falls back to market if current mark cannot be computed.
+
+        qty: if provided, close only that many contracts (partial scale-out).
+             If qty < pos.contracts, position remains tracked with reduced contracts.
         """
         pos = self._positions.get(occ_sym)
         if pos is None:
             return
+        
+        close_qty = qty if qty is not None else int(pos.contracts)
+        is_partial = close_qty < int(pos.contracts)
 
         try:
             if len(pos.legs) > 1:
@@ -1898,7 +1915,7 @@ class OptionsExecutor:
 
                 payload = {
                     "symbol": "",
-                    "qty": str(int(round(pos.contracts))),
+                    "qty": str(close_qty),
                     # "side" intentionally omitted — not required for mleg per Alpaca docs;
                     # each reversed leg carries its own side.
                     "order_class": "mleg",
@@ -1910,13 +1927,13 @@ class OptionsExecutor:
                     payload["limit_price"] = str(_close_limit_price)
                     log.info(
                         f"OPTIONS MLEG CLOSE (limit @ {_close_limit_price:+.2f}): "
-                        f"{pos.symbol} {pos.strategy} ({len(pos.legs)} legs, {pos.contracts} contract(s))"
+                        f"{pos.symbol} {pos.strategy} ({len(pos.legs)} legs, {close_qty}/{int(pos.contracts)} contract(s))"
                     )
                 else:
                     payload["type"] = "market"
                     log.info(
                         f"OPTIONS MLEG CLOSE (market fallback): {pos.symbol} {pos.strategy} "
-                        f"({len(pos.legs)} legs, {pos.contracts} contract(s))"
+                        f"({len(pos.legs)} legs, {close_qty}/{int(pos.contracts)} contract(s))"
                     )
                 self.client.post("/orders", payload)
 
@@ -1959,15 +1976,23 @@ class OptionsExecutor:
 
                 order_req = LimitOrderRequest(
                     symbol=occ_sym,
-                    qty=pos.contracts,
+                    qty=close_qty,
                     side=side,
                     limit_price=_close_limit,
                     time_in_force=TimeInForce.DAY,
                 )
-                log.info(f"OPTIONS CLOSE (limit @{_close_limit:.2f}): {side.value.upper()} {pos.contracts}x {occ_sym}")
+                log.info(f"OPTIONS CLOSE (limit @{_close_limit:.2f}): {side.value.upper()} {close_qty}x {occ_sym}")
                 self.client.submit_order(order_req)
 
-            del self._positions[occ_sym]
+            if is_partial:
+                # Partial scale-out: update remaining contracts, don't remove from tracker
+                pos.contracts = int(pos.contracts) - close_qty
+                log.info(
+                    f"OPTIONS: {pos.symbol} partial close {close_qty} contracts — "
+                    f"{pos.contracts} remaining"
+                )
+            else:
+                del self._positions[occ_sym]
 
         except Exception as e:
             if "40310100" in str(e):
