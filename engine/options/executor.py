@@ -1449,6 +1449,13 @@ class OptionsExecutor:
                 # Determine if multi-leg or single-leg
                 is_mleg = len(pos.legs) > 1
                 
+                # Get entry price early for use in P&L calculations
+                entry_price_signed = float(pos.entry_price)
+                entry_mark = abs(entry_price_signed)   # absolute entry premium per share
+                entry_cost_dollars = entry_mark * pos.contracts * CONTRACT_SIZE
+                if entry_cost_dollars < 0.01:
+                    continue
+                
                 if is_mleg:
                     # Multi-leg (spread, butterfly, condor): Use consolidated Schwab pricing
                     from engine.utils.schwab_pricing import get_spread_complete_pricing
@@ -1458,7 +1465,7 @@ class OptionsExecutor:
                     for leg in pos.legs:
                         strike = _extract_strike_from_occ_symbol(leg["occ_symbol"])
                         if strike is None:
-                            log.warning(f"[OPTIONS] Failed to extract strike from {leg['occ_symbol']} — skipping P&L update")
+                            log.warning(f"[OPTIONS] Failed to extract strike from {leg['occ_symbol']} — falling back to Alpaca")
                             pricing_legs = None
                             break
                         pricing_legs.append({
@@ -1469,35 +1476,80 @@ class OptionsExecutor:
                             "opt_type": "call" if "C" in leg["occ_symbol"] else "put"
                         })
                     
-                    if pricing_legs is None:
-                        log.warning(f"[OPTIONS] {occ_sym} - failed to parse legs, skipping P&L update")
-                        continue
+                    # Try Schwab first if legs parsed successfully
+                    pricing_data = None
+                    if pricing_legs is not None:
+                        pricing_data = get_spread_complete_pricing(
+                            pos.symbol,
+                            pricing_legs,
+                            pos.entry_price
+                        )
                     
-                    pricing_data = get_spread_complete_pricing(
-                        pos.symbol,
-                        pricing_legs,
-                        pos.entry_price
-                    )
-                    
+                    # Fallback to Alpaca snapshots if OCC parsing failed or Schwab unavailable
                     if pricing_data is None:
-                        log.warning(f"[OPTIONS] {occ_sym} - failed to get Schwab pricing, skipping P&L update")
-                        continue
-                    
-                    # Use MARK price (mid/theoretical value) for P&L
-                    current_mark = pricing_data["spread_mark"]
-                    pnl_pct = pricing_data["pnl_mark_pct"]
-                    dte_from_pricing = pricing_data["dte"]
-                    
-                    # Override DTE if Schwab has fresher data
-                    if dte_from_pricing is not None:
-                        dte = dte_from_pricing
-                    
-                    log.debug(
-                        f"[OPTIONS] {pos.symbol} {pos.strategy} (spread/mleg) "
-                        f"mark=${current_mark:.2f} bid=${pricing_data['spread_bid']:.2f} "
-                        f"ask=${pricing_data['spread_ask']:.2f} "
-                        f"pnl={pnl_pct:+.1f}% dte={dte}d"
-                    )
+                        log.debug(f"[OPTIONS] {occ_sym} - Schwab pricing unavailable, using Alpaca snapshots fallback")
+                        try:
+                            # Get snapshots for all legs
+                            leg_occ_syms = [l["occ_symbol"] for l in pos.legs]
+                            _snaps = self.data_client.get_option_snapshot(
+                                OptionSnapshotRequest(symbol_or_symbols=leg_occ_syms)
+                            )
+                            
+                            # Calculate composite spread price from legs
+                            spread_mark = 0.0
+                            spread_bid = 0.0
+                            spread_ask = 0.0
+                            
+                            for leg, leg_occ_sym in zip(pos.legs, leg_occ_syms):
+                                _s = _snaps.get(leg_occ_sym)
+                                if _s is None or _s.latest_quote is None:
+                                    raise ValueError(f"no snapshot for {leg_occ_sym}")
+                                
+                                bid = float(_s.latest_quote.bid_price)
+                                ask = float(_s.latest_quote.ask_price)
+                                mid = (bid + ask) / 2.0
+                                
+                                # Apply side: buy legs add, sell legs subtract
+                                sign = 1.0 if leg["side"].lower() == "buy" else -1.0
+                                ratio = leg.get("ratio_qty", 1)
+                                
+                                spread_bid += sign * bid * ratio
+                                spread_ask += sign * ask * ratio
+                                spread_mark += sign * mid * ratio
+                            
+                            # Clamp negative spreads to 0 (pricing error indicator)
+                            spread_bid = max(0.0, spread_bid)
+                            spread_ask = max(0.0, spread_ask)
+                            spread_mark = max(0.0, spread_mark)
+                            
+                            current_mark = spread_mark
+                            pnl_pct = (spread_mark - entry_price_signed) / abs(entry_price_signed) * 100
+                            
+                            log.debug(
+                                f"[OPTIONS] {pos.symbol} {pos.strategy} (mleg, Alpaca fallback) "
+                                f"mark=${current_mark:.2f} bid=${spread_bid:.2f} "
+                                f"ask=${spread_ask:.2f} "
+                                f"pnl={pnl_pct:+.1f}% dte={dte}d"
+                            )
+                        except Exception as e:
+                            log.warning(f"[OPTIONS] {occ_sym} - Alpaca fallback also failed: {e} — skipping P&L update")
+                            continue
+                    else:
+                        # Use Schwab pricing data
+                        current_mark = pricing_data["spread_mark"]
+                        pnl_pct = pricing_data["pnl_mark_pct"]
+                        dte_from_pricing = pricing_data["dte"]
+                        
+                        # Override DTE if Schwab has fresher data
+                        if dte_from_pricing is not None:
+                            dte = dte_from_pricing
+                        
+                        log.debug(
+                            f"[OPTIONS] {pos.symbol} {pos.strategy} (spread/mleg, Schwab) "
+                            f"mark=${current_mark:.2f} bid=${pricing_data['spread_bid']:.2f} "
+                            f"ask=${pricing_data['spread_ask']:.2f} "
+                            f"pnl={pnl_pct:+.1f}% dte={dte}d"
+                        )
                 else:
                     # Single-leg (naked call/put): Use Alpaca snapshots
                     _snaps = self.data_client.get_option_snapshot(
@@ -1516,12 +1568,6 @@ class OptionsExecutor:
                         f"mark=${current_mark:.2f}"
                     )
                 
-                entry_price_signed = float(pos.entry_price)
-                entry_mark = abs(entry_price_signed)   # absolute entry premium per share
-                entry_cost_dollars = entry_mark * pos.contracts * CONTRACT_SIZE
-                if entry_cost_dollars < 0.01:
-                    continue
-
                 # pnl_pct: positive = profitable, negative = losing.
                 # For multi-leg: already computed by get_spread_complete_pricing
                 # For single-leg: compute here
