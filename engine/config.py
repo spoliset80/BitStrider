@@ -27,7 +27,9 @@ OPTIONS_BROKER = "alpaca"                               # Only Alpaca supports o
 # ─────────────────────────────────────────────────────────────────
 OPTIONS_ENABLED             = os.getenv("OPTIONS_ENABLED", "true").lower() in ("1", "true", "yes")
 OPTIONS_ALLOCATION_PCT      = float(os.getenv("OPTIONS_ALLOCATION_PCT", "15.0"))  # % of equity for all options (override via .env)
-OPTIONS_MAX_POSITIONS       = int(os.getenv("OPTIONS_MAX_POSITIONS", "4"))        # max open options contracts
+OPTIONS_MAX_POSITIONS       = int(os.getenv("OPTIONS_MAX_POSITIONS", "4"))        # max open options positions total
+OPTIONS_MAX_MLEG_POSITIONS  = int(os.getenv("OPTIONS_MAX_MLEG_POSITIONS", "2"))   # hard limit: max open spreads/butterflies/condors
+OPTIONS_MAX_MLEG_CONTRACTS  = int(os.getenv("OPTIONS_MAX_MLEG_CONTRACTS", "2"))   # hard limit: max contracts per spread entry
 OPTIONS_DTE_MIN             = int(os.getenv("OPTIONS_DTE_MIN", "14"))             # min days-to-expiry at entry (14 avoids forced same-day close = PDT hit)
 OPTIONS_DTE_MAX             = int(os.getenv("OPTIONS_DTE_MAX", "40"))             # max days-to-expiry at entry
 OPTIONS_DELTA_TARGET        = float(os.getenv("OPTIONS_DELTA_TARGET", "0.55"))    # target delta — 0.55 = ATM/slight ITM (higher profit/point)

@@ -39,6 +39,8 @@ from engine.config import (
     OPTIONS_ENABLED,
     OPTIONS_ALLOCATION_PCT,
     OPTIONS_MAX_POSITIONS,
+    OPTIONS_MAX_MLEG_POSITIONS,
+    OPTIONS_MAX_MLEG_CONTRACTS,
     OPTIONS_PROFIT_TARGET_PCT,
     OPTIONS_PROFIT_TARGET_1_PCT,
     OPTIONS_PROFIT_TARGET_1_STOP_PCT,
@@ -955,6 +957,18 @@ class OptionsExecutor:
         is_condor = "condor" in strat
         is_spread = signal.spread_sell_strike is not None and not is_butterfly and not is_condor
         is_mleg = is_butterfly or is_spread or is_condor
+
+        # Hard limit: max 2 open mleg positions at any time
+        if is_mleg:
+            open_mleg = sum(1 for p in self._positions.values() if len(p.legs) > 1)
+            if open_mleg >= OPTIONS_MAX_MLEG_POSITIONS:
+                log.info(
+                    f"[OPTIONS] Mleg limit ({OPTIONS_MAX_MLEG_POSITIONS}) reached "
+                    f"({open_mleg} open spreads) — skipping {signal.symbol}"
+                )
+                return False
+            # Cap contracts per spread entry
+            contracts = min(contracts, OPTIONS_MAX_MLEG_CONTRACTS)
 
         cp_type = "call" if "call" in signal.option_type.lower() else "put"
 
