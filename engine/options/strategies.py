@@ -2927,6 +2927,23 @@ _STRATEGY_REGIME_ADJUSTMENTS = {
 # Strategies that work in NEUTRAL zone (theta decay, range-bound)
 _NEUTRAL_ZONE_STRATEGIES = frozenset({"IronCondor", "Butterfly", "BearPut", "CoveredCall", "MeanReversion"})
 
+# Strategy profit direction classification (determines behavior in bear markets)
+# - call_side: profits from UP moves or staying UP (need bullish/neutral markets)
+# - put_side: profits from DOWN moves or crashes (good in bearish markets)
+# - neutral: profits from stagnation/theta decay (works everywhere but highest in range-bound)
+_STRATEGY_DIRECTION = {
+    "MomentumCall": "call_side",       # BUY CALL (up moves)
+    "BearPut": "call_side",            # SELL PUT (stays up, avoids crash)
+    "BearCallSpread": "put_side",      # BUY PUT (down moves) - ONLY put-side strategy
+    "ShortSqueeze": "call_side",       # BUY CALL (momentum up)
+    "MeanReversion": "call_side",      # BUY CALL (rebounds up)
+    "BreakoutRetest": "call_side",     # BUY CALL (breakouts up)
+    "TrendPullbackSpread": "call_side",# BUY CALL SPREAD (up trend)
+    "IronCondor": "neutral",           # SELL PUT + SELL CALL (time decay)
+    "Butterfly": "neutral",            # SELL CALL SPREAD (time decay)
+    "CoveredCall": "neutral",          # SELL CALL (income/theta)
+}
+
 
 def _classify_symbol_tier(symbol: str) -> str:
     """Classify symbol into tier for allocation prioritization.
@@ -2942,15 +2959,27 @@ def _classify_symbol_tier(symbol: str) -> str:
     return "other"
 
 
+def _get_strategy_direction(strategy: str) -> str:
+    """Get strategy profit direction (call_side, put_side, or neutral).
+    
+    Used in bearish regimes to allow put-side strategies on all tiers
+    while blocking call-side strategies entirely.
+    """
+    return _STRATEGY_DIRECTION.get(strategy, "neutral")
+
+
 def _filter_signals_by_market_regime(signals: List[OptionSignal], market_regime: str, bull_strength: float) -> List[OptionSignal]:
     """Filter signals based on market regime strength, symbol tier, and strategy type.
     
     Regime Rules:
     - BULLISH (strength >= 0.80):       Allow all tiers and strategies
     - BULL_NEUTRAL (0.40-0.79):         Allow major_cap + unusual_volume; block squeeze
-    - NEUTRAL (-0.40 to 0.40):          Allow major_cap only + theta-decay strategies (IronCondor, Butterfly, BearPut, CoveredCall)
+    - NEUTRAL (-0.40 to 0.40):          Allow major_cap only + theta-decay strategies
     - BEAR_NEUTRAL (-0.79 to -0.40):    Allow major_cap only
-    - BEARISH (<= -0.80):               Allow major_cap only; prefer defensive strategies (BearPut, BearCallSpread)
+    - BEARISH (<= -0.80):               Special handling:
+        * Put-side strategies: Allow ALL tiers (BearCallSpread on squeeze valuable in crash)
+        * Neutral strategies: Allow major_cap only (theta decay, lower risk)
+        * Call-side strategies: BLOCK entirely (no upside in strong downtrend)
     
     Also applies strategy-specific confidence adjustments per regime.
     """
@@ -2989,12 +3018,28 @@ def _filter_signals_by_market_regime(signals: List[OptionSignal], market_regime:
                 block_reason = f"{tier}_blocked_in_NEUTRAL"
             else:
                 block_reason = f"{sig.strategy}_not_theta_decay_in_NEUTRAL"
-        elif market_regime in ("BEAR_NEUTRAL", "BEARISH"):
-            # Allow major caps only in weak/bearish regimes
+        elif market_regime == "BEAR_NEUTRAL":
+            # Allow major caps only in weak bear regime
             if tier == "major_cap":
                 allowed = True
             else:
                 block_reason = f"{tier}_blocked_in_{market_regime}"
+        elif market_regime == "BEARISH":
+            # Strong bearish: special direction-based filtering
+            direction = _get_strategy_direction(sig.strategy)
+            
+            if direction == "put_side":
+                # Put-side strategies: allow ALL tiers (selling puts on crashes valuable everywhere)
+                allowed = True
+            elif direction == "neutral":
+                # Theta decay: major caps only (safer in crash)
+                if tier == "major_cap":
+                    allowed = True
+                else:
+                    block_reason = f"{tier}_blocked_in_BEARISH_theta"
+            else:  # call_side
+                # Call-side blocked entirely (no upside in strong downtrend)
+                block_reason = f"call_side_blocked_in_BEARISH"
         
         if allowed:
             # Create new signal with adjusted confidence
