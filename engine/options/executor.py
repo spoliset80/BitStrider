@@ -1675,46 +1675,57 @@ class OptionsExecutor:
                 if pnl_pct >= OPTIONS_PROFIT_TARGET_1_PCT and not pos.tier1_closed:
                     # SCALE-OUT: Close 50% of position at +50%, hold 50% with new +20% stop
                     if not pdt_block:
-                        qty_to_close = max(1, pos.contracts // 2)  # Close 50% (rounded up to min 1)
-                        qty_remaining = pos.contracts - qty_to_close
-                        
-                        log.info(
-                            f"OPTIONS: {pos.symbol} scale-out triggered at +{pnl_pct:.1f}% "
-                            f"— closing {qty_to_close}/{pos.contracts} contracts at market"
-                        )
-                        
-                        # Close first half at market
-                        try:
-                            close_request = MarketOrderRequest(
-                                symbol=occ_sym,
-                                qty=qty_to_close,
-                                side=OrderSide.SELL if pos.action == "buy_to_open" else OrderSide.BUY,
-                                time_in_force=TimeInForce.DAY,
+                        if _is_mleg:
+                            # Multi-leg spreads: Close entire spread at +50% target
+                            # (Can't do partial closes due to atomic leg requirements)
+                            log.info(
+                                f"OPTIONS: {pos.symbol} {pos.strategy} spread hit +{pnl_pct:.1f}% "
+                                f"— closing entire spread (multi-leg, atomic close only)"
                             )
-                            order = self.client.submit_order(close_request)
-                            if order:
-                                proceeds = current_mark * qty_to_close
-                                log.info(
-                                    f"OPTIONS: {pos.symbol} first half closed: {qty_to_close} contracts @ ${current_mark:.2f} "
-                                    f"= ${proceeds:.2f} (P&L: +{pnl_pct:.1f}%)"
+                            to_close.append(occ_sym)
+                            pos.tier1_closed = True
+                        else:
+                            # Naked options: Scale out 50% at +50%
+                            qty_to_close = pos.contracts / 2.0  # Allow fractional
+                            qty_remaining = pos.contracts - qty_to_close
+                            
+                            log.info(
+                                f"OPTIONS: {pos.symbol} scale-out triggered at +{pnl_pct:.1f}% "
+                                f"— closing {qty_to_close}/{pos.contracts} contracts at market"
+                            )
+                            
+                            # Close first half at market
+                            try:
+                                close_request = MarketOrderRequest(
+                                    symbol=occ_sym,
+                                    qty=qty_to_close,
+                                    side=OrderSide.SELL if pos.action == "buy_to_open" else OrderSide.BUY,
+                                    time_in_force=TimeInForce.DAY,
                                 )
-                        except Exception as e:
-                            log.warning(f"OPTIONS: {pos.symbol} scale-out close failed: {e}")
-                            return
-                        
-                        # Update position for second half
-                        pos.contracts = qty_remaining
-                        pos.scaled_out_qty = qty_to_close
-                        pos.tier1_closed = True
-                        
-                        # Set new stop for remaining half: +20% (breakeven guard)
-                        pos.tier1_scale_out_stop = entry_mark * (1 + OPTIONS_PROFIT_TARGET_1_STOP_PCT / 100)
-                        
-                        log.info(
-                            f"OPTIONS: {pos.symbol} second half position: {qty_remaining} contracts, "
-                            f"new stop at +{OPTIONS_PROFIT_TARGET_1_STOP_PCT:.0f}% (${pos.tier1_scale_out_stop:.2f}), "
-                            f"target at +{OPTIONS_PROFIT_TARGET_2_PCT:.0f}%"
-                        )
+                                order = self.client.submit_order(close_request)
+                                if order:
+                                    proceeds = current_mark * qty_to_close
+                                    log.info(
+                                        f"OPTIONS: {pos.symbol} first half closed: {qty_to_close} contracts @ ${current_mark:.2f} "
+                                        f"= ${proceeds:.2f} (P&L: +{pnl_pct:.1f}%)"
+                                    )
+                            except Exception as e:
+                                log.warning(f"OPTIONS: {pos.symbol} scale-out close failed: {e}")
+                                continue
+                            
+                            # Update position for second half
+                            pos.contracts = qty_remaining
+                            pos.scaled_out_qty = qty_to_close
+                            pos.tier1_closed = True
+                            
+                            # Set new stop for remaining half: +20% (breakeven guard)
+                            pos.tier1_scale_out_stop = entry_mark * (1 + OPTIONS_PROFIT_TARGET_1_STOP_PCT / 100)
+                            
+                            log.info(
+                                f"OPTIONS: {pos.symbol} second half position: {qty_remaining} contracts, "
+                                f"new stop at +{OPTIONS_PROFIT_TARGET_1_STOP_PCT:.0f}% (${pos.tier1_scale_out_stop:.2f}), "
+                                f"target at +{OPTIONS_PROFIT_TARGET_2_PCT:.0f}%"
+                            )
 
                 elif pnl_pct >= OPTIONS_PROFIT_TARGET_2_PCT and pos.tier1_closed:
                     # Second half: close remaining at max profit target
@@ -1724,10 +1735,6 @@ class OptionsExecutor:
                             f"({pnl_pct:.1f}% >= {OPTIONS_PROFIT_TARGET_2_PCT:.0f}%) — closing remaining {pos.contracts}"
                         )
                         to_close.append(occ_sym)
-
-                elif pnl_pct >= OPTIONS_PROFIT_TARGET_1_PCT and not pos.tier1_closed:
-                    # No tier1 close yet, but hitting first threshold — wait for exact target
-                    pass
 
                 # ── Second-half stop loss (if scaled out): New stop at +20% (breakeven guard) ────
                 if pos.tier1_closed and pnl_pct <= OPTIONS_PROFIT_TARGET_1_STOP_PCT:
