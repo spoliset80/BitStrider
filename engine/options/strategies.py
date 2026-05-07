@@ -3207,11 +3207,11 @@ def scan_options_universe(
         except Exception:
             pass
 
-    # Up to 24 workers: all three fetch types (bars, OI, chain) are network I/O
-    # bound and use separate HTTP clients, so they don't contend on a single pool.
-    # 24 workers gives ~5-round ceil(122/24) versus the old ~11-round ceil(122/12),
-    # roughly halving wall-clock prefetch time for a 120-ticker universe.
-    _PREFETCH_WORKERS = min(24, _n_total)
+    # Workers for parallel prefetch (bars, OI, chain fetches)
+    # Reduced from 24 to 8 to avoid overwhelming Schwab API when they're rate limiting or have issues.
+    # Schwab returns 502/503 under concurrent load; lower concurrency improves stability.
+    # 8 workers with 3x backoff retry in schwab_client gives us graceful degradation vs hammering them.
+    _PREFETCH_WORKERS = min(8, _n_total)
     with concurrent.futures.ThreadPoolExecutor(max_workers=_PREFETCH_WORKERS) as pool:
         list(pool.map(_prefetch, ti_universe))
     log.info(f"Options scan: prefetch complete — starting strategy evaluation")
