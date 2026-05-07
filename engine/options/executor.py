@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 import json
 import re
 from alpaca.trading.client import TradingClient
+from alpaca.data.historical.option import OptionHistoricalDataClient
 from alpaca.trading.requests import (
     LimitOrderRequest,
     MarketOrderRequest,
@@ -322,6 +323,7 @@ class OptionsExecutor:
 
     def __init__(self, client: TradingClient):
         self.client = client
+        self.data_client = OptionHistoricalDataClient(API_KEY, API_SECRET)
         self._positions: Dict[str, OptionsPosition] = {}   # occ_symbol -> OptionsPosition
         self._last_monitor_ts: float = 0.0
         self._MONITOR_INTERVAL = 20   # seconds between P&L checks (fast enough to catch intraday moves)
@@ -1490,8 +1492,9 @@ class OptionsExecutor:
                         try:
                             # Get snapshots for all legs
                             leg_occ_syms = [l["occ_symbol"] for l in pos.legs]
-                            _snaps = self.client.get_option_snapshot(
-                                symbol_or_symbols=leg_occ_syms
+                            from alpaca.data.requests import OptionSnapshotRequest
+                            _snaps = self.data_client.get_option_snapshot(
+                                OptionSnapshotRequest(symbol_or_symbols=leg_occ_syms)
                             )
                             
                             # Calculate composite spread price from legs
@@ -1551,8 +1554,9 @@ class OptionsExecutor:
                         )
                 else:
                     # Single-leg (naked call/put): Use Alpaca snapshots
-                    _snaps = self.client.get_option_snapshot(
-                        symbol_or_symbols=[pos.legs[0]["occ_symbol"]]
+                    from alpaca.data.requests import OptionSnapshotRequest
+                    _snaps = self.data_client.get_option_snapshot(
+                        OptionSnapshotRequest(symbol_or_symbols=[pos.legs[0]["occ_symbol"]])
                     )
                     _s = _snaps.get(pos.legs[0]["occ_symbol"])
                     if _s is None or _s.latest_quote is None:
