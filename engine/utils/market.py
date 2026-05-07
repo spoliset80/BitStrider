@@ -332,6 +332,36 @@ def is_bull_regime() -> bool:
 _is_bull_regime = is_bull_regime
 
 
+def get_bull_strength() -> float:
+    """Return bull regime strength as a 0-1 scalar based on SPY's distance from 200-SMA.
+    
+    0.0 = SPY at or below 200-SMA (bear regime)
+    0.5 = SPY ~1-2% above 200-SMA (weak bull)
+    1.0 = SPY >=5% above 200-SMA (strong bull conviction)
+    
+    Used to boost long call confidence during strong bull markets and reduce spread/condor
+    confidence when directional conviction is high.
+    """
+    try:
+        from engine.utils.bars import get_bars
+        spy = get_bars("SPY", "250d", "1d")
+        if spy.empty or len(spy) < 200:
+            return 0.5  # neutral default on data failure
+        
+        sma200 = float(spy["close"].rolling(200).mean().iloc[-1])
+        price  = float(spy["close"].iloc[-1])
+        
+        if price <= sma200:
+            return 0.0  # bear regime
+        
+        # Percentage above 200-SMA: scale 1% → 0.2, 5%+ → 1.0
+        pct_above = (price - sma200) / sma200 * 100
+        strength = min(1.0, pct_above / 5.0)  # 5% above = max strength
+        return round(strength, 2)
+    except Exception:
+        return 0.5  # neutral default on error
+
+
 # ── Inverse ETF universe ──────────────────────────────────────────────────────
 # ETFs that profit from market declines — treated as LONG buys in bear regime.
 INVERSE_ETFS: frozenset = frozenset({

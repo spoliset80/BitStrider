@@ -58,7 +58,7 @@ from engine.config import (
     get_options_universe,
 )
 import os
-from engine.utils.market import _INVERSE_ETFS, _is_bull_regime
+from engine.utils.market import _INVERSE_ETFS, _is_bull_regime, get_bull_strength
 from engine.utils.bars import calculate_atr as _calc_atr14
 
 _market_state: Optional[MarketState] = None
@@ -1341,6 +1341,15 @@ class MomentumCallStrategy:
             if ctx.spot > prior_5d_high:
                 conf += 0.03   # genuine breakout bonus
 
+            # Bull regime strength bonus (+0.05 max when SPY >=5% above 200-SMA)
+            # Encourages naked calls during strong bull conviction
+            try:
+                bull_strength = get_bull_strength()
+                conf += min(0.05, bull_strength * 0.05)  # 0.0 = 0%, 1.0 = +5%
+                log.debug(f"[BullRegime] {symbol} strength={bull_strength:.2f} conf_adj=+{min(0.05, bull_strength * 0.05):.3f}")
+            except Exception:
+                pass
+
             # SA v2 metrics-grades momentum boost (up to +0.05)
             try:
                 from engine.data.seeking_alpha import get_sa_metrics_grades
@@ -2383,6 +2392,17 @@ class IronCondorStrategy:
             conf += min(0.07, (chain.iv_rank - 50) * 0.002)   # IVR 50→85 adds 0→0.07
             conf += min(0.06, (credit_ratio - 0.20) * 0.3)    # credit ratio 20%→40% adds 0→0.06
             conf += 0.05  # NEW: Defined-risk spread bonus
+            
+            # Bull strength penalty: reduce condor confidence in strong bull markets
+            # (condors profit from neutral/choppy range-bound price action, not strong trends)
+            try:
+                bull_strength = get_bull_strength()
+                if bull_strength >= 0.6:  # SPY >=3% above 200-SMA
+                    conf -= min(0.08, bull_strength * 0.10)  # up to -8% penalty in strong bull
+                    log.debug(f"[BullRegime] {symbol} IronCondor penalized: strength={bull_strength:.2f} conf_adj=-{min(0.08, bull_strength * 0.10):.3f}")
+            except Exception:
+                pass
+            
             confidence = round(min(0.94, conf), 3)  # Raised max from 0.93
 
             return OptionSignal(
@@ -2750,6 +2770,17 @@ class TrendPullbackSpreadStrategy:
             conf += min(0.04, (f["IV_RANK_CALL_MAX"] - chain.iv_rank) * 0.001)
             conf += min(0.05, spread_rr * 0.02)
             conf += 0.05  # Defined-risk spread bonus
+            
+            # Bull strength penalty: reduce spread confidence in very strong bull markets
+            # (spreads cap profit; naked calls are better when directional conviction is high)
+            try:
+                bull_strength = get_bull_strength()
+                if bull_strength >= 0.8:  # SPY >=4% above 200-SMA = strong bull
+                    conf -= min(0.06, bull_strength * 0.075)  # up to -6% penalty
+                    log.debug(f"[BullRegime] {symbol} TrendPullbackSpread penalized: strength={bull_strength:.2f} conf_adj=-{min(0.06, bull_strength * 0.075):.3f}")
+            except Exception:
+                pass
+            
             confidence = round(min(0.95, conf), 3)
 
             return OptionSignal(
