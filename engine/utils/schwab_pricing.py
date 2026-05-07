@@ -58,6 +58,16 @@ def get_spread_complete_pricing(
             ratio = leg.get("ratio_qty", 1)
             strike = leg.get("strike")
             
+            # Fallback: extract strike from OCC symbol if not provided
+            if strike is None:
+                import re
+                try:
+                    m = re.match(r"^([A-Z]+)(\d{6})([CP])(\d{8})$", occ_sym)
+                    if m:
+                        strike = int(m.group(4)) / 1000.0
+                except Exception:
+                    pass
+            
             if strike is None:
                 log.warning(f"[SCHWAB] No strike price in leg for {occ_sym}")
                 return None
@@ -216,6 +226,16 @@ def get_spread_mark_from_schwab(
             side = leg["side"]  # "buy" or "sell"
             ratio = leg.get("ratio_qty", 1)
             strike = leg.get("strike")
+            
+            # Fallback: extract strike from OCC symbol if not provided
+            if strike is None:
+                import re
+                try:
+                    m = re.match(r"^([A-Z]+)(\d{6})([CP])(\d{8})$", occ_sym)
+                    if m:
+                        strike = int(m.group(4)) / 1000.0
+                except Exception:
+                    pass
             
             if strike is None:
                 log.warning(f"[SCHWAB] No strike price in leg for {occ_sym}")

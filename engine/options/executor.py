@@ -95,6 +95,24 @@ def _alpaca_option_symbol(symbol: str, expiry: datetime.date, option_type: str, 
     return f"{symbol}{exp_str}{cp}{strike_int:08d}"
 
 
+def _extract_strike_from_occ_symbol(occ_symbol: str) -> Optional[float]:
+    """Extract strike price from OCC option symbol.
+    
+    OCC format: <Ticker><YYMMDD><C|P><8-digit-strike>
+    Example: BAC260515P00049000 → 49.00
+    
+    Returns: strike price, or None if parsing fails
+    """
+    try:
+        m = re.match(r"^([A-Z]+)(\d{6})([CP])(\d{8})$", occ_symbol)
+        if m:
+            strike_str = m.group(4)
+            return int(strike_str) / 1000.0
+    except Exception:
+        pass
+    return None
+
+
 def calculate_position_size_pct(
     confidence: float,
     rr_ratio: float,
@@ -1435,9 +1453,29 @@ class OptionsExecutor:
                     # Multi-leg (spread, butterfly, condor): Use consolidated Schwab pricing
                     from engine.utils.schwab_pricing import get_spread_complete_pricing
                     
+                    # Extract strikes from OCC symbols for Schwab pricing call
+                    pricing_legs = []
+                    for leg in pos.legs:
+                        strike = _extract_strike_from_occ_symbol(leg["occ_symbol"])
+                        if strike is None:
+                            log.warning(f"[OPTIONS] Failed to extract strike from {leg['occ_symbol']} — skipping P&L update")
+                            pricing_legs = None
+                            break
+                        pricing_legs.append({
+                            "occ_symbol": leg["occ_symbol"],
+                            "side": leg["side"],
+                            "ratio_qty": leg.get("ratio_qty", 1),
+                            "strike": strike,
+                            "opt_type": "call" if "C" in leg["occ_symbol"] else "put"
+                        })
+                    
+                    if pricing_legs is None:
+                        log.warning(f"[OPTIONS] {occ_sym} - failed to parse legs, skipping P&L update")
+                        continue
+                    
                     pricing_data = get_spread_complete_pricing(
                         pos.symbol,
-                        pos.legs,
+                        pricing_legs,
                         pos.entry_price
                     )
                     
