@@ -1675,12 +1675,16 @@ class OptionsExecutor:
                 if pnl_pct >= OPTIONS_PROFIT_TARGET_1_PCT and not pos.tier1_closed:
                     # SCALE-OUT: Close 50% of position at +50%, hold 50% with new +20% stop
                     if not pdt_block:
-                        if _is_mleg:
-                            # Multi-leg spreads: Close entire spread at +50% target
-                            # (Can't do partial closes due to atomic leg requirements)
+                        _is_short = pos.action == "sell_to_open"
+                        if _is_mleg or _is_short:
+                            # Multi-leg spreads and naked shorts: close full position at target
+                            # - Spreads require atomic leg closing (can't partial close)
+                            # - Naked shorts require BUY-to-close which needs buying power;
+                            #   partial close still requires same margin as full close
+                            reason = "multi-leg atomic" if _is_mleg else "naked short (buying power)"
                             log.info(
-                                f"OPTIONS: {pos.symbol} {pos.strategy} spread hit +{pnl_pct:.1f}% "
-                                f"— closing entire spread (multi-leg, atomic close only)"
+                                f"OPTIONS: {pos.symbol} hit +{pnl_pct:.1f}% "
+                                f"— closing full position ({reason})"
                             )
                             to_close.append(occ_sym)
                             pos.tier1_closed = True
