@@ -1685,7 +1685,7 @@ class OptionsExecutor:
                                 symbol=occ_sym,
                                 qty=qty_to_close,
                                 side=OrderSide.SELL if pos.action == "buy_to_open" else OrderSide.BUY,
-                                time_in_force=TimeInForce.day,
+                                time_in_force=TimeInForce.DAY,
                             )
                             order = self.client.submit_order(close_request)
                             if order:
