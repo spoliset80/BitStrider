@@ -333,33 +333,62 @@ _is_bull_regime = is_bull_regime
 
 
 def get_bull_strength() -> float:
-    """Return bull regime strength as a 0-1 scalar based on SPY's distance from 200-SMA.
+    """Return market strength on scale -1.0 (bearish) to +1.0 (bullish) based on SPY vs 200-SMA.
     
-    0.0 = SPY at or below 200-SMA (bear regime)
-    0.5 = SPY ~1-2% above 200-SMA (weak bull)
-    1.0 = SPY >=5% above 200-SMA (strong bull conviction)
+    -1.0 = SPY >=5% below 200-SMA (strong bearish conviction)
+    -0.5 = SPY ~1-2% below 200-SMA (weak bearish)
+     0.0 = SPY at or near 200-SMA (neutral/uncertain)
+    +0.5 = SPY ~1-2% above 200-SMA (weak bullish)
+    +1.0 = SPY >=5% above 200-SMA (strong bullish conviction)
     
-    Used to boost long call confidence during strong bull markets and reduce spread/condor
-    confidence when directional conviction is high.
+    Used to adjust strategy confidence and tier filtering across all market regimes.
     """
     try:
         from engine.utils.bars import get_bars
         spy = get_bars("SPY", "250d", "1d")
         if spy.empty or len(spy) < 200:
-            return 0.5  # neutral default on data failure
+            return 0.0  # neutral default on data failure
         
         sma200 = float(spy["close"].rolling(200).mean().iloc[-1])
         price  = float(spy["close"].iloc[-1])
         
-        if price <= sma200:
-            return 0.0  # bear regime
+        # Percentage difference from 200-SMA (positive = above, negative = below)
+        pct_diff = (price - sma200) / sma200 * 100
         
-        # Percentage above 200-SMA: scale 1% → 0.2, 5%+ → 1.0
-        pct_above = (price - sma200) / sma200 * 100
-        strength = min(1.0, pct_above / 5.0)  # 5% above = max strength
+        # Scale: ±5% = ±1.0, ±2.5% = ±0.5, 0% = 0.0
+        if pct_diff >= 0:
+            strength = min(1.0, pct_diff / 5.0)  # bullish
+        else:
+            strength = max(-1.0, pct_diff / 5.0)  # bearish
+        
         return round(strength, 2)
     except Exception:
-        return 0.5  # neutral default on error
+        return 0.0  # neutral default on error
+
+
+def get_market_regime() -> str:
+    """Classify market regime into 5 categories based on bull_strength.
+    
+    BULLISH:       strength >= 0.80  (SPY +4% to +10% above 200-SMA)
+    BULL_NEUTRAL:  0.40 <= strength < 0.80  (SPY +1% to +4% above 200-SMA)
+    NEUTRAL:       -0.40 < strength < 0.40  (SPY ±2% around 200-SMA, uncertain)
+    BEAR_NEUTRAL:  -0.80 < strength <= -0.40  (SPY -1% to -4% below 200-SMA)
+    BEARISH:       strength <= -0.80  (SPY -4% to -10% below 200-SMA)
+    
+    Returns regime string to use for strategy filtering and confidence adjustment.
+    """
+    strength = get_bull_strength()
+    
+    if strength >= 0.80:
+        return "BULLISH"
+    elif strength >= 0.40:
+        return "BULL_NEUTRAL"
+    elif strength > -0.40:
+        return "NEUTRAL"
+    elif strength > -0.80:
+        return "BEAR_NEUTRAL"
+    else:
+        return "BEARISH"
 
 
 # ── Inverse ETF universe ──────────────────────────────────────────────────────

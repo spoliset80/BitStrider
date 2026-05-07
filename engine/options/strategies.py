@@ -58,7 +58,7 @@ from engine.config import (
     get_options_universe,
 )
 import os
-from engine.utils.market import _INVERSE_ETFS, _is_bull_regime, get_bull_strength
+from engine.utils.market import _INVERSE_ETFS, _is_bull_regime, get_bull_strength, get_market_regime
 from engine.utils.bars import calculate_atr as _calc_atr14
 
 _market_state: Optional[MarketState] = None
@@ -1348,14 +1348,8 @@ class MomentumCallStrategy:
             if ctx.spot > prior_5d_high:
                 conf += 0.03   # genuine breakout bonus
 
-            # Bull regime strength bonus (+0.05 max when SPY >=5% above 200-SMA)
-            # Encourages naked calls during strong bull conviction
-            try:
-                bull_strength = get_bull_strength()
-                conf += min(0.05, bull_strength * 0.05)  # 0.0 = 0%, 1.0 = +5%
-                log.debug(f"[BullRegime] {symbol} strength={bull_strength:.2f} conf_adj=+{min(0.05, bull_strength * 0.05):.3f}")
-            except Exception:
-                pass
+            # Note: Bull regime strength adjustments now applied uniformly at scan-level
+            # via _filter_signals_by_market_regime() to ensure consistency across all strategies
 
             # SA v2 metrics-grades momentum boost (up to +0.05)
             try:
@@ -2400,15 +2394,8 @@ class IronCondorStrategy:
             conf += min(0.06, (credit_ratio - 0.20) * 0.3)    # credit ratio 20%→40% adds 0→0.06
             conf += 0.05  # NEW: Defined-risk spread bonus
             
-            # Bull strength penalty: reduce condor confidence in strong bull markets
-            # (condors profit from neutral/choppy range-bound price action, not strong trends)
-            try:
-                bull_strength = get_bull_strength()
-                if bull_strength >= 0.6:  # SPY >=3% above 200-SMA
-                    conf -= min(0.08, bull_strength * 0.10)  # up to -8% penalty in strong bull
-                    log.debug(f"[BullRegime] {symbol} IronCondor penalized: strength={bull_strength:.2f} conf_adj=-{min(0.08, bull_strength * 0.10):.3f}")
-            except Exception:
-                pass
+            # Note: Bull regime strength adjustments now applied uniformly at scan-level
+            # via _filter_signals_by_market_regime() to ensure consistency across all strategies
             
             confidence = round(min(0.94, conf), 3)  # Raised max from 0.93
 
@@ -2778,15 +2765,8 @@ class TrendPullbackSpreadStrategy:
             conf += min(0.05, spread_rr * 0.02)
             conf += 0.05  # Defined-risk spread bonus
             
-            # Bull strength penalty: reduce spread confidence in very strong bull markets
-            # (spreads cap profit; naked calls are better when directional conviction is high)
-            try:
-                bull_strength = get_bull_strength()
-                if bull_strength >= 0.8:  # SPY >=4% above 200-SMA = strong bull
-                    conf -= min(0.06, bull_strength * 0.075)  # up to -6% penalty
-                    log.debug(f"[BullRegime] {symbol} TrendPullbackSpread penalized: strength={bull_strength:.2f} conf_adj=-{min(0.06, bull_strength * 0.075):.3f}")
-            except Exception:
-                pass
+            # Note: Bull regime strength adjustments now applied uniformly at scan-level
+            # via _filter_signals_by_market_regime() to ensure consistency across all strategies
             
             confidence = round(min(0.95, conf), 3)
 
@@ -2929,6 +2909,25 @@ class MeanReversionCallStrategy:
 
 # ── Signal Filtering & Allocation ───────────────────────────────────────────
 
+# Strategy confidence adjustments by market regime
+# Format: strategy_name -> {regime_name -> confidence_delta}
+_STRATEGY_REGIME_ADJUSTMENTS = {
+    "MomentumCall": {"BULLISH": +0.10, "BULL_NEUTRAL": +0.05, "NEUTRAL": -0.05, "BEAR_NEUTRAL": -0.10, "BEARISH": -0.15},
+    "BearPut": {"BULLISH": -0.10, "BULL_NEUTRAL": -0.05, "NEUTRAL": +0.05, "BEAR_NEUTRAL": +0.10, "BEARISH": +0.15},
+    "BearCallSpread": {"BULLISH": -0.08, "BULL_NEUTRAL": -0.03, "NEUTRAL": -0.15, "BEAR_NEUTRAL": +0.08, "BEARISH": +0.12},
+    "ShortSqueeze": {"BULLISH": +0.08, "BULL_NEUTRAL": +0.03, "NEUTRAL": -0.20, "BEAR_NEUTRAL": -0.08, "BEARISH": -0.12},
+    "MeanReversion": {"BULLISH": +0.03, "BULL_NEUTRAL": +0.02, "NEUTRAL": +0.03, "BEAR_NEUTRAL": +0.05, "BEARISH": +0.08},
+    "BreakoutRetest": {"BULLISH": +0.05, "BULL_NEUTRAL": +0.02, "NEUTRAL": -0.10, "BEAR_NEUTRAL": -0.08, "BEARISH": -0.10},
+    "TrendPullbackSpread": {"BULLISH": -0.06, "BULL_NEUTRAL": -0.02, "NEUTRAL": -0.20, "BEAR_NEUTRAL": +0.05, "BEARISH": +0.10},
+    "IronCondor": {"BULLISH": -0.08, "BULL_NEUTRAL": -0.03, "NEUTRAL": +0.00, "BEAR_NEUTRAL": +0.08, "BEARISH": +0.12},
+    "Butterfly": {"BULLISH": -0.05, "BULL_NEUTRAL": -0.02, "NEUTRAL": +0.00, "BEAR_NEUTRAL": +0.05, "BEARISH": +0.08},
+    "CoveredCall": {"BULLISH": +0.02, "BULL_NEUTRAL": +0.01, "NEUTRAL": +0.03, "BEAR_NEUTRAL": +0.02, "BEARISH": +0.01},
+}
+
+# Strategies that work in NEUTRAL zone (theta decay, range-bound)
+_NEUTRAL_ZONE_STRATEGIES = frozenset({"IronCondor", "Butterfly", "BearPut", "CoveredCall", "MeanReversion"})
+
+
 def _classify_symbol_tier(symbol: str) -> str:
     """Classify symbol into tier for allocation prioritization.
     
@@ -2943,35 +2942,78 @@ def _classify_symbol_tier(symbol: str) -> str:
     return "other"
 
 
-def _filter_signals_by_bull_strength(signals: List[OptionSignal], bull_strength: float) -> List[OptionSignal]:
-    """Filter signals based on bull regime strength and symbol tier.
+def _filter_signals_by_market_regime(signals: List[OptionSignal], market_regime: str, bull_strength: float) -> List[OptionSignal]:
+    """Filter signals based on market regime strength, symbol tier, and strategy type.
     
-    Strong bull (>=0.8): Allow all tiers
-    Moderate bull (0.4-0.8): Exclude squeeze candidates
-    Weak/neutral (<0.4): Exclude squeeze + unusual volume, keep major caps only
+    Regime Rules:
+    - BULLISH (strength >= 0.80):       Allow all tiers and strategies
+    - BULL_NEUTRAL (0.40-0.79):         Allow major_cap + unusual_volume; block squeeze
+    - NEUTRAL (-0.40 to 0.40):          Allow major_cap only + theta-decay strategies (IronCondor, Butterfly, BearPut, CoveredCall)
+    - BEAR_NEUTRAL (-0.79 to -0.40):    Allow major_cap only
+    - BEARISH (<= -0.80):               Allow major_cap only; prefer defensive strategies (BearPut, BearCallSpread)
     
-    Returns: Filtered signal list
+    Also applies strategy-specific confidence adjustments per regime.
     """
-    if bull_strength >= 0.8:
-        return signals  # All tiers allowed in strong bull
-    
     filtered = []
+    removed_reasons = []
+    
     for sig in signals:
         tier = _classify_symbol_tier(sig.symbol)
-        if bull_strength >= 0.4:
-            # Moderate bull: allow major caps + unusual volume, skip squeeze
-            if tier != "squeeze":
-                filtered.append(sig)
-        else:
-            # Weak/neutral: major caps only
+        
+        # Apply confidence adjustment for regime
+        adjustment = _STRATEGY_REGIME_ADJUSTMENTS.get(sig.strategy, {}).get(market_regime, 0.0)
+        adjusted_confidence = sig.confidence + adjustment
+        
+        # Skip if adjustment pushes below threshold
+        if adjusted_confidence < OPTIONS_MIN_SIGNAL_CONFIDENCE:
+            removed_reasons.append(f"{sig.symbol}({sig.strategy},conf={sig.confidence:.2f} -> {adjusted_confidence:.2f} BELOW_THRESHOLD)")
+            continue
+        
+        # Tier filtering by regime
+        allowed = False
+        block_reason = None
+        
+        if market_regime == "BULLISH":
+            allowed = True  # All tiers in strong bull
+        elif market_regime == "BULL_NEUTRAL":
+            # Allow major caps + unusual volume; block squeeze
+            if tier in ("major_cap", "unusual_volume"):
+                allowed = True
+            else:
+                block_reason = f"squeeze_blocked_in_{market_regime}"
+        elif market_regime == "NEUTRAL":
+            # Allow major caps only, but only if strategy is theta-decay
+            if tier == "major_cap" and sig.strategy in _NEUTRAL_ZONE_STRATEGIES:
+                allowed = True
+            elif tier != "major_cap":
+                block_reason = f"{tier}_blocked_in_NEUTRAL"
+            else:
+                block_reason = f"{sig.strategy}_not_theta_decay_in_NEUTRAL"
+        elif market_regime in ("BEAR_NEUTRAL", "BEARISH"):
+            # Allow major caps only in weak/bearish regimes
             if tier == "major_cap":
-                filtered.append(sig)
+                allowed = True
+            else:
+                block_reason = f"{tier}_blocked_in_{market_regime}"
+        
+        if allowed:
+            # Create new signal with adjusted confidence
+            sig_dict = sig.__dict__.copy()
+            sig_dict['confidence'] = min(1.0, adjusted_confidence)
+            adjusted_sig = OptionSignal(**sig_dict)
+            filtered.append(adjusted_sig)
+        else:
+            removed_reasons.append(f"{sig.symbol}({sig.strategy}, {block_reason})")
     
+    # Log filtering summary
     if len(filtered) < len(signals):
-        skipped = [s.symbol for s in signals if s not in filtered]
-        tiers = [_classify_symbol_tier(s) for s in skipped]
-        tier_str = ", ".join([f"{s}({t})" for s, t in zip(skipped, tiers)])
-        log.info(f"Options scan: {len(signals)-len(filtered)} signal(s) filtered by bull strength {bull_strength:.2f}: {tier_str}")
+        summary = "; ".join(removed_reasons[:5])  # first 5 removals
+        if len(removed_reasons) > 5:
+            summary += f" ... and {len(removed_reasons)-5} more"
+        log.info(
+            f"Options scan: {len(signals)-len(filtered)} signal(s) filtered by market regime {market_regime} "
+            f"(strength={bull_strength:.2f}): {summary}"
+        )
     
     return filtered
 
@@ -3136,9 +3178,10 @@ def scan_options_universe(
 
     signals.sort(key=_score, reverse=True)
     
-    # Apply bull strength filtering to prevent over-concentration in weak bull
+    # Apply market regime filtering and confidence adjustments
     bull_strength = get_bull_strength()
-    signals = _filter_signals_by_bull_strength(signals, bull_strength)
+    market_regime = get_market_regime()
+    signals = _filter_signals_by_market_regime(signals, market_regime, bull_strength)
     
     strategy_names = [s.strategy for s in signals]
     if not signals:
