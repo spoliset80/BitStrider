@@ -63,6 +63,13 @@ from engine.utils.bars import calculate_atr as _calc_atr14
 
 _market_state: Optional[MarketState] = None
 
+# Symbol tier classification for allocation prioritization
+_MAJOR_CAPS = frozenset({"SPY", "QQQ", "AAPL", "MSFT", "NVDA", "GOOGL", "AMZN", "TSLA", "META", "NFLX", "PYPL", "SQ"})
+_SQUEEZE_CANDIDATES = frozenset({
+    "TASK", "CYPH", "AKBA", "HYLN", "LFVN", "LFMD", "UUUU", "AOSL", "AMWL", "ADPT",
+    "BBD", "MNKD", "FRPT", "CRTO", "GDYN", "CTRA", "KSTR", "MNTN",
+})
+
 _MDA_API_KEY: Optional[str] = os.environ.get("MARKETDATA_API_KEY") or None
 _MDA_AVAILABLE: bool = bool(_MDA_API_KEY)
 _OPTIONS_UNIVERSE_CACHE_TS: datetime.datetime = datetime.datetime.min.replace(tzinfo=datetime.timezone.utc)
@@ -2920,6 +2927,55 @@ class MeanReversionCallStrategy:
 
 # -- Scanner Entry Point -------------------------------------------------------
 
+# ── Signal Filtering & Allocation ───────────────────────────────────────────
+
+def _classify_symbol_tier(symbol: str) -> str:
+    """Classify symbol into tier for allocation prioritization.
+    
+    Returns: 'major_cap', 'squeeze', 'unusual_volume', or 'other'
+    """
+    if symbol in _MAJOR_CAPS:
+        return "major_cap"
+    if symbol in _SQUEEZE_CANDIDATES:
+        return "squeeze"
+    if symbol in _get_options_universe():
+        return "unusual_volume"
+    return "other"
+
+
+def _filter_signals_by_bull_strength(signals: List[OptionSignal], bull_strength: float) -> List[OptionSignal]:
+    """Filter signals based on bull regime strength and symbol tier.
+    
+    Strong bull (>=0.8): Allow all tiers
+    Moderate bull (0.4-0.8): Exclude squeeze candidates
+    Weak/neutral (<0.4): Exclude squeeze + unusual volume, keep major caps only
+    
+    Returns: Filtered signal list
+    """
+    if bull_strength >= 0.8:
+        return signals  # All tiers allowed in strong bull
+    
+    filtered = []
+    for sig in signals:
+        tier = _classify_symbol_tier(sig.symbol)
+        if bull_strength >= 0.4:
+            # Moderate bull: allow major caps + unusual volume, skip squeeze
+            if tier != "squeeze":
+                filtered.append(sig)
+        else:
+            # Weak/neutral: major caps only
+            if tier == "major_cap":
+                filtered.append(sig)
+    
+    if len(filtered) < len(signals):
+        skipped = [s.symbol for s in signals if s not in filtered]
+        tiers = [_classify_symbol_tier(s) for s in skipped]
+        tier_str = ", ".join([f"{s}({t})" for s, t in zip(skipped, tiers)])
+        log.info(f"Options scan: {len(signals)-len(filtered)} signal(s) filtered by bull strength {bull_strength:.2f}: {tier_str}")
+    
+    return filtered
+
+
 def scan_options_universe(
     held_positions: Dict[str, int],
     existing_option_symbols: set,
@@ -3079,6 +3135,11 @@ def scan_options_universe(
         return s.confidence * min(s.rr_ratio if s.rr_ratio > 0 else 1.0, 3.0)
 
     signals.sort(key=_score, reverse=True)
+    
+    # Apply bull strength filtering to prevent over-concentration in weak bull
+    bull_strength = get_bull_strength()
+    signals = _filter_signals_by_bull_strength(signals, bull_strength)
+    
     strategy_names = [s.strategy for s in signals]
     if not signals:
         summary = ", ".join(
