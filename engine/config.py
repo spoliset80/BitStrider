@@ -41,11 +41,12 @@ OPTIONS_MIN_IV_PCT          = float(os.getenv("OPTIONS_MIN_IV_PCT", "15.0"))    
 # *** SPREADS: Use strategy-specific SL (profit target + underlying movement + DTE)
 # *** NAKED: Use -35% debit SL (percentage-based) — for long calls/puts without caps
 # Grace period extended to 3 days — options need time to settle after entry.
-# Confidence-tiered profit targets — high-confidence setups hold longer for max gain.
+# Scale-out strategy: Close 50% at first target, hold 50% with tighter stop for max profit.
 OPTIONS_STOP_LOSS_PCT       = float(os.getenv("OPTIONS_STOP_LOSS_PCT", "35.0"))      # -35% loss for NAKED options (NOT spreads)
-OPTIONS_PROFIT_TARGET_1_PCT = float(os.getenv("OPTIONS_PROFIT_TARGET_1_PCT", "20.0"))  # close 50% of position at +20% (early lock-in)
-OPTIONS_PROFIT_TARGET_2_PCT = float(os.getenv("OPTIONS_PROFIT_TARGET_2_PCT", "50.0"))  # close remaining 50% at +50% (ride the move)
-OPTIONS_PROFIT_TARGET_PCT   = OPTIONS_PROFIT_TARGET_2_PCT  # Backward compatibility alias
+OPTIONS_PROFIT_TARGET_1_PCT = float(os.getenv("OPTIONS_PROFIT_TARGET_1_PCT", "50.0"))  # close 50% of position at +50% (lock solid profit)
+OPTIONS_PROFIT_TARGET_1_STOP_PCT = float(os.getenv("OPTIONS_PROFIT_TARGET_1_STOP_PCT", "20.0"))  # new stop for 2nd half at +20% (breakeven guard)
+OPTIONS_PROFIT_TARGET_2_PCT = float(os.getenv("OPTIONS_PROFIT_TARGET_2_PCT", "100.0"))  # close remaining 50% at +100% or max profit
+OPTIONS_PROFIT_TARGET_PCT   = OPTIONS_PROFIT_TARGET_1_PCT  # Backward compatibility alias
 OPTIONS_ENTRY_GRACE_DAYS    = int(os.getenv("OPTIONS_ENTRY_GRACE_DAYS", "3"))        # extended from 2 to 3 days for better settling
 OPTIONS_THETA_EXIT_DTE      = int(os.getenv("OPTIONS_THETA_EXIT_DTE", "4"))           # exit by DTE ≤ 4 (was 2) — avoid theta acceleration spike
 OPTIONS_COVERED_CALL_DELTA  = float(os.getenv("OPTIONS_COVERED_CALL_DELTA", "0.25")) # sell OTM calls ~0.25 delta

@@ -42,6 +42,7 @@ from engine.config import (
     OPTIONS_MAX_POSITIONS,
     OPTIONS_PROFIT_TARGET_PCT,
     OPTIONS_PROFIT_TARGET_1_PCT,
+    OPTIONS_PROFIT_TARGET_1_STOP_PCT,
     OPTIONS_PROFIT_TARGET_2_PCT,
     OPTIONS_STOP_LOSS_PCT,
     OPTIONS_DTE_MIN,
@@ -234,8 +235,9 @@ class OptionsPosition:
     # Butterfly break-even mode: once mark goes negative, lower exit target to 0%
     # (recover original debit) instead of waiting for +45%. Latches True, never resets.
     breakeven_mode: bool = False
-    # Tiered profit taking: track if first tier (50%) was closed at +20%
-    tier1_closed: bool = False    # True = 50% closed at first target, hold 50% for second target
+    # Tiered profit taking: track if first tier (50%) was closed at +50%
+    tier1_closed: bool = False    # True = 50% closed at +50%, hold 50% with new +20% stop for 2nd half
+    scaled_out_qty: int = 0       # Number of contracts closed at tier1 target
     # Phase 2: Signal confidence at entry (for confidence-tiered profit targets)
     entry_confidence: float = 0.80  # Confidence score at entry (default 0.80)
 
@@ -1670,47 +1672,71 @@ class OptionsExecutor:
                 # ── End butterfly/condor logic ────────────────────────────────
 
                 if pnl_pct >= OPTIONS_PROFIT_TARGET_1_PCT and not pos.tier1_closed:
-                    # First tier: close based on confidence band
-                    # Confidence-tiered targets allow high-conviction trades to run longer
-                    tiers = get_tiered_profit_targets(pos.entry_confidence)
-                    tier1_pct = tiers['tier1_target']
-                    tier1_close_pct = tiers['tier1_close_pct']
-                    
-                    if pnl_pct >= tier1_pct:
-                        if not pdt_block:
-                            log.info(
-                                f"OPTIONS: {pos.symbol} tier-1 target hit "
-                                f"({pnl_pct:.1f}% >= {tier1_pct:.0f}%, conf={pos.entry_confidence:.0%}) — "
-                                f"closing {tier1_close_pct:.0%} and holding {1-tier1_close_pct:.0%} for next tier"
+                    # SCALE-OUT: Close 50% of position at +50%, hold 50% with new +20% stop
+                    if not pdt_block:
+                        qty_to_close = max(1, pos.contracts // 2)  # Close 50% (rounded up to min 1)
+                        qty_remaining = pos.contracts - qty_to_close
+                        
+                        log.info(
+                            f"OPTIONS: {pos.symbol} scale-out triggered at +{pnl_pct:.1f}% "
+                            f"— closing {qty_to_close}/{pos.contracts} contracts at market"
+                        )
+                        
+                        # Close first half at market
+                        try:
+                            close_request = MarketOrderRequest(
+                                symbol=occ_sym,
+                                qty=qty_to_close,
+                                side=OrderSide.sell if pos.action == "buy_to_open" else OrderSide.buy,
+                                time_in_force=TimeInForce.day,
                             )
-                            # TODO: Implement partial close (currently closes entire position)
-                            pos.tier1_closed = True
-                            # Reduce target to second tier for remaining position
-                            tier2_pct = tiers['tier2_target']
-                            log.debug(f"OPTIONS: {pos.symbol} tier-1 closed, holding for tier-2 at {tier2_pct:.0f}%")
+                            order = self.client.submit_order(close_request)
+                            if order:
+                                proceeds = current_mark * qty_to_close
+                                log.info(
+                                    f"OPTIONS: {pos.symbol} first half closed: {qty_to_close} contracts @ ${current_mark:.2f} "
+                                    f"= ${proceeds:.2f} (P&L: +{pnl_pct:.1f}%)"
+                                )
+                        except Exception as e:
+                            log.warning(f"OPTIONS: {pos.symbol} scale-out close failed: {e}")
+                            return
+                        
+                        # Update position for second half
+                        pos.contracts = qty_remaining
+                        pos.scaled_out_qty = qty_to_close
+                        pos.tier1_closed = True
+                        
+                        # Set new stop for remaining half: +20% (breakeven guard)
+                        pos.tier1_scale_out_stop = entry_mark * (1 + OPTIONS_PROFIT_TARGET_1_STOP_PCT / 100)
+                        
+                        log.info(
+                            f"OPTIONS: {pos.symbol} second half position: {qty_remaining} contracts, "
+                            f"new stop at +{OPTIONS_PROFIT_TARGET_1_STOP_PCT:.0f}% (${pos.tier1_scale_out_stop:.2f}), "
+                            f"target at +{OPTIONS_PROFIT_TARGET_2_PCT:.0f}%"
+                        )
 
                 elif pnl_pct >= OPTIONS_PROFIT_TARGET_2_PCT and pos.tier1_closed:
-                    # Second tier: close remaining based on confidence
-                    tiers = get_tiered_profit_targets(pos.entry_confidence)
-                    tier2_pct = tiers['tier2_target']
-                    
-                    if pnl_pct >= tier2_pct:
-                        if not pdt_block:
-                            log.info(
-                                f"OPTIONS: {pos.symbol} tier-2 target hit "
-                                f"({pnl_pct:.1f}% >= {tier2_pct:.0f}%) — closing remaining"
-                            )
-                            to_close.append(occ_sym)
+                    # Second half: close remaining at max profit target
+                    if not pdt_block:
+                        log.info(
+                            f"OPTIONS: {pos.symbol} second-half target hit "
+                            f"({pnl_pct:.1f}% >= {OPTIONS_PROFIT_TARGET_2_PCT:.0f}%) — closing remaining {pos.contracts}"
+                        )
+                        to_close.append(occ_sym)
 
-                elif pnl_pct >= OPTIONS_PROFIT_TARGET_2_PCT and not pos.tier1_closed:
-                    # Direct hit to tier-2 without tier-1: close position
-                    tiers = get_tiered_profit_targets(pos.entry_confidence)
-                    tier2_pct = tiers['tier2_target']
-                    
-                    if pnl_pct >= tier2_pct:
-                        if not pdt_block:
-                            log.info(f"OPTIONS: {pos.symbol} target hit ({pnl_pct:.1f}%) — closing")
-                            to_close.append(occ_sym)
+                elif pnl_pct >= OPTIONS_PROFIT_TARGET_1_PCT and not pos.tier1_closed:
+                    # No tier1 close yet, but hitting first threshold — wait for exact target
+                    pass
+
+                # ── Second-half stop loss (if scaled out): New stop at +20% (breakeven guard) ────
+                if pos.tier1_closed and pnl_pct <= OPTIONS_PROFIT_TARGET_1_STOP_PCT:
+                    # Second half hit its new stop at +20% — close to lock minimum gain
+                    if not pdt_block and not in_grace_period:
+                        log.warning(
+                            f"OPTIONS: {pos.symbol} second-half stop hit at +{pnl_pct:.1f}% "
+                            f"(stop={OPTIONS_PROFIT_TARGET_1_STOP_PCT:.0f}%) — closing remaining {pos.contracts}"
+                        )
+                        to_close.append(occ_sym)
 
                 # ── Percentage-based stop loss: ONLY for naked options, NOT spreads ────
                 # Multi-leg spreads have complex mark pricing; SL is managed by Schwab stop orders.
