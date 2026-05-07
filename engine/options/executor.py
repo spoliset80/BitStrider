@@ -519,8 +519,8 @@ class OptionsExecutor:
                         entry_price = net_debit,
                         strategy    = "reconciled_spread",
                         legs        = [
-                            {"occ_symbol": buy_leg["occ"],  "side": "buy",  "ratio_qty": 1},
-                            {"occ_symbol": sell_leg["occ"], "side": "sell", "ratio_qty": 1},
+                            {"occ_symbol": buy_leg["occ"],  "side": "buy",  "ratio_qty": 1, "strike": buy_leg["strike"]},
+                            {"occ_symbol": sell_leg["occ"], "side": "sell", "ratio_qty": 1, "strike": sell_leg["strike"]},
                         ],
                         entered_at  = buy_leg["entered_at"],
                     )
@@ -1010,31 +1010,30 @@ class OptionsExecutor:
         # ── End 4b ───────────────────────────────────────────────────────────
 
         try:
-            # Price improvement: for debits (buy) bid 1% below mid to lower cost;
-            # for credits (sell) offer 1% above mid to collect more.
-            # For auto-derived spreads (IV gate): signal.mid_price is the long-leg premium
-            # only, so we must subtract the estimated short-leg credit to get the true
-            # net debit — otherwise Alpaca reserves 2× the buying power needed.
-            _spread_mid_price = signal.mid_price
-            if is_mleg and signal.spread_sell_mid is None and _eff_spread_sell_strike is not None:
-                # Estimate short-leg credit via Black-Scholes
-                _dte = max(1, (signal.expiry - datetime.date.today()).days)
-                _iv  = signal.iv_pct if signal.iv_pct > 0 else 0.30
-                # Spot ≈ signal.strike (entry is at-the-money by convention)
-                _short_credit = _bs_option_price(
-                    spot=signal.strike,
-                    strike=_eff_spread_sell_strike,
-                    dte=_dte,
-                    iv=_iv,
-                    call=(cp_type == "call"),
-                )
-                _spread_mid_price = max(0.01, signal.mid_price - _short_credit)
+            # NO INTERNAL CALCULATIONS — all pricing from market data (Schwab)
+            # For multi-leg spreads: strategy either provides spread_sell_mid OR we fetch from Schwab
+            # For single-leg: fetch from Schwab
+            # This eliminates Black-Scholes estimates and ensures accuracy
+            
+            _spread_mid_price = signal.mid_price  # Placeholder, will be overridden by Schwab pricing
+            _net_entry_price = signal.mid_price
+            
+            if is_mleg and signal.spread_sell_mid is not None:
+                # Strategy provided explicit spread_sell_mid (from strategy's own market research)
+                _spread_mid_price = max(0.01, signal.mid_price - signal.spread_sell_mid)
+                _net_entry_price = _spread_mid_price
                 log.debug(
-                    f"[OPTIONS] Auto-spread net debit: long=${signal.mid_price:.2f} "
-                    f"- short_est=${_short_credit:.2f} = net=${_spread_mid_price:.2f} "
-                    f"(was sending ${signal.mid_price:.2f} -- overstating BP)"
+                    f"[OPTIONS] Spread net debit (strategy-provided): "
+                    f"long=${signal.mid_price:.2f} - short=${signal.spread_sell_mid:.2f} "
+                    f"= net=${_spread_mid_price:.2f}"
                 )
-                _net_entry_price = _spread_mid_price  # use net debit as position entry_price
+            elif is_mleg:
+                # For auto-derived short leg (IV gate): we'll get ACTUAL price from Schwab in Step 4
+                # Don't estimate via Black-Scholes — fetch real market data instead
+                log.debug(
+                    f"[OPTIONS] IV gate auto-derived spread short leg @{_eff_spread_sell_strike}: "
+                    f"will fetch ACTUAL price from Schwab (no internal calculation)"
+                )
 
             if "buy" in signal.action:
                 limit_price = round(_spread_mid_price * 0.99, 2)   # debit: bid below mid (pay less)
@@ -1046,6 +1045,20 @@ class OptionsExecutor:
                 else:
                     limit_price = round(_spread_mid_price * 1.01, 2)   # single-leg sell: offer above mid
 
+            # ── STEP 4: GET SCHWAB PRICING FOR COMPLETE SPREAD ─────────────────
+            # Before constructing the order, fetch fresh Schwab pricing for multi-leg
+            # positions. This ensures we have real-time bid/ask/mark from broker.
+            _schwab_spread_mark = None
+            _schwab_spread_bid = None
+            _schwab_spread_ask = None
+            _schwab_limit_override = None
+            
+            if is_mleg:
+                # Build temp legs list for Schwab pricing (before order construction)
+                _temp_legs = []
+                # We'll populate _temp_legs based on strategy type (same as order legs)
+                # This will be populated in each case below before calling Schwab
+                
             # ── CASE A: MULTI-LEG (Spreads, Butterflies, Condors) ────────────────
             if is_mleg:
                 legs_list = []
@@ -1073,6 +1086,63 @@ class OptionsExecutor:
                         {"symbol": _alpaca_option_symbol(signal.symbol, signal.expiry, cp_type, signal.strike), "side": primary_side, "ratio_qty": 1},
                         {"symbol": _alpaca_option_symbol(signal.symbol, signal.expiry, cp_type, _eff_spread_sell_strike), "side": secondary_side, "ratio_qty": 1}
                     ]
+
+                # ── STEP 4a: Fetch Real-Time Schwab Pricing ───────────────────
+                # Build Schwab leg format for pricing API
+                try:
+                    from engine.utils.schwab_pricing import get_spread_complete_pricing
+                    
+                    _schwab_legs = []
+                    if is_condor:
+                        _schwab_legs = [
+                            {"occ_symbol": l["symbol"], "side": "buy" if "buy" in _leg_side_str(l["side"]) else "sell", "ratio_qty": l["ratio_qty"], "strike": s, "opt_type": ot}
+                            for l, s, ot in zip(
+                                legs_list,
+                                [signal.put_long_strike, signal.put_short_strike, signal.call_short_strike, signal.call_long_strike],
+                                ["put", "put", "call", "call"]
+                            )
+                        ]
+                    elif is_butterfly:
+                        _schwab_legs = [
+                            {"occ_symbol": l["symbol"], "side": "buy" if "buy" in _leg_side_str(l["side"]) else "sell", "ratio_qty": l["ratio_qty"], "strike": s, "opt_type": cp_type}
+                            for l, s in zip(legs_list, [signal.butterfly_low_strike, signal.strike, signal.butterfly_high_strike])
+                        ]
+                    else:  # Vertical spread
+                        _schwab_legs = [
+                            {"occ_symbol": l["symbol"], "side": "buy" if "buy" in _leg_side_str(l["side"]) else "sell", "ratio_qty": l["ratio_qty"], "strike": s, "opt_type": cp_type}
+                            for l, s in zip(legs_list, [signal.strike, _eff_spread_sell_strike])
+                        ]
+                    
+                    # Get real-time prices from Schwab
+                    schwab_pricing = get_spread_complete_pricing(signal.symbol, _schwab_legs, _spread_mid_price)
+                    if schwab_pricing:
+                        _schwab_spread_mark = schwab_pricing.get("spread_mark")
+                        _schwab_spread_bid = schwab_pricing.get("spread_bid")
+                        _schwab_spread_ask = schwab_pricing.get("spread_ask")
+                        
+                        # Use Schwab mark to set limit price (1% improvement)
+                        if "buy" in signal.action:
+                            # Debit: bid 1% below mark (pay less)
+                            _schwab_limit_override = round(_schwab_spread_mark * 0.99, 2)
+                        else:
+                            # Credit: offer 1% above mark (collect more)
+                            _schwab_limit_override = -round(_schwab_spread_mark * 1.01, 2)
+                        
+                        log.info(
+                            f"[OPTIONS] {signal.symbol} Schwab pricing: "
+                            f"bid=${_schwab_spread_bid:.2f} mark=${_schwab_spread_mark:.2f} ask=${_schwab_spread_ask:.2f} | "
+                            f"estimated_mid=${_spread_mid_price:.2f} (diff={_schwab_spread_mark - _spread_mid_price:+.2f})"
+                        )
+                        log.info(
+                            f"[OPTIONS] {signal.symbol} limit price: "
+                            f"estimated=${limit_price:.2f} → schwab_real=${_schwab_limit_override:.2f}"
+                        )
+                        # Use Schwab-based limit price for order
+                        limit_price = _schwab_limit_override
+                    else:
+                        log.warning(f"[OPTIONS] {signal.symbol} failed to fetch Schwab pricing, using estimated limit=${limit_price:.2f}")
+                except Exception as e:
+                    log.error(f"[OPTIONS] {signal.symbol} Schwab pricing error: {e}, using estimated limit=${limit_price:.2f}")
 
                 # Construct Payload
                 def _leg_side_str(leg_side) -> str:
@@ -1108,6 +1178,65 @@ class OptionsExecutor:
             # ── CASE B: SINGLE OPTION (Standard) ─────────────────────────────
             else:
                 occ_sym = _alpaca_option_symbol(signal.symbol, signal.expiry, cp_type, signal.strike)
+                
+                # ── STEP 4b: Fetch Real-Time Schwab Pricing (Single-Leg) ─────────
+                try:
+                    from engine.broker.schwab_client import get_schwab_market_data_client
+                    
+                    client = get_schwab_market_data_client()
+                    chain_data = client.get_option_chains(signal.symbol, contract_type="ALL")
+                    
+                    if chain_data:
+                        exp_date_map = chain_data.get("callExpDateMap" if cp_type == "call" else "putExpDateMap", {})
+                        bid_price = None
+                        ask_price = None
+                        mark_price = None
+                        
+                        # Search for matching strike
+                        for exp_date_str, strikes_dict in exp_date_map.items():
+                            for strike_str, option_list in strikes_dict.items():
+                                try:
+                                    strike_num = float(strike_str)
+                                    if abs(strike_num - signal.strike) < 0.01:
+                                        if isinstance(option_list, list) and len(option_list) > 0:
+                                            option_data = option_list[0]
+                                            bid_price = float(option_data.get("bid", 0))
+                                            ask_price = float(option_data.get("ask", 0))
+                                            mark_price = float(option_data.get("mark", 0))
+                                            
+                                            if mark_price == 0 and bid_price and ask_price:
+                                                mark_price = (bid_price + ask_price) / 2.0
+                                            break
+                                except (ValueError, TypeError):
+                                    continue
+                            if bid_price is not None:
+                                break
+                        
+                        if bid_price is not None and ask_price is not None and mark_price is not None:
+                            # Use Schwab mark to set limit price (1% improvement)
+                            if "buy" in signal.action:
+                                _schwab_limit_override = round(mark_price * 0.99, 2)
+                            else:
+                                _schwab_limit_override = round(mark_price * 1.01, 2)
+                            
+                            log.info(
+                                f"[OPTIONS] {signal.symbol} {cp_type}@{signal.strike} Schwab pricing: "
+                                f"bid=${bid_price:.2f} mark=${mark_price:.2f} ask=${ask_price:.2f} | "
+                                f"estimated=${signal.mid_price:.2f} (diff={mark_price - signal.mid_price:+.2f})"
+                            )
+                            log.info(
+                                f"[OPTIONS] {signal.symbol} limit price: "
+                                f"estimated=${limit_price:.2f} → schwab_real=${_schwab_limit_override:.2f}"
+                            )
+                            limit_price = _schwab_limit_override
+                        else:
+                            log.warning(f"[OPTIONS] {occ_sym} no Schwab pricing found, using estimated limit=${limit_price:.2f}")
+                    else:
+                        log.warning(f"[OPTIONS] {signal.symbol} no chain data from Schwab, using estimated limit=${limit_price:.2f}")
+                except Exception as e:
+                    log.error(f"[OPTIONS] {occ_sym} Schwab pricing error: {e}, using estimated limit=${limit_price:.2f}")
+                
+                # Submit order with Schwab-based limit price
                 order_req = LimitOrderRequest(
                     symbol=occ_sym,
                     qty=contracts,
@@ -1115,7 +1244,7 @@ class OptionsExecutor:
                     limit_price=limit_price,
                     time_in_force=TimeInForce.DAY
                 )
-                log.debug(f"[OPTIONS] Submitting SINGLE {occ_sym}")
+                log.debug(f"[OPTIONS] Submitting SINGLE {occ_sym} @ limit=${limit_price:.2f}")
                 resp = self.client.submit_order(order_req)
                 order_id = getattr(resp, "id", None)
                 if order_id:
@@ -1123,14 +1252,55 @@ class OptionsExecutor:
 
             # 5. Tracking — store all leg OCC symbols for strategy-agnostic close/monitor
             primary_occ = _alpaca_option_symbol(signal.symbol, signal.expiry, cp_type, signal.strike)
-            entry_legs = [
-                {
-                    "occ_symbol": l["symbol"],
-                    "side": l["side"].value if hasattr(l["side"], "value") else str(l["side"]),
-                    "ratio_qty": l["ratio_qty"],
-                }
-                for l in (legs_list if is_mleg else [{"symbol": primary_occ, "side": OrderSide.BUY, "ratio_qty": 1}])
-            ]
+            entry_legs = []
+            if is_mleg:
+                # Multi-leg (spreads, butterflies, condors): extract strike info
+                if is_condor:
+                    entry_legs = [
+                        {
+                            "occ_symbol": l["symbol"],
+                            "side": l["side"].value if hasattr(l["side"], "value") else str(l["side"]),
+                            "ratio_qty": l["ratio_qty"],
+                            "strike": strike,
+                            "opt_type": opt_type_leg  # ADDED: Store option type for clarity
+                        }
+                        for l, strike, opt_type_leg in zip(
+                            legs_list,
+                            [signal.put_long_strike, signal.put_short_strike, signal.call_short_strike, signal.call_long_strike],
+                            ["put", "put", "call", "call"]
+                        )
+                    ]
+                elif is_butterfly:
+                    entry_legs = [
+                        {
+                            "occ_symbol": l["symbol"],
+                            "side": l["side"].value if hasattr(l["side"], "value") else str(l["side"]),
+                            "ratio_qty": l["ratio_qty"],
+                            "strike": strike,
+                            "opt_type": cp_type  # ADDED: Store option type
+                        }
+                        for l, strike in zip(legs_list, [signal.butterfly_low_strike, signal.strike, signal.butterfly_high_strike])
+                    ]
+                else:  # Vertical spread
+                    entry_legs = [
+                        {
+                            "occ_symbol": l["symbol"],
+                            "side": l["side"].value if hasattr(l["side"], "value") else str(l["side"]),
+                            "ratio_qty": l["ratio_qty"],
+                            "strike": strike,
+                            "opt_type": cp_type  # ADDED: Store option type
+                        }
+                        for l, strike in zip(legs_list, [signal.strike, _eff_spread_sell_strike])
+                    ]
+            else:
+                # Single leg: no secondary strike
+                entry_legs = [{
+                    "occ_symbol": primary_occ,
+                    "side": "buy" if "buy" in signal.action else "sell",
+                    "ratio_qty": 1,
+                    "strike": signal.strike,
+                    "opt_type": cp_type  # ADDED: Store option type
+                }]
 
             self._positions[primary_occ] = OptionsPosition(
                 occ_symbol=primary_occ,
@@ -1244,11 +1414,10 @@ class OptionsExecutor:
                     to_close.append(occ_sym)
                 continue
 
-            # 2. P&L — fetch live bid/ask quotes for every leg, compute net mark.
-            # mid = (bid + ask) / 2 per leg, sign = +1 long / -1 short.
-            # Applies to all position types: naked, spread, butterfly, condor.
-            # current_mark = net spread price you'd receive (or pay) right now.
-            # pnl_pct = (current_mark - entry_mark) / entry_mark × 100
+            # 2. P&L — Use consolidated spread pricing from Schwab API
+            # For multi-leg positions: Get complete spread mark/bid/ask prices
+            # For single-leg options: Calculate from bid/ask midpoint
+            # P&L calculated using MARK price (mid/theoretical value)
             try:
                 # Check all legs still exist in the account first
                 any_leg_missing = any(
@@ -1259,21 +1428,56 @@ class OptionsExecutor:
                     del self._positions[occ_sym]
                     continue
 
-                # Fetch live snapshots for all legs in one API call.
-                # OptionsSnapshot includes bid/ask (latest_quote) + greeks + IV.
-                _leg_syms = [l["occ_symbol"] for l in pos.legs]
-                _snaps = self.data_client.get_option_snapshot(
-                    OptionSnapshotRequest(symbol_or_symbols=_leg_syms)
-                )
-                current_mark = 0.0
-                for leg in pos.legs:
-                    _s = _snaps.get(leg["occ_symbol"])
+                # Determine if multi-leg or single-leg
+                is_mleg = len(pos.legs) > 1
+                
+                if is_mleg:
+                    # Multi-leg (spread, butterfly, condor): Use consolidated Schwab pricing
+                    from engine.utils.schwab_pricing import get_spread_complete_pricing
+                    
+                    pricing_data = get_spread_complete_pricing(
+                        pos.symbol,
+                        pos.legs,
+                        pos.entry_price
+                    )
+                    
+                    if pricing_data is None:
+                        log.warning(f"[OPTIONS] {occ_sym} - failed to get Schwab pricing, skipping P&L update")
+                        continue
+                    
+                    # Use MARK price (mid/theoretical value) for P&L
+                    current_mark = pricing_data["spread_mark"]
+                    pnl_pct = pricing_data["pnl_mark_pct"]
+                    dte_from_pricing = pricing_data["dte"]
+                    
+                    # Override DTE if Schwab has fresher data
+                    if dte_from_pricing is not None:
+                        dte = dte_from_pricing
+                    
+                    log.debug(
+                        f"[OPTIONS] {pos.symbol} {pos.strategy} (spread/mleg) "
+                        f"mark=${current_mark:.2f} bid=${pricing_data['spread_bid']:.2f} "
+                        f"ask=${pricing_data['spread_ask']:.2f} "
+                        f"pnl={pnl_pct:+.1f}% dte={dte}d"
+                    )
+                else:
+                    # Single-leg (naked call/put): Use Alpaca snapshots
+                    _snaps = self.data_client.get_option_snapshot(
+                        OptionSnapshotRequest(symbol_or_symbols=[pos.legs[0]["occ_symbol"]])
+                    )
+                    _s = _snaps.get(pos.legs[0]["occ_symbol"])
                     if _s is None or _s.latest_quote is None:
-                        raise ValueError(f"no snapshot/quote for {leg['occ_symbol']}")
-                    _mid  = (float(_s.latest_quote.bid_price) + float(_s.latest_quote.ask_price)) / 2.0
-                    _sign = 1 if leg["side"] == "buy" else -1
-                    current_mark += _sign * _mid
-
+                        raise ValueError(f"no snapshot/quote for {pos.legs[0]['occ_symbol']}")
+                    
+                    current_mark = (float(_s.latest_quote.bid_price) + float(_s.latest_quote.ask_price)) / 2.0
+                    
+                    log.debug(
+                        f"[OPTIONS] {pos.symbol} {pos.strategy} (single-leg) "
+                        f"bid=${_s.latest_quote.bid_price:.2f} "
+                        f"ask=${_s.latest_quote.ask_price:.2f} "
+                        f"mark=${current_mark:.2f}"
+                    )
+                
                 entry_price_signed = float(pos.entry_price)
                 entry_mark = abs(entry_price_signed)   # absolute entry premium per share
                 entry_cost_dollars = entry_mark * pos.contracts * CONTRACT_SIZE
@@ -1281,12 +1485,10 @@ class OptionsExecutor:
                     continue
 
                 # pnl_pct: positive = profitable, negative = losing.
-                # Use signed entry price so both debit and credit strategies normalize correctly:
-                #   debit  entry +x: (current - +x) / x
-                #   credit entry -x: (current - -x) / x
-                # This yields ~0% near entry for either style and prevents false -200% reads
-                # on credit spreads.
-                pnl_pct = (current_mark - entry_price_signed) / entry_mark * 100
+                # For multi-leg: already computed by get_spread_complete_pricing
+                # For single-leg: compute here
+                if not is_mleg:
+                    pnl_pct = (current_mark - entry_price_signed) / entry_mark * 100
 
                 if pnl_pct > pos.peak_pnl_pct:
                     pos.peak_pnl_pct = pnl_pct
@@ -1309,13 +1511,27 @@ class OptionsExecutor:
                 elif dte <= 20:
                     _eff_stop = min(_eff_stop, 22.0)
 
-                # ── Butterfly-specific exit logic ─────────────────────────────
-                # % P&L stop is meaningless for butterflies: max loss is already
+                # ── Spread/Multi-leg exit logic (bull call, bear put, butterfly, condor, etc.) ────
+                # NOTE: Spread SL calculation is complex (mark pricing, bid-ask spreads, multi-leg consolidation).
+                # Instead of computing SL in code, get SL directly from Schwab API when syncing positions.
+                # For now: Skip -35% debit SL for spreads; let Schwab manage via its own stop orders.
+                _is_spread = ("spread" in pos.option_type.lower() or "spread" in pos.strategy.lower() or
+                             "TrendPullback" in pos.strategy or "BearCall" in pos.strategy)
+                _is_butterfly = "butterfly" in pos.option_type.lower() or "butterfly" in pos.strategy.lower()
+                _is_condor    = "condor"    in pos.option_type.lower() or "condor"    in pos.strategy.lower()
+                _is_mleg = _is_spread or _is_butterfly or _is_condor
+
+                # ── Multi-leg positions: skip percentage-based SL, use Schwab stop orders ────
+                if _is_mleg:
+                    log.debug(
+                        f"[OPTIONS] {pos.symbol} {pos.strategy} (multi-leg) — "
+                        f"mark=${current_mark:.2f} pnl={pnl_pct:+.1f}% "
+                        f"(SL managed by Schwab stop order, not bot calculation)"
+                    )
+
                 # ── Butterfly / Iron Condor exit logic ───────────────────────
                 # current_mark and entry_mark already computed above from live quotes.
                 # Strategy: HOLD and wait for recovery. Emergency exit only at DTE ≤ 3.
-                _is_butterfly = "butterfly" in pos.option_type.lower() or "butterfly" in pos.strategy.lower()
-                _is_condor    = "condor"    in pos.option_type.lower() or "condor"    in pos.strategy.lower()
                 if _is_butterfly or _is_condor:
                     _mleg_type = "butterfly" if _is_butterfly else "iron condor"
 
@@ -1412,7 +1628,9 @@ class OptionsExecutor:
                             log.info(f"OPTIONS: {pos.symbol} target hit ({pnl_pct:.1f}%) — closing")
                             to_close.append(occ_sym)
 
-                elif pnl_pct <= -_eff_stop:
+                # ── Percentage-based stop loss: ONLY for naked options, NOT spreads ────
+                # Multi-leg spreads have complex mark pricing; SL is managed by Schwab stop orders.
+                elif not _is_mleg and pnl_pct <= -_eff_stop:
                     # Grace period: don't stop-out within first N days of entry
                     if in_grace_period:
                         # Still within grace period — hold even if stop is hit
@@ -1457,6 +1675,7 @@ class OptionsExecutor:
 
             except Exception as e:
                 log.error(f"Error monitoring {occ_sym}: {e}")
+                # Skip this position and continue with next
 
         # Execute closes — pass all_positions so _close_option can compute limit price
         for occ_sym in to_close:

@@ -46,10 +46,14 @@ from engine.config import (
     OPTIONS_MIN_IV_PCT,
     OPTIONS_COVERED_CALL_DELTA,
     OPTIONS_MIN_SIGNAL_CONFIDENCE,
+    OPTIONS_MIN_SIGNAL_CONFIDENCE_TI,
     OPTIONS_MIN_STOCK_PRICE,
     OPTIONS_MIN_MOVE_PCT,
+    OPTIONS_MIN_MOVE_PCT_TI,
     OPTIONS_MIN_RVOL,
+    OPTIONS_MIN_RVOL_TI,
     OPTIONS_MIN_ADV,
+    OPTIONS_MIN_ADV_TI,
     OPTIONS_STOP_COOLDOWN_DAYS,
     OPTIONS_EARNINGS_AVOID_DAYS,
     ATR_STOP_MULTIPLIER,
@@ -74,7 +78,7 @@ _MDA_API_KEY: Optional[str] = os.environ.get("MARKETDATA_API_KEY") or None
 _MDA_AVAILABLE: bool = bool(_MDA_API_KEY)
 _OPTIONS_UNIVERSE_CACHE_TS: datetime.datetime = datetime.datetime.min.replace(tzinfo=datetime.timezone.utc)
 _OPTIONS_UNIVERSE_CACHE: list[str] | None = None
-
+_CURRENT_TI_UNIVERSE: list[str] = []  # Set during scan_options_universe() for strategy access
 
 _OPTIONS_UNIVERSE_CACHE_TTL_SEC = 300
 
@@ -92,6 +96,31 @@ def _get_options_universe() -> list[str]:
             _OPTIONS_UNIVERSE_CACHE = []
         _OPTIONS_UNIVERSE_CACHE_TS = now
     return _OPTIONS_UNIVERSE_CACHE
+
+
+def _is_ti_symbol(symbol: str) -> bool:
+    """Check if symbol is in the TI unusual options universe."""
+    return symbol in _CURRENT_TI_UNIVERSE
+
+
+def _get_adv_threshold(symbol: str) -> float:
+    """Get ADV threshold for symbol. Lower for TI universe, higher for major caps."""
+    return OPTIONS_MIN_ADV_TI if _is_ti_symbol(symbol) else OPTIONS_MIN_ADV
+
+
+def _get_confidence_threshold(symbol: str) -> float:
+    """Get confidence threshold for symbol. Lower for TI unusual options, higher for major caps."""
+    return OPTIONS_MIN_SIGNAL_CONFIDENCE_TI if _is_ti_symbol(symbol) else OPTIONS_MIN_SIGNAL_CONFIDENCE
+
+
+def _get_move_threshold(symbol: str) -> float:
+    """Get min daily move threshold. Lower for TI symbols, higher for major caps."""
+    return OPTIONS_MIN_MOVE_PCT_TI if _is_ti_symbol(symbol) else OPTIONS_MIN_MOVE_PCT
+
+
+def _get_rvol_threshold(symbol: str) -> float:
+    """Get min relative volume threshold. Lower for TI symbols, higher for major caps."""
+    return OPTIONS_MIN_RVOL_TI if _is_ti_symbol(symbol) else OPTIONS_MIN_RVOL
 
 
 def _calc_rsi_scalar(prices: pd.Series) -> Optional[float]:
@@ -1279,9 +1308,13 @@ class MomentumCallStrategy:
             if ctx is None or len(ctx.closes) < 25:
                 return None
 
-            if ctx.chg_pct < OPTIONS_MIN_MOVE_PCT:
+            # Get TI-specific thresholds if applicable
+            min_move = _get_move_threshold(symbol)
+            min_rvol = _get_rvol_threshold(symbol)
+            
+            if ctx.chg_pct < min_move:
                 return None
-            if ctx.vol_ratio < OPTIONS_MIN_RVOL:
+            if ctx.vol_ratio < min_rvol:
                 return None
 
             if ctx.rsi is None or not (50 <= ctx.rsi <= 72):
@@ -3091,7 +3124,7 @@ def scan_options_universe(
 
     # Strategies call _get_filters() per scan() — no global refresh needed here
 
-    global _market_state, _schwab_health_success, _schwab_health_failure, _schwab_health_use_alpaca_first
+    global _market_state, _schwab_health_success, _schwab_health_failure, _schwab_health_use_alpaca_first, _CURRENT_TI_UNIVERSE
     _market_state = market_state
     
     # Reset Schwab health counters at start of scan; evaluate recovery/degradation
@@ -3121,6 +3154,10 @@ def scan_options_universe(
             ti_universe = list(ti_universe) + _pq_syms
     except Exception:
         pass
+    
+    # Set global ti_universe for strategy access (used by _is_ti_symbol and threshold getters)
+    _CURRENT_TI_UNIVERSE = ti_universe
+    
     signals: List[OptionSignal] = []
     momentum_strat      = MomentumCallStrategy()
     bear_put_strat      = BearPutStrategy()
@@ -3181,12 +3218,17 @@ def scan_options_universe(
     # ─────────────────────────────────────────────────────────────────────────
 
     for _scan_idx, symbol in enumerate(ti_universe, 1):
+        # Get appropriate thresholds for this symbol (TI vs major cap)
+        adv_threshold = _get_adv_threshold(symbol)
+        conf_threshold = _get_confidence_threshold(symbol)
+        is_ti = _is_ti_symbol(symbol)
+        
         # Dollar volume quality gate — reuse already-prefetched bar context (no extra fetch)
         _ctx_for_adv = _bar_ctx_cache.get(symbol)
         if _ctx_for_adv is not None:
             adv = float((_ctx_for_adv.daily["close"] * _ctx_for_adv.daily["volume"]).iloc[-20:].mean())
-            if adv < OPTIONS_MIN_ADV:
-                log.debug(f"Options scan: {symbol} ADV ${adv:,.0f} < ${OPTIONS_MIN_ADV:,.0f} — skip")
+            if adv < adv_threshold:
+                log.debug(f"Options scan: {symbol} ADV ${adv:,.0f} < ${adv_threshold:,.0f} {'(TI)' if is_ti else '(major cap)'} — skip")
                 _record_fail("adv", symbol)
                 continue
 
@@ -3203,7 +3245,7 @@ def scan_options_universe(
         for strat in (momentum_strat, bear_put_strat, bear_call_strat, squeeze_strat, mean_rev_strat,
                       retest_strat, trend_spread_strat, iron_condor_strat, butterfly_strat):
             sig = strat.scan(symbol)
-            if sig and sig.confidence >= OPTIONS_MIN_SIGNAL_CONFIDENCE:
+            if sig and sig.confidence >= conf_threshold:  # Use TI-specific or major cap threshold
                 signals.append(sig)
                 symbol_got_signal = True
                 break   # one signal per symbol per scan cycle
@@ -3213,8 +3255,10 @@ def scan_options_universe(
             _record_fail("no_signal", symbol)
 
     for symbol, qty in held_positions.items():
+        # Use appropriate confidence threshold for held position
+        conf_threshold = _get_confidence_threshold(symbol)
         sig = covered_strat.scan(symbol, qty, existing_option_symbols)
-        if sig and sig.confidence >= OPTIONS_MIN_SIGNAL_CONFIDENCE:
+        if sig and sig.confidence >= conf_threshold:
             signals.append(sig)
 
     # Rank by composite: confidence * min(R/R, 3.0)

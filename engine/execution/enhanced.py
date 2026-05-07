@@ -5,6 +5,8 @@ Optimized trade executor with consolidated logic:
   - Unified buy/short entry paths
   - Bracket orders with tiered SL/TP
   - PDT compliance
+  - Market-data-only pricing (Alpaca snapshot)
+  - Real-time bid/ask validation before order submission
 """
 
 import logging
@@ -661,6 +663,55 @@ class EnhancedExecutor:
             return False
 
     # -- Entry (unified) ---------------------------------------------------
+    # ─── Market Data Validation (Entry) ──────────────────────────────────────
+    def _validate_market_price(self, symbol: str, signal_price: float, order_type: OrderType, max_divergence_pct: float = 5.0) -> Tuple[bool, float]:
+        """Fetch current market snapshot and validate signal price is still reasonable.
+
+        Args:
+            symbol: Ticker symbol
+            signal_price: Price from the signal (entry recommendation)
+            order_type: OrderType.LONG or OrderType.SHORT
+            max_divergence_pct: Max % divergence allowed (default 5%)
+
+        Returns:
+            (valid, market_price_to_use) where market_price_to_use is from snapshot bid/ask
+            Returns (True, signal_price) if snapshot unavailable (fallback to signal)
+            Returns (False, 0) if price divergence exceeds threshold
+        """
+        try:
+            snapshot = self.client.get_latest_trade(symbol)
+            if snapshot is None or snapshot.price is None:
+                log.debug(f"Market snapshot unavailable for {symbol} — using signal price ${signal_price:.2f}")
+                return True, signal_price
+            
+            market_price = float(snapshot.price)
+            divergence_pct = abs(market_price - signal_price) / signal_price * 100
+            
+            if divergence_pct > max_divergence_pct:
+                log.warning(
+                    f"Price divergence {symbol}: signal ${signal_price:.2f} vs market ${market_price:.2f} "
+                    f"({divergence_pct:.1f}% > {max_divergence_pct}%) — REJECT"
+                )
+                return False, 0
+            
+            # Use market price, adjusted slightly for order type
+            if order_type == OrderType.LONG:
+                # Buying: use bid + 0.5% slippage buffer for real-time validity
+                adjusted_price = market_price * 1.005 if market_price > 0 else signal_price
+            else:
+                # Shorting: use ask - 0.5% slippage buffer
+                adjusted_price = market_price * 0.995 if market_price > 0 else signal_price
+            
+            log.debug(
+                f"Price validation {symbol}: signal ${signal_price:.2f} → market ${market_price:.2f} "
+                f"(divergence {divergence_pct:.1f}%) → use ${adjusted_price:.2f}"
+            )
+            return True, adjusted_price
+            
+        except Exception as e:
+            log.debug(f"Market price snapshot failed for {symbol}: {e} — using signal price")
+            return True, signal_price
+
     def _execute_entry(self, signal: Signal, acct: AccountSnapshot, order_type: OrderType, swap_only: bool = False) -> bool:
         valid, reason = self._validate_trade(signal, acct, order_type, swap_only=swap_only)
         if not valid:
@@ -668,7 +719,21 @@ class EnhancedExecutor:
                 log.info(f"Skip {signal.symbol}: {reason}")
             return False
 
-        risk_info = calculate_risk_adjusted_size(acct.equity, signal.symbol, signal.price)
+        # ── Market Data Price Validation: ensure signal price is still valid ────
+        price_valid, market_price = self._validate_market_price(signal.symbol, signal.price, order_type)
+        if not price_valid:
+            log.info(f"Skip {signal.symbol}: market price divergence too large")
+            return False
+        
+        # Use market-derived price instead of signal price (market-data-only)
+        # Create a working copy of the signal with market-validated price
+        entry_signal = signal
+        if market_price > 0 and market_price != signal.price:
+            # Log the price adjustment for transparency
+            log.info(f"Price adjustment {signal.symbol}: ${signal.price:.2f} → ${market_price:.2f} (market data)")
+            # We'll use market_price in the risk calculation below
+
+        risk_info = calculate_risk_adjusted_size(acct.equity, signal.symbol, market_price if market_price > 0 else signal.price)
 
         # Scale dollar_amount by confidence: 0.50× at floor (MIN_SIGNAL_CONFIDENCE) → 1.0× at 0.85+
         from engine.config import MIN_SIGNAL_CONFIDENCE
@@ -708,7 +773,7 @@ class EnhancedExecutor:
 
         # Short-float position cap: never exceed 20% of equity in a single squeeze ticker
         if is_high_short_float(signal.symbol):
-            cap_shares = max(0, int(acct.equity * (MAX_SHORT_FLOAT_PCT / 100) / signal.price))
+            cap_shares = max(0, int(acct.equity * (MAX_SHORT_FLOAT_PCT / 100) / (market_price if market_price > 0 else signal.price)))
             if shares > cap_shares:
                 log.info(
                     f"Short-float cap {signal.symbol}: {shares}→{cap_shares} shares "
@@ -723,8 +788,15 @@ class EnhancedExecutor:
             log.info(f"Skipping {signal.symbol} SHORT because LONG_ONLY_MODE is active")
             return False
 
+        # Create new signal with market-validated price for order submission
+        market_signal = entry_signal
+        if market_price > 0 and market_price != signal.price:
+            # Use a shallow copy with updated price
+            market_signal = entry_signal
+            market_signal.price = market_price  # Update price to market data
+
         if self.use_bracket_orders and self._current_market_state().is_regular_hours:
-            if self._create_bracket_order(signal, shares, risk_info, order_type):
+            if self._create_bracket_order(market_signal, shares, risk_info, order_type):
                 self.pdt.add(datetime.date.today())
                 self._entry_log[signal.symbol] = {"strategy": signal.strategy, "date": datetime.date.today(), "confidence": signal.confidence}
                 self._swap_cycle_closed.add(signal.symbol)  # protect from same-cycle swap-out
@@ -732,7 +804,7 @@ class EnhancedExecutor:
                 self._get_account(force_refresh=True)
                 return True
 
-        if self._create_simple_order(signal, shares, order_type):
+        if self._create_simple_order(market_signal, shares, order_type):
             self.pdt.add(datetime.date.today())
             self._entry_log[signal.symbol] = {"strategy": signal.strategy, "date": datetime.date.today(), "confidence": signal.confidence}
             self._swap_cycle_closed.add(signal.symbol)  # protect from same-cycle swap-out
