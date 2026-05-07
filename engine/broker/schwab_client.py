@@ -205,6 +205,21 @@ class SchwabMarketDataClient:
                 response.raise_for_status()
                 return response.json()
             
+            except requests.exceptions.HTTPError as e:
+                # 4xx client errors (bad request, forbidden, not found) are not transient
+                # Skip them without retrying
+                if 400 <= e.response.status_code < 500:
+                    log.debug(f"Schwab: {symbol} candles — {e.response.status_code} (skipping, not retryable)")
+                    return None
+                # Other errors (5xx, connection) might be transient — retry if not last attempt
+                if attempt < max_retries - 1:
+                    wait_time = backoff_times[attempt]
+                    log.debug(f"Schwab: {symbol} candles retry in {wait_time:.1f}s")
+                    time.sleep(wait_time)
+                else:
+                    log.warning(f"Schwab: Failed to get candles for {symbol}: {e}")
+                    return None
+            
             except requests.exceptions.RequestException as e:
                 if attempt < max_retries - 1:
                     wait_time = backoff_times[attempt]
@@ -264,6 +279,24 @@ class SchwabMarketDataClient:
                 # All other status codes: use standard raise_for_status
                 response.raise_for_status()
                 return response.json()
+            
+            except requests.exceptions.HTTPError as e:
+                # 4xx client errors (bad request, forbidden, not found) are not transient
+                # Skip them without retrying
+                if 400 <= e.response.status_code < 500:
+                    log.debug(f"Schwab: {symbol} chain — {e.response.status_code} (skipping, not retryable)")
+                    return None
+                # Other errors (5xx, connection) might be transient — retry if not last attempt
+                if attempt < max_retries - 1:
+                    wait_time = backoff_times[attempt]
+                    log.warning(
+                        f"Schwab: {symbol} chain request error: {e} "
+                        f"— retrying in {wait_time:.1f}s (attempt {attempt + 1}/{max_retries})"
+                    )
+                    time.sleep(wait_time)
+                else:
+                    log.warning(f"Schwab: Failed to get options chains for {symbol}: {e}")
+                    return None
             
             except requests.exceptions.RequestException as e:
                 if attempt < max_retries - 1:
