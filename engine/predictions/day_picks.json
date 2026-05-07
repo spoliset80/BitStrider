@@ -1,15 +1,23 @@
 {
-  "generated_at": "2026-05-06T13:28:29-04:00",
+  "generated_at": "2026-05-06T23:48:28-04:00",
   "date": "2026-05-06",
   "market_regime": "bull",
   "picks": [
     {
-      "symbol": "BGDE",
+      "symbol": "PKST",
       "action": "buy",
-      "price": 4.9,
-      "confidence": 0.856,
-      "strategy": "VWAPReclaim",
-      "reason": "VWAP reclaim $4.73 | vol x2.1 | RSI 58"
+      "price": 20.99,
+      "confidence": 0.82,
+      "strategy": "Sweepea",
+      "reason": "Daily Sweepea pullback to 8-EMA | ATR $0.02"
+    },
+    {
+      "symbol": "HUT",
+      "action": "buy",
+      "price": 80.51,
+      "confidence": 0.82,
+      "strategy": "Sweepea",
+      "reason": "Daily Sweepea pullback to 8-EMA | ATR $4.74"
     },
     {
       "symbol": "REPL",
@@ -20,28 +28,20 @@
       "reason": "Daily Sweepea pullback to 8-EMA | ATR $0.35"
     },
     {
-      "symbol": "UAMY",
-      "action": "buy",
-      "price": 11.15,
-      "confidence": 0.82,
-      "strategy": "Sweepea",
-      "reason": "Daily Sweepea pullback to 8-EMA | ATR $1.19"
-    },
-    {
-      "symbol": "NGNE",
-      "action": "buy",
-      "price": 28.94,
-      "confidence": 0.82,
-      "strategy": "Sweepea",
-      "reason": "Daily Sweepea pullback to 8-EMA | ATR $1.89"
-    },
-    {
       "symbol": "TGTX",
       "action": "buy",
       "price": 36.1,
       "confidence": 0.82,
       "strategy": "Sweepea",
       "reason": "Daily Sweepea pullback to 8-EMA | ATR $1.46"
+    },
+    {
+      "symbol": "UAMY",
+      "action": "buy",
+      "price": 11.15,
+      "confidence": 0.82,
+      "strategy": "Sweepea",
+      "reason": "Daily Sweepea pullback to 8-EMA | ATR $1.19"
     }
   ]
 }

@@ -145,3 +145,80 @@ def calculate_risk_adjusted_size(account_balance: float, symbol: str, price: flo
         "tp":             tier_info["tp"],
         "atr_pct":        tier_info.get("atr_pct", 0),
     }
+
+
+def calculate_spread_sl(long_strike: float, short_strike: float, spread_debit: float,
+                        underlying_price: float, dte: int, strategy_name: str = "") -> dict:
+    """Calculate spread-specific SL thresholds (NOT percentage-of-debit).
+
+    PROBLEM: -35% debit SL is meaningless for spreads with capped risk.
+    SOLUTION: Use 3-tier approach:
+      1. PROFIT TARGET: Close at 50-75% of max gain
+      2. UNDERLYING MOVEMENT: Close if underlying breaches key support
+      3. DTE: Close if DTE < 7 days and profit < 50% max gain
+
+    Args:
+        long_strike: Long call/put strike price
+        short_strike: Short call/put strike price
+        spread_debit: Debit paid for spread (e.g., $1.90)
+        underlying_price: Current underlying price
+        dte: Days to expiration
+        strategy_name: e.g., "TrendPullbackSpread", "BearCallSpread"
+
+    Returns dict with keys:
+        - max_profit: max gain per spread (e.g., $3.10 for 550/555 spread)
+        - profit_target_bid: bid price to close at 50% max gain
+        - underlying_sl: underlying price threshold (e.g., $547 for 550 long)
+        - dte_sl_days: days threshold (e.g., 7)
+        - should_close_for_profit: bool, if profit_target_bid reached
+        - should_close_for_underlying: bool, if underlying breaches
+        - should_close_for_dte: bool, if DTE and profit < 50%
+    """
+    from engine.config import (
+        SPREAD_PROFIT_TARGET_LOWER,
+        SPREAD_UNDERLYING_SL_PCTFROM_LONG,
+        SPREAD_DTE_EXIT_THRESHOLD,
+    )
+
+    # Calculate max profit and max loss
+    spread_width = abs(short_strike - long_strike)
+    max_profit = spread_width - spread_debit
+    max_loss = spread_debit
+
+    # TIER 1: Profit Target
+    # Close at 50% of max gain (more conservative, preferred)
+    profit_target_gain = max_profit * (SPREAD_PROFIT_TARGET_LOWER / 100.0)
+    profit_target_bid = spread_debit + profit_target_gain
+
+    # TIER 2: Underlying Movement SL
+    # If underlying breaches 1% below long strike, close spread
+    # (E.g., for 550 call, SL if SPY < $544.50)
+    spread_type = "call" if short_strike > long_strike else "put"
+    if spread_type == "call":
+        underlying_sl = long_strike * (1 - SPREAD_UNDERLYING_SL_PCTFROM_LONG / 100.0)
+    else:  # put spread
+        underlying_sl = long_strike * (1 + SPREAD_UNDERLYING_SL_PCTFROM_LONG / 100.0)
+
+    # TIER 3: DTE Management
+    dte_sl_days = SPREAD_DTE_EXIT_THRESHOLD
+
+    # Current P&L assessment
+    current_spread_value = min(max_profit, max(0, spread_width - abs(underlying_price - long_strike)))
+    current_pnl = current_spread_value - spread_debit
+    current_pnl_pct = (current_pnl / spread_debit * 100) if spread_debit > 0 else 0
+
+    return {
+        "max_profit": round(max_profit, 2),
+        "max_loss": round(max_loss, 2),
+        "profit_target_bid": round(profit_target_bid, 2),
+        "profit_target_gain": round(profit_target_gain, 2),
+        "underlying_sl": round(underlying_sl, 2),
+        "dte_sl_days": dte_sl_days,
+        "current_spread_value": round(current_spread_value, 2),
+        "current_pnl": round(current_pnl, 2),
+        "current_pnl_pct": round(current_pnl_pct, 2),
+        "should_close_for_profit": current_spread_value >= profit_target_bid,
+        "should_close_for_underlying": (spread_type == "call" and underlying_price <= underlying_sl) or
+                                      (spread_type == "put" and underlying_price >= underlying_sl),
+        "should_close_for_dte": dte <= dte_sl_days and current_pnl_pct < 50.0,
+    }
