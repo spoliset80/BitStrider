@@ -1170,7 +1170,7 @@ def _calc_rr(atr14: float, dte: int, mid_price: float) -> float:
 
 
 def _trend_aligned(closes: pd.Series, direction: str) -> Tuple[bool, float]:
-    """Check 20-EMA trend alignment.
+    """Check 20-EMA trend alignment + EMA200 stack (when enough history available).
     Returns (aligned: bool, ema20_value: float).
     direction: 'up' for calls, 'down' for puts.
     """
@@ -1181,7 +1181,20 @@ def _trend_aligned(closes: pd.Series, direction: str) -> Tuple[bool, float]:
     ema20_prev = float(ema.iloc[-3])
     spot = float(closes.iloc[-1])
     if direction == "up":
-        return spot > ema20 and ema20 > ema20_prev, ema20
+        basic_ok = spot > ema20 and ema20 > ema20_prev
+        if not basic_ok:
+            return False, ema20
+        # EMA stack: 20 > 50 > 200 (only checked when sufficient history)
+        if len(closes) >= 55:
+            ema50 = float(closes.ewm(span=50, adjust=False).mean().iloc[-1])
+            if ema20 <= ema50:
+                return False, ema20
+        if len(closes) >= 205:
+            ema200 = float(closes.ewm(span=200, adjust=False).mean().iloc[-1])
+            ema50  = float(closes.ewm(span=50,  adjust=False).mean().iloc[-1])
+            if ema50 <= ema200:
+                return False, ema20
+        return True, ema20
     else:
         return spot < ema20 and ema20 < ema20_prev, ema20
 
@@ -1229,7 +1242,7 @@ def _fetch_bar_context(symbol: str) -> Optional[_BarCtx]:
     """
     if symbol in _bar_ctx_cache:
         return _bar_ctx_cache[symbol]
-    daily = get_bars(symbol, "80d", "1d")
+    daily = get_bars(symbol, "250d", "1d")  # extended to 250d for EMA200 stack check
     if daily.empty or len(daily) < 25:
         return None
     closes = daily["close"]
@@ -1282,9 +1295,9 @@ class MomentumCallStrategy:
     - Bull regime (SPY > 200-SMA)
     - Today >= +3%, 20-day volume surge >= 1.5x
     - RSI 50-72: trending but not overbought
-    - 20-EMA rising AND price above EMA
+    - 20-EMA rising AND price above EMA AND EMA20 > EMA50 > EMA200 stack
     - 3-day upward momentum confirms (no one-day fluke)
-    - Price broke above prior 5-day high (real breakout)
+    - Price broke above prior 21-day high (confirmed breakout, not just 5-day noise)
     - IV rank < 35 (buying cheap premium only)
     - Premium <= 3% of spot
     - R/R >= 1.5 (ATR expected move justifies premium)
@@ -1329,9 +1342,10 @@ class MomentumCallStrategy:
             if not _three_day_trend(ctx.closes, "up"):
                 return None
 
-            # A+ Filter 3: breakout above prior 5-day high
-            prior_5d_high = float(ctx.daily["high"].iloc[-7:-2].max())
-            if ctx.spot < prior_5d_high * 0.995:
+            # A+ Filter 3: breakout above prior 21-day high (stronger confirmation)
+            # Uses [-23:-2] to exclude the last 2 days (entry day + yesterday) and look back 21 sessions
+            prior_21d_high = float(ctx.daily["high"].iloc[-23:-2].max()) if len(ctx.daily) >= 23 else float(ctx.daily["high"].iloc[:-2].max())
+            if ctx.spot < prior_21d_high * 0.995:
                 return None
 
             chain = _get_options_chain(symbol)
@@ -1378,8 +1392,8 @@ class MomentumCallStrategy:
             conf += min(0.05, (ctx.vol_ratio - 1.5) * 0.025)
             conf += min(0.04, (f["IV_RANK_CALL_MAX"] - chain.iv_rank) * 0.001)
             conf += min(0.04, (rr - f["MIN_RR"]) * 0.02)
-            if ctx.spot > prior_5d_high:
-                conf += 0.03   # genuine breakout bonus
+            if ctx.spot > prior_21d_high:
+                conf += 0.03   # genuine 21-day breakout bonus
 
             # Note: Bull regime strength adjustments now applied uniformly at scan-level
             # via _filter_signals_by_market_regime() to ensure consistency across all strategies
