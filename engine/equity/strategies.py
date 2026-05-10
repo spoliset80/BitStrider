@@ -59,6 +59,122 @@ def _calc_atr14(bars: pd.DataFrame, period: int = 14) -> float:
         return 0.0
 
 
+# ── TA Filter Helpers ─────────────────────────────────────────────────────────
+# Check 1a: EMA stack — 20 EMA > 50 EMA > 200 EMA (daily closes required).
+# Returns True (pass) when insufficient data to avoid blocking good signals.
+def _ema_stack_ok(closes: pd.Series) -> bool:
+    """True if daily 20 EMA > 50 EMA > 200 EMA (bull EMA alignment)."""
+    if len(closes) < 60:
+        return True   # not enough history — don't block
+    ema20  = float(closes.ewm(span=20,  adjust=False).mean().iloc[-1])
+    ema50  = float(closes.ewm(span=50,  adjust=False).mean().iloc[-1])
+    if len(closes) >= 200:
+        ema200 = float(closes.ewm(span=200, adjust=False).mean().iloc[-1])
+        return ema20 > ema50 > ema200
+    return ema20 > ema50   # fallback when < 200 days available
+
+
+# Check 1b: Price crossed above 20 EMA within the last N daily candles.
+def _ema20_crossed_recently(closes: pd.Series, lookback: int = 7) -> bool:
+    """True if price was below 20 EMA at some point in the last `lookback` days
+    and is currently above it — i.e. a fresh breakout, not a stale trend."""
+    needed = lookback + 22
+    if len(closes) < needed:
+        return True   # insufficient data — don't block
+    ema20        = closes.ewm(span=20, adjust=False).mean()
+    window_close = closes.iloc[-(lookback + 1):-1]
+    window_ema   = ema20.iloc[-(lookback + 1):-1]
+    was_below    = any(float(c) < float(e) for c, e in zip(window_close, window_ema))
+    above_now    = float(closes.iloc[-1]) > float(ema20.iloc[-1])
+    return was_below and above_now
+
+
+# Check 3: Price is above the high from the 21–55 day ago window (prior consolidation breakout).
+def _above_prior_range_high(daily: pd.DataFrame, near_days: int = 21, far_days: int = 55) -> bool:
+    """True if current price broke above the resistance high of the 21–55 day ago window."""
+    needed = far_days + 2
+    if len(daily) < needed:
+        return True   # insufficient data — don't block
+    spot       = float(daily["close"].iloc[-1])
+    prior_high = float(daily["high"].iloc[-(far_days + 1):-(near_days)].max())
+    return spot >= prior_high * 0.995   # within 0.5% counts as breakout
+
+
+# Check 2: 4H bars synthesised from 60-min Schwab bars (Schwab has no native 4H frequency).
+def _get_4h_bars(symbol: str, days: int = 10) -> pd.DataFrame:
+    """Fetch 60-min bars and resample to 4-hour OHLCV candles."""
+    try:
+        bars_60m = get_bars(symbol, f"{days}d", "60m")
+        if bars_60m.empty or len(bars_60m) < 4:
+            return pd.DataFrame()
+        bars_60m = bars_60m.copy().set_index("time")
+        bars_4h  = bars_60m.resample("4h", closed="left", label="left").agg(
+            {"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"}
+        ).dropna(subset=["close"])
+        return bars_4h.reset_index()
+    except Exception:
+        return pd.DataFrame()
+
+
+# Check 2: Full Fibonacci HL confluence check across 4H + 15-min.
+def _fib_hl_ok(symbol: str) -> bool:
+    """Check 4H swing fib level + 15-min Higher Low + bullish reversal candle.
+
+    Returns True (pass) when pattern is detected OR data is insufficient.
+    Returns False only when 4H data confirms price is NOT near a fib level
+    AND no Higher Low is present — i.e. active rejection.
+    """
+    try:
+        # ── 4H: identify swing high/low and fib levels ───────────────────────
+        bars_4h = _get_4h_bars(symbol, days=10)
+        if bars_4h.empty or len(bars_4h) < 6:
+            return True   # no 4H data — don't block
+        swing_high = float(bars_4h["high"].iloc[-7:-1].max())
+        swing_low  = float(bars_4h["low"].iloc[:-1].min())
+        if swing_high <= swing_low:
+            return True
+        swing_range = swing_high - swing_low
+        fib_levels  = [
+            swing_high - 0.500 * swing_range,   # 0.500
+            swing_high - 0.618 * swing_range,   # 0.618
+            swing_high - 0.786 * swing_range,   # 0.786
+        ]
+        cur_4h   = float(bars_4h["close"].iloc[-1])
+        near_fib = any(abs(cur_4h - lvl) / max(lvl, 0.01) <= 0.008 for lvl in fib_levels)
+        if not near_fib:
+            return False   # price not near any fib — reject
+
+        # ── 15-min: Higher Low + bullish reversal candle ─────────────────────
+        bars_15m = get_bars(symbol, "5d", "15m")
+        if bars_15m.empty or len(bars_15m) < 10:
+            return True   # no 15m data — don't block (fib level alone is sufficient signal)
+
+        # Find local lows in last 30 bars (candle lower than both neighbours)
+        lows = bars_15m["low"].iloc[-30:].reset_index(drop=True)
+        local_lows = [
+            float(lows.iloc[i])
+            for i in range(1, len(lows) - 1)
+            if lows.iloc[i] < lows.iloc[i - 1] and lows.iloc[i] < lows.iloc[i + 1]
+        ]
+        if len(local_lows) < 2:
+            return True   # not enough swing structure — don't block
+        higher_low = local_lows[-1] > local_lows[-2]
+
+        # Bullish reversal candle: either bullish body or hammer wick ≥ 40%
+        last         = bars_15m.iloc[-2]
+        candle_range = float(last["high"]) - float(last["low"])
+        if candle_range == 0:
+            return True
+        is_bullish_body  = float(last["close"]) > float(last["open"])
+        lower_wick       = float(min(last["open"], last["close"])) - float(last["low"])
+        is_hammer        = (lower_wick / candle_range) >= 0.40
+        bullish_candle   = is_bullish_body or is_hammer
+
+        return higher_low and bullish_candle
+    except Exception:
+        return True   # never block on error
+
+
 # ── Market Regime Filter ──────────────────────────────────────────────────────
 # Canonical implementation lives in engine.utils.market.
 # Imported here so existing strategy code continues to call _is_bull_regime() directly.
@@ -241,7 +357,18 @@ class SweepeaStrategy:
                 is_inverse = symbol in _INVERSE_ETFS
                 # Inverse ETFs are valid LONG buys in bear regime
                 regime_ok = is_inverse or _is_bull_regime()
-                if (pb8 or pb20) and uptrend and regime_ok:
+                # Check 1: EMA stack (20 > 50 > 200) — skip for inverse ETFs
+                ema_stack = is_inverse or _ema_stack_ok(daily["close"])
+                # Check 3: price broke above 21–55 day prior range high — skip for inverse ETFs
+                prior_breakout = is_inverse or _above_prior_range_high(daily)
+                # Check 4: RSI > 30 on daily (not oversold) — skip for inverse ETFs
+                _rsi_daily = float(daily["close"].ewm(com=13, adjust=False).mean().iloc[-1])  # fast proxy
+                _rsi_series = daily["close"].diff().pipe(
+                    lambda d: 100 - 100 / (1 + d.clip(lower=0).rolling(14).mean() / (-d.clip(upper=0).rolling(14).mean()).replace(0, 1e-9))
+                )
+                _daily_rsi = float(_rsi_series.iloc[-1]) if len(_rsi_series) >= 14 else 50.0
+                rsi_ok = is_inverse or _daily_rsi > 30
+                if (pb8 or pb20) and uptrend and regime_ok and ema_stack and prior_breakout and rsi_ok:
                     atr14   = _calc_atr14(daily)
                     ema_lbl = "8-EMA" if pb8 else "20-EMA"
                     # High-Tight Flag: up ≥50% in last 4 weeks + tight 5-day consolidation
@@ -362,6 +489,9 @@ class SweepeaStrategy:
 
         _is_inv = symbol in _INVERSE_ETFS
         if bull_pin and (_is_bull_regime() or _is_inv):
+            # Check 2: 4H+15m Fib HL confluence (skip for inverse ETFs — no meaningful fib on them)
+            if not _is_inv and not _fib_hl_ok(symbol):
+                return None
             bull_conf = _sa_metrics_boost(symbol, bull_conf)
             return Signal(symbol, "buy",  float(cur["close"]), bull_conf,
                           f"Liquidity sweep + bullish pinbar | wick {lower_wick_ratio:.0f}% | vol x{vol_ratio:.1f}", "Sweepea")
@@ -412,9 +542,13 @@ class TrendBreakerStrategy:
         if price <= sma20_now:
             return None
 
-        # Price must also clear the 10-day high (prior to today)
-        high_10d = float(daily["high"].iloc[-11:-1].max())
-        if price < high_10d * 1.002:   # requires at least a clean break (0.2% above)
+        # Price must also clear the 21-day high (prior to today) — confirms real breakout
+        high_21d = float(daily["high"].iloc[-22:-1].max())
+        if price < high_21d * 1.002:   # requires at least a clean break (0.2% above)
+            return None
+
+        # Check 1: EMA stack (20 > 50 > 200) must be aligned for a valid squeeze breakout
+        if not _ema_stack_ok(closes):
             return None
 
         # Volume spike: today vs 20-day average
@@ -533,10 +667,12 @@ class TechnicalStrategy:
         score   = 0.0
         reasons = []
 
-        if cur_rsi < TECHNICAL["rsi_oversold"]:
-            score += 0.3
-            reasons.append("Oversold")
-        elif cur_rsi > TECHNICAL["rsi_overbought"]:
+        # Check 4: RSI > 30 — reject oversold entries (price may continue falling).
+        # Exception: inverse ETFs can be bought even when RSI is low (crash-day entries).
+        if cur_rsi <= 30 and not is_inverse:
+            return None
+
+        if cur_rsi > TECHNICAL["rsi_overbought"]:
             # Inverse ETFs can stay overbought during sustained bear markets — don't penalize
             if not is_inverse:
                 score -= 0.3
@@ -656,6 +792,17 @@ class MomentumStrategy:
         if (momentum >= MOMENTUM["min_momentum"]
                 and vol_ratio >= MOMENTUM["volume_surge"]
                 and price > sma20):
+            # Check 1: EMA stack (20 > 50 > 200) on daily bars
+            _daily_mom = get_bars(symbol, "60d", "1d")
+            if not _daily_mom.empty and len(_daily_mom) >= 22:
+                if not _ema_stack_ok(_daily_mom["close"]):
+                    return None
+                # Check 4: RSI > 30 on daily
+                _rsi_mom = _daily_mom["close"].diff().pipe(
+                    lambda d: 100 - 100 / (1 + d.clip(lower=0).rolling(14).mean() / (-d.clip(upper=0).rolling(14).mean()).replace(0, 1e-9))
+                )
+                if float(_rsi_mom.iloc[-1]) <= 30:
+                    return None
             confidence = min(0.73 + (momentum / 100), 0.95)
             # MDA real-time confirmation: ensure momentum is still intact
             q = _mda_quote(symbol)
@@ -738,6 +885,13 @@ class GapBreakoutStrategy:
             return None
 
         atr14 = _calc_atr14(daily)
+        # Check 4: RSI > 30 on daily (gap into oversold is a trap, not a breakout)
+        if len(daily) >= 15:
+            _rsi_gap = daily["close"].diff().pipe(
+                lambda d: 100 - 100 / (1 + d.clip(lower=0).rolling(14).mean() / (-d.clip(upper=0).rolling(14).mean()).replace(0, 1e-9))
+            )
+            if float(_rsi_gap.iloc[-1]) <= 30:
+                return None
         confidence = min(0.73 + (gap_pct / 100), 0.95)
         # Near 52-week high = institutional momentum, not just an intraday gap
         if _near_52w_high(symbol, within_pct=10.0):
