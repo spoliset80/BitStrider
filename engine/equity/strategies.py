@@ -74,20 +74,6 @@ def _ema_stack_ok(closes: pd.Series) -> bool:
     return ema20 > ema50   # fallback when < 200 days available
 
 
-# Check 1b: Price crossed above 20 EMA within the last N daily candles.
-def _ema20_crossed_recently(closes: pd.Series, lookback: int = 7) -> bool:
-    """True if price was below 20 EMA at some point in the last `lookback` days
-    and is currently above it — i.e. a fresh breakout, not a stale trend."""
-    needed = lookback + 22
-    if len(closes) < needed:
-        return True   # insufficient data — don't block
-    ema20        = closes.ewm(span=20, adjust=False).mean()
-    window_close = closes.iloc[-(lookback + 1):-1]
-    window_ema   = ema20.iloc[-(lookback + 1):-1]
-    was_below    = any(float(c) < float(e) for c, e in zip(window_close, window_ema))
-    above_now    = float(closes.iloc[-1]) > float(ema20.iloc[-1])
-    return was_below and above_now
-
 
 # Check 3: Price is above the high from the 21–55 day ago window (prior consolidation breakout).
 def _above_prior_range_high(daily: pd.DataFrame, near_days: int = 21, far_days: int = 55) -> bool:
@@ -359,8 +345,10 @@ class SweepeaStrategy:
                 regime_ok = is_inverse or _is_bull_regime()
                 # Check 1: EMA stack (20 > 50 > 200) — skip for inverse ETFs
                 ema_stack = is_inverse or _ema_stack_ok(daily["close"])
-                # Check 3: price broke above 21–55 day prior range high — skip for inverse ETFs
-                prior_breakout = is_inverse or _above_prior_range_high(daily)
+                # NOTE: _above_prior_range_high is NOT applied here — SweepeaPath A is a pullback
+                # strategy; requiring price to be at a new 21-55d HIGH contradicts the pullback
+                # setup (price has, by design, pulled back below the prior high). EMA stack already
+                # confirms the uptrend structure without blocking legitimate pullback entries.
                 # Check 4: RSI > 30 on daily (not oversold) — skip for inverse ETFs
                 _rsi_daily = float(daily["close"].ewm(com=13, adjust=False).mean().iloc[-1])  # fast proxy
                 _rsi_series = daily["close"].diff().pipe(
@@ -368,7 +356,7 @@ class SweepeaStrategy:
                 )
                 _daily_rsi = float(_rsi_series.iloc[-1]) if len(_rsi_series) >= 14 else 50.0
                 rsi_ok = is_inverse or _daily_rsi > 30
-                if (pb8 or pb20) and uptrend and regime_ok and ema_stack and prior_breakout and rsi_ok:
+                if (pb8 or pb20) and uptrend and regime_ok and ema_stack and rsi_ok:
                     atr14   = _calc_atr14(daily)
                     ema_lbl = "8-EMA" if pb8 else "20-EMA"
                     # High-Tight Flag: up ≥50% in last 4 weeks + tight 5-day consolidation
