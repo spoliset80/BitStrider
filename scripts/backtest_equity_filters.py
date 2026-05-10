@@ -77,10 +77,9 @@ def _calc_rsi14(closes: pd.Series) -> pd.Series:
 def _filter_row(closes_to_date: pd.Series, daily_to_date: pd.DataFrame) -> dict:
     """Return dict of filter pass/fail for a given historical snapshot.
     Mirrors EXACTLY what is live in deployed strategies:
-      ema_stack  - SweepeaPath A, TrendBreaker, MomentumStrategy
-      prior_high - TrendBreaker only (NOT SweepeaPath A — pullback != new high)
+      ema_stack  - SweepeaPath A + MomentumStrategy: conditional on price>=15 AND avg_vol>=300k
+                   TrendBreaker: unconditional
       rsi_ok     - SweepeaPath A, MomentumStrategy, GapBreakout
-    ema20_cross and prior_high on SweepeaPath A removed after regression analysis.
     """
     n = len(closes_to_date)
     result = {"ema_stack": True, "rsi_ok": True}
@@ -92,14 +91,17 @@ def _filter_row(closes_to_date: pd.Series, daily_to_date: pd.DataFrame) -> dict:
     ema50  = closes_to_date.ewm(span=50,  adjust=False).mean()
     spot   = float(closes_to_date.iloc[-1])
 
-    # 1. EMA stack (20 > 50 > 200) — used in SweepeaPath A, TrendBreaker, MomentumStrategy
-    e20, e50 = float(ema20.iloc[-1]), float(ema50.iloc[-1])
-    if n >= 200:
-        ema200 = float(closes_to_date.ewm(span=200, adjust=False).mean().iloc[-1])
-        result["ema_stack"] = e20 > e50 > ema200
-    elif n >= 60:
-        result["ema_stack"] = e20 > e50
-    # else: insufficient — stays True
+    # 1. EMA stack — conditional on liquidity (price >= $15 AND avg 20-day vol >= 300k)
+    avg_vol20  = float(daily_to_date["volume"].iloc[-21:-1].mean()) if n >= 22 else 0
+    liquid     = spot >= 15.0 and avg_vol20 >= 300_000
+    if liquid:
+        e20, e50 = float(ema20.iloc[-1]), float(ema50.iloc[-1])
+        if n >= 200:
+            ema200 = float(closes_to_date.ewm(span=200, adjust=False).mean().iloc[-1])
+            result["ema_stack"] = e20 > e50 > ema200
+        elif n >= 60:
+            result["ema_stack"] = e20 > e50
+    # thin/low-price stocks bypass EMA stack — stays True
 
     # 2. RSI > 30 — used in SweepeaPath A, MomentumStrategy, GapBreakout
     if n >= 16:

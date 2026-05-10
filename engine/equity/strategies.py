@@ -343,12 +343,15 @@ class SweepeaStrategy:
                 is_inverse = symbol in _INVERSE_ETFS
                 # Inverse ETFs are valid LONG buys in bear regime
                 regime_ok = is_inverse or _is_bull_regime()
-                # Check 1: EMA stack (20 > 50 > 200) — skip for inverse ETFs
-                ema_stack = is_inverse or _ema_stack_ok(daily["close"])
-                # NOTE: _above_prior_range_high is NOT applied here — SweepeaPath A is a pullback
-                # strategy; requiring price to be at a new 21-55d HIGH contradicts the pullback
-                # setup (price has, by design, pulled back below the prior high). EMA stack already
-                # confirms the uptrend structure without blocking legitimate pullback entries.
+                # Check 1: EMA stack (20 > 50 > 200) — skip for inverse ETFs and thin/low-price
+                # stocks. Small/mid-cap speculative names (<$15 or avg vol <300k) frequently trend
+                # strongly with a broken EMA stack (post-catalyst, early breakout). Applying the
+                # stack filter to them produces false rejections with no expectancy improvement.
+                _avg_vol20 = float(daily["volume"].iloc[-21:-1].mean()) if len(daily) >= 22 else 0
+                _liquid_stock = float(cur["close"]) >= 15.0 and _avg_vol20 >= 300_000
+                ema_stack = is_inverse or not _liquid_stock or _ema_stack_ok(daily["close"])
+                # NOTE: _above_prior_range_high not applied here — SweepeaPath A is a pullback
+                # strategy; requiring a new 21-55d high contradicts the pullback setup.
                 # Check 4: RSI > 30 on daily (not oversold) — skip for inverse ETFs
                 _rsi_daily = float(daily["close"].ewm(com=13, adjust=False).mean().iloc[-1])  # fast proxy
                 _rsi_series = daily["close"].diff().pipe(
@@ -780,10 +783,14 @@ class MomentumStrategy:
         if (momentum >= MOMENTUM["min_momentum"]
                 and vol_ratio >= MOMENTUM["volume_surge"]
                 and price > sma20):
-            # Check 1: EMA stack (20 > 50 > 200) on daily bars
+            # Check 1: EMA stack (20 > 50 > 200) on daily bars — only for liquid stocks
+            # (price >= $15, avg vol >= 300k). Thin/low-price names trend strongly post-catalyst
+            # even with broken EMA stacks; the filter produces false rejections there.
             _daily_mom = get_bars(symbol, "60d", "1d")
             if not _daily_mom.empty and len(_daily_mom) >= 22:
-                if not _ema_stack_ok(_daily_mom["close"]):
+                _avg_vol_mom = float(_daily_mom["volume"].iloc[-21:-1].mean()) if len(_daily_mom) >= 22 else 0
+                _liquid_mom  = price >= 15.0 and _avg_vol_mom >= 300_000
+                if _liquid_mom and not _ema_stack_ok(_daily_mom["close"]):
                     return None
                 # Check 4: RSI > 30 on daily
                 _rsi_mom = _daily_mom["close"].diff().pipe(
