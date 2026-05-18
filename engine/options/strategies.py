@@ -1536,7 +1536,8 @@ class BearPutStrategy:
 
             # IV gate — spreads tolerate higher IV since short leg hedges premium cost
             if chain.iv_rank > f["IV_RANK_PUT_MAX"]:
-                log.debug(f"BearPut {symbol}: IV rank {chain.iv_rank:.0f} > {f["IV_RANK_PUT_MAX"]} — skip")
+                iv_max = f["IV_RANK_PUT_MAX"]
+                log.debug(f"BearPut {symbol}: IV rank {chain.iv_rank:.0f} > {iv_max} — skip")
                 return None
 
             # Long leg: δ0.30 (OTM)
