@@ -124,16 +124,19 @@ class SchwabMarketDataClient:
         self.oauth = oauth_client
         self.session = requests.Session()
         
-        # Configure connection pooling: increase pool size from default 10 to 25
-        # Configure retry strategy with exponential backoff for transient errors
+        # Configure connection pooling: increase pool size from default 10 to 25.
+        # Do NOT put 502/503/504 in the urllib3 status_forcelist — the manual retry
+        # loops in get_option_chains / get_candles already handle those codes with
+        # meaningful backoff.  Having both layers active multiplies the attempt count
+        # by up to 4×, causing the bot to block for 60–100 seconds per symbol.
         adapter = HTTPAdapter(
-            pool_connections=25,      # Max connections to pool per host
-            pool_maxsize=25,          # Max number of connections to save in pool
+            pool_connections=25,   # Max connections to pool per host
+            pool_maxsize=25,       # Max number of connections to save in pool
             max_retries=Retry(
-                total=3,                           # Total retries across all methods
-                backoff_factor=0.5,               # Exponential backoff: 0.5s, 1s, 2s
-                status_forcelist=[502, 503, 504], # Retry on Bad Gateway, Service Unavailable, Timeout
-                raise_on_status=False             # Don't raise on 4xx (auth/validation errors)
+                total=2,               # Only retry on connection-level failures (not HTTP 5xx)
+                backoff_factor=1.0,
+                status_forcelist=[],   # 502/503/504 handled by the manual loops below
+                raise_on_status=False  # Don't raise on 4xx (auth/validation errors)
             )
         )
         self.session.mount("https://", adapter)
@@ -167,8 +170,8 @@ class SchwabMarketDataClient:
             frequency: 1, 5, 10, 15, 30 for minute; 1 for daily/weekly/monthly
         """
         max_retries = 3
-        backoff_times = [0.5, 1.0, 2.0]
-        timeout_values = [25, 30, 35]  # Progressive timeout: 25s → 30s → 35s on retries
+        backoff_times = [3.0, 8.0, 15.0]  # Longer waits so the API has time to recover
+        timeout_values = [15, 20, 25]      # Shorter first timeout — 502s return quickly
         
         for attempt in range(max_retries):
             try:
@@ -241,8 +244,8 @@ class SchwabMarketDataClient:
             Options chain data or None on persistent failure
         """
         max_retries = 3
-        backoff_times = [0.5, 1.0, 2.0]  # Exponential: 0.5s, 1s, 2s
-        timeout_values = [25, 30, 35]    # Progressive timeout: 25s → 30s → 35s on retries
+        backoff_times = [3.0, 8.0, 15.0]  # Longer waits so the API has time to recover
+        timeout_values = [15, 20, 25]      # Shorter first timeout — 502s return quickly
         
         for attempt in range(max_retries):
             try:

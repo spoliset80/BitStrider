@@ -1015,7 +1015,8 @@ class OptionsExecutor:
                     )
             else:
                 # Normal session: IV rank decides naked vs spread
-                _force_spread = signal.iv_rank > 35
+                from engine.config import OPTIONS_IV_RANK_SPREAD_THRESHOLD
+                _force_spread = signal.iv_rank > OPTIONS_IV_RANK_SPREAD_THRESHOLD
 
             if not _force_spread:
                 # Trade as pure naked single-leg — ignore any spread_sell_strike from strategy
@@ -1120,6 +1121,10 @@ class OptionsExecutor:
                         {"symbol": _alpaca_option_symbol(signal.symbol, signal.expiry, cp_type, _eff_spread_sell_strike), "side": secondary_side, "ratio_qty": 1}
                     ]
 
+                # Helper defined here so it's in scope for both Schwab pricing and payload construction
+                def _leg_side_str(leg_side) -> str:
+                    return leg_side.value if hasattr(leg_side, "value") else str(leg_side)
+
                 # ── STEP 4a: Fetch Real-Time Schwab Pricing ───────────────────
                 # Build Schwab leg format for pricing API
                 try:
@@ -1153,6 +1158,14 @@ class OptionsExecutor:
                         _schwab_spread_bid = schwab_pricing.get("spread_bid")
                         _schwab_spread_ask = schwab_pricing.get("spread_ask")
                         
+                        # Abort if credit spread returns near-zero premium — pricing failure
+                        if not ("buy" in signal.action) and abs(_schwab_spread_mark) < 0.05:
+                            log.warning(
+                                f"[OPTIONS] {signal.symbol} Schwab mark=${_schwab_spread_mark:.3f} too low "
+                                f"(< $0.05 min credit) — skipping to avoid $0 premium trade"
+                            )
+                            return
+
                         # Use Schwab mark to set limit price (1% improvement)
                         if "buy" in signal.action:
                             # Debit: bid 1% below mark (pay less)
@@ -1173,14 +1186,25 @@ class OptionsExecutor:
                         # Use Schwab-based limit price for order
                         limit_price = _schwab_limit_override
                     else:
+                        # Schwab returned None — validate estimated fallback before using it
+                        if not ("buy" in signal.action) and abs(limit_price) < 0.05:
+                            log.warning(
+                                f"[OPTIONS] {signal.symbol} Schwab pricing unavailable and estimated "
+                                f"credit=${limit_price:.3f} < $0.05 min — skipping trade"
+                            )
+                            return
                         log.warning(f"[OPTIONS] {signal.symbol} failed to fetch Schwab pricing, using estimated limit=${limit_price:.2f}")
                 except Exception as e:
+                    # Validate estimated fallback before using it
+                    if not ("buy" in signal.action) and abs(limit_price) < 0.05:
+                        log.warning(
+                            f"[OPTIONS] {signal.symbol} Schwab pricing error and estimated "
+                            f"credit=${limit_price:.3f} < $0.05 min — skipping trade. Error: {e}"
+                        )
+                        return
                     log.error(f"[OPTIONS] {signal.symbol} Schwab pricing error: {e}, using estimated limit=${limit_price:.2f}")
 
                 # Construct Payload
-                def _leg_side_str(leg_side) -> str:
-                    return leg_side.value if hasattr(leg_side, "value") else str(leg_side)
-
                 payload = {
                     "symbol": "", # Must be empty for MLEG
                     "qty": str(int(round(contracts))),
@@ -1533,10 +1557,15 @@ class OptionsExecutor:
                                 spread_ask += sign * ask * ratio
                                 spread_mark += sign * mid * ratio
                             
-                            # Clamp negative spreads to 0 (pricing error indicator)
-                            spread_bid = max(0.0, spread_bid)
-                            spread_ask = max(0.0, spread_ask)
-                            spread_mark = max(0.0, spread_mark)
+                            # For DEBIT spreads (entry_price_signed > 0): clamp negative composite
+                            # prices to $0 — they're pricing artifacts (debit spreads can't go below $0).
+                            # For CREDIT spreads (entry_price_signed < 0): a negative composite is
+                            # VALID — it means the cost-to-close exceeds the credit received (max loss).
+                            # Clamping to 0 would make a max-loss Bear Call show as +100% profit.
+                            if entry_price_signed >= 0:
+                                spread_bid = max(0.0, spread_bid)
+                                spread_ask = max(0.0, spread_ask)
+                                spread_mark = max(0.0, spread_mark)
                             
                             current_mark = spread_mark
                             pnl_pct = (spread_mark - entry_price_signed) / abs(entry_price_signed) * 100

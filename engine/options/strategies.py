@@ -1324,13 +1324,21 @@ class MomentumCallStrategy:
             # Get TI-specific thresholds if applicable
             min_move = _get_move_threshold(symbol)
             min_rvol = _get_rvol_threshold(symbol)
-            
+            # In bull regime, relax daily move threshold by 30% — we don't need a fresh
+            # gap-up on every day; a trending move in an established bull is sufficient.
+            if _is_bull_regime():
+                min_move = min_move * 0.7
+                min_rvol = min_rvol * 0.8
+
             if ctx.chg_pct < min_move:
                 return None
             if ctx.vol_ratio < min_rvol:
                 return None
 
-            if ctx.rsi is None or not (50 <= ctx.rsi <= 72):
+            # In confirmed bull regime, allow up to RSI 80 (post-rally continuation)
+            # to avoid rejecting everything the day after a big rally move.
+            rsi_ceil = 80 if _is_bull_regime() else 72
+            if ctx.rsi is None or not (50 <= ctx.rsi <= rsi_ceil):
                 return None
 
             # A+ Filter 1: EMA-20 trend alignment
@@ -1343,9 +1351,11 @@ class MomentumCallStrategy:
                 return None
 
             # A+ Filter 3: breakout above prior 21-day high (stronger confirmation)
-            # Uses [-23:-2] to exclude the last 2 days (entry day + yesterday) and look back 21 sessions
-            prior_21d_high = float(ctx.daily["high"].iloc[-23:-2].max()) if len(ctx.daily) >= 23 else float(ctx.daily["high"].iloc[:-2].max())
-            if ctx.spot < prior_21d_high * 0.995:
+            # Uses [-22:-1] to exclude only today and look at prior 21 sessions including yesterday.
+            # In bull regime, allow 2% below prior high (regime confirmation substitutes for fresh breakout).
+            prior_21d_high = float(ctx.daily["high"].iloc[-22:-1].max()) if len(ctx.daily) >= 22 else float(ctx.daily["high"].iloc[:-1].max())
+            breakout_floor = 0.98 if _is_bull_regime() else 0.995
+            if ctx.spot < prior_21d_high * breakout_floor:
                 return None
 
             chain = _get_options_chain(symbol)
@@ -1878,6 +1888,14 @@ class BearCallSpreadStrategy:
 
         bull = _is_bull_regime()
 
+        # BearCallSpread profits when stock stays flat or falls.
+        # In a bull market the entire tape is rising — even "overbought" stocks
+        # continue higher. Selling calls in a bull regime leads to the exact
+        # situation we just experienced (SMH 570/575 ITM immediately).
+        if bull:
+            log.debug(f"BearCallSpread {symbol}: bull regime — skipping (bearish strategy)")
+            return None
+
         try:
             ctx = _fetch_bar_context(symbol)
             if ctx is None or len(ctx.closes) < 25:
@@ -1886,14 +1904,9 @@ class BearCallSpreadStrategy:
             if ctx.rsi is None:
                 return None
 
-            # In bear: accept flat-to-down days. In bull: require overbought RSI.
-            if bull:
-                if ctx.rsi < 68:
-                    return None
-            else:
-                # Bear regime: stock should be in downtrend context, not crashing today
-                if ctx.chg_pct < -4.0 or ctx.chg_pct > 1.0:
-                    return None
+            # Bear/neutral regime only: stock should be flat-to-down, not crashing
+            if ctx.chg_pct < -4.0 or ctx.chg_pct > 1.0:
+                return None
 
             # Don't sell calls into a genuine upside breakout (we'd get run over)
             if not _three_day_trend(ctx.closes, "down") and not bull:
@@ -1924,6 +1937,11 @@ class BearCallSpreadStrategy:
             short_strike = float(short_row["strike"])
             if short_strike <= ctx.spot:
                 return None  # must be OTM
+            # Require at least 3% OTM buffer — prevents selling near-ATM calls
+            # that get blown through on any momentum move
+            if short_strike < ctx.spot * 1.03:
+                log.debug(f"BearCallSpread {symbol}: short strike {short_strike:.2f} < 3% OTM (spot={ctx.spot:.2f}) — skip")
+                return None
 
             if "bid" in short_row.index and "ask" in short_row.index:
                 short_mid = (float(short_row["bid"]) + float(short_row["ask"])) / 2.0
@@ -2961,7 +2979,7 @@ class MeanReversionCallStrategy:
 _STRATEGY_REGIME_ADJUSTMENTS = {
     "MomentumCall": {"BULLISH": +0.10, "BULL_NEUTRAL": +0.05, "NEUTRAL": -0.05, "BEAR_NEUTRAL": -0.10, "BEARISH": -0.15},
     "BearPut": {"BULLISH": -0.10, "BULL_NEUTRAL": -0.05, "NEUTRAL": +0.05, "BEAR_NEUTRAL": +0.10, "BEARISH": +0.15},
-    "BearCallSpread": {"BULLISH": -0.08, "BULL_NEUTRAL": -0.03, "NEUTRAL": -0.15, "BEAR_NEUTRAL": +0.08, "BEARISH": +0.12},
+    "BearCallSpread": {"BULLISH": -1.00, "BULL_NEUTRAL": -0.20, "NEUTRAL": -0.15, "BEAR_NEUTRAL": +0.08, "BEARISH": +0.12},
     "ShortSqueeze": {"BULLISH": +0.08, "BULL_NEUTRAL": +0.03, "NEUTRAL": -0.20, "BEAR_NEUTRAL": -0.08, "BEARISH": -0.12},
     "MeanReversion": {"BULLISH": +0.03, "BULL_NEUTRAL": +0.02, "NEUTRAL": +0.03, "BEAR_NEUTRAL": +0.05, "BEARISH": +0.08},
     "BreakoutRetest": {"BULLISH": +0.05, "BULL_NEUTRAL": +0.02, "NEUTRAL": -0.10, "BEAR_NEUTRAL": -0.08, "BEARISH": -0.10},

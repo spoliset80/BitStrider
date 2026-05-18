@@ -63,6 +63,7 @@ OPTIONS_MIN_ADV             = float(os.getenv("OPTIONS_MIN_ADV", "500_000"))    
 OPTIONS_MIN_ADV_TI          = float(os.getenv("OPTIONS_MIN_ADV_TI", "150_000"))   # min ADV for TI unusual options (lower threshold for micro-cap unusual picks)
 OPTIONS_UNIVERSE_OVERRIDE   = os.getenv("OPTIONS_UNIVERSE_OVERRIDE", "").strip()  # comma-separated tickers to force a smaller options universe
 OPTIONS_STOP_COOLDOWN_DAYS  = int(os.getenv("OPTIONS_STOP_COOLDOWN_DAYS", "2"))   # no re-entry within N days after a stop on same symbol
+OPTIONS_IV_RANK_SPREAD_THRESHOLD = int(os.getenv("OPTIONS_IV_RANK_SPREAD_THRESHOLD", "60"))  # IV rank above this → force spread; below → allow naked
 OPTIONS_EARNINGS_AVOID_DAYS = int(os.getenv("OPTIONS_EARNINGS_AVOID_DAYS", "15")) # skip entries if earnings within N calendar days
 # Trailing stop: locks in gains after big moves. Flexible to let winners run.
 OPTIONS_TRAIL_ACTIVATE_PCT  = float(os.getenv("OPTIONS_TRAIL_ACTIVATE_PCT", "25.0"))  # trailing stop arms at +25% P&L (was 20%)
@@ -199,6 +200,11 @@ TRADE_MODE = os.getenv("TRADE_MODE", "paper").lower()
 PAPER      = TRADE_MODE == "paper"
 LIVE       = not PAPER
 _MODE      = "PAPER" if PAPER else "LIVE"
+
+# Paper mode: lift options position caps so all strategies can be tested freely
+if PAPER:
+    OPTIONS_MAX_POSITIONS      = int(os.getenv("OPTIONS_MAX_POSITIONS",      "999"))
+    OPTIONS_MAX_MLEG_POSITIONS = int(os.getenv("OPTIONS_MAX_MLEG_POSITIONS", "999"))
 
 API_KEY    = os.getenv(f"{_MODE}_ALPACA_API_KEY", "")
 API_SECRET = os.getenv(f"{_MODE}_ALPACA_API_SECRET", "")

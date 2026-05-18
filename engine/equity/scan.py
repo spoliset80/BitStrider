@@ -337,7 +337,10 @@ def _passes_guardrails(symbol: str, bull_regime: bool = None, market_state: Opti
                                 )
                                 day_slice = past_intraday.loc[day_mask, "volume"]
                                 n = len(day_slice)
-                                if n >= max(3, int(elapsed_min * 0.50)):
+                                # Accept sessions with >=20% bar density (micro-caps trade
+                                # only ~20-35% of minutes — 50% was too strict and caused
+                                # all illiquid symbols to fall through to the legacy fallback).
+                                if n >= max(3, int(elapsed_min * 0.20)):
                                     # Scale partial sessions to full elapsed-window equivalent
                                     avg_vols.append(float(day_slice.sum()) * (elapsed_min / n))
 
@@ -389,14 +392,15 @@ def _passes_guardrails(symbol: str, bull_regime: bool = None, market_state: Opti
                     denom = avg_daily_vol * max(elapsed_frac, 0.02)
                     rvol_fallback = today_vol_fb / denom if denom > 0 else 0.0
                     rvol_threshold = adaptive_rvol * (_IEX_THRESHOLD_SCALE if iex_feed else 1.0)
-                    _log.warning(
-                        f"[RVOL@TIME FALLBACK] {symbol}: no valid prior-session bars — "
-                        f"fractional legacy RVOL: rvol={rvol_fallback:.3f}, "
-                        f"threshold={rvol_threshold:.2f} "
-                        f"(avg_daily={avg_daily_vol:.0f} elapsed_frac={elapsed_frac:.3f} "
-                        f"iex_scale={iex_feed})"
-                    )
                     if not iex_feed and rvol_fallback < rvol_threshold:
+                        # Only warn (and block) when the symbol actually fails the gate
+                        _log.warning(
+                            f"[RVOL@TIME FALLBACK] {symbol}: no valid prior-session bars — "
+                            f"fractional legacy RVOL: rvol={rvol_fallback:.3f}, "
+                            f"threshold={rvol_threshold:.2f} "
+                            f"(avg_daily={avg_daily_vol:.0f} elapsed_frac={elapsed_frac:.3f} "
+                            f"iex_scale={iex_feed})"
+                        )
                         _log.warning(
                             f"[GUARDRAIL] {symbol} blocked: RVOL_FALLBACK {rvol_fallback:.2f} < "
                             f"rvol_threshold {rvol_threshold:.2f} (adaptive={adaptive_rvol:.2f}) "
@@ -405,6 +409,13 @@ def _passes_guardrails(symbol: str, bull_regime: bool = None, market_state: Opti
                         if return_reason:
                             return False, 'rvol'
                         return False
+                    else:
+                        # Passing symbols: debug only (no need to spam WARNING for every scan)
+                        _log.debug(
+                            f"[RVOL@TIME FALLBACK] {symbol}: no prior-session 1m bars — "
+                            f"fallback rvol={rvol_fallback:.3f} >= threshold={rvol_threshold:.2f} "
+                            f"(avg_daily={avg_daily_vol:.0f} elapsed_frac={elapsed_frac:.3f}) — passing"
+                        )
 
                 _rvol_gate_applied = True  # RVOL@TIME block ran — skip legacy gate below
                 # Time-weighted dollar volume guardrail

@@ -132,13 +132,18 @@ def get_spread_complete_pricing(
                 f"bid=${bid_price:.2f} mid=${mark_price:.2f} ask=${ask_price:.2f}"
             )
         
-        # Clamp negative spreads to $0.00
-        if spread_bid < 0:
-            spread_bid = 0.0
-        if spread_mark < 0:
-            spread_mark = 0.0
-        if spread_ask < 0:
-            spread_ask = 0.0
+        # For DEBIT spreads (entry_price > 0): clamp negative composite prices to $0
+        # (negative composite is a pricing artifact — debit spreads can't go below $0).
+        # For CREDIT spreads (entry_price < 0): a negative composite is VALID — it means
+        # the cost-to-close exceeds the credit received (i.e., a losing position near max loss).
+        # Clamping to 0 here would make a max-loss credit spread look like +100% profit.
+        if entry_price >= 0:
+            if spread_bid < 0:
+                spread_bid = 0.0
+            if spread_mark < 0:
+                spread_mark = 0.0
+            if spread_ask < 0:
+                spread_ask = 0.0
         
         # Calculate DTE
         dte = None
