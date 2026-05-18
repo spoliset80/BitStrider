@@ -1364,7 +1364,8 @@ class MomentumCallStrategy:
 
             # A+ Filter 4: IV rank -- buy cheap premium only
             if chain.iv_rank > f["IV_RANK_CALL_MAX"]:
-                log.debug(f"MomentumCall {symbol}: IV rank {chain.iv_rank:.0f} > {f["IV_RANK_CALL_MAX"]} (dynamic) -- skip")
+                iv_max = f["IV_RANK_CALL_MAX"]
+                log.debug(f"MomentumCall {symbol}: IV rank {chain.iv_rank:.0f} > {iv_max} (dynamic) -- skip")
                 return None
 
             strike_row = _pick_strike(chain.calls, ctx.spot, OPTIONS_DELTA_TARGET, f)
