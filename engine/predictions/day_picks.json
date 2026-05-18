@@ -1,47 +1,15 @@
 {
-  "generated_at": "2026-05-06T23:48:28-04:00",
-  "date": "2026-05-06",
+  "generated_at": "2026-05-18T13:50:23-04:00",
+  "date": "2026-05-18",
   "market_regime": "bull",
   "picks": [
     {
-      "symbol": "PKST",
+      "symbol": "XYLD",
       "action": "buy",
-      "price": 20.99,
+      "price": 40.52,
       "confidence": 0.82,
       "strategy": "Sweepea",
-      "reason": "Daily Sweepea pullback to 8-EMA | ATR $0.02"
-    },
-    {
-      "symbol": "HUT",
-      "action": "buy",
-      "price": 80.51,
-      "confidence": 0.82,
-      "strategy": "Sweepea",
-      "reason": "Daily Sweepea pullback to 8-EMA | ATR $4.74"
-    },
-    {
-      "symbol": "REPL",
-      "action": "buy",
-      "price": 2.87,
-      "confidence": 0.82,
-      "strategy": "Sweepea",
-      "reason": "Daily Sweepea pullback to 8-EMA | ATR $0.35"
-    },
-    {
-      "symbol": "TGTX",
-      "action": "buy",
-      "price": 36.1,
-      "confidence": 0.82,
-      "strategy": "Sweepea",
-      "reason": "Daily Sweepea pullback to 8-EMA | ATR $1.46"
-    },
-    {
-      "symbol": "UAMY",
-      "action": "buy",
-      "price": 11.15,
-      "confidence": 0.82,
-      "strategy": "Sweepea",
-      "reason": "Daily Sweepea pullback to 8-EMA | ATR $1.19"
+      "reason": "Daily Sweepea pullback to 8-EMA | ATR $0.12"
     }
   ]
 }

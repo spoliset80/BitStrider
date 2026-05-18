@@ -30,6 +30,10 @@ OPTIONS_ALLOCATION_PCT      = float(os.getenv("OPTIONS_ALLOCATION_PCT", "15.0"))
 OPTIONS_MAX_POSITIONS       = int(os.getenv("OPTIONS_MAX_POSITIONS", "4"))        # max open options positions total
 OPTIONS_MAX_MLEG_POSITIONS  = int(os.getenv("OPTIONS_MAX_MLEG_POSITIONS", "2"))   # hard limit: max open spreads/butterflies/condors
 OPTIONS_MAX_MLEG_CONTRACTS  = int(os.getenv("OPTIONS_MAX_MLEG_CONTRACTS", "2"))   # hard limit: max contracts per spread entry
+# Comma-separated list of allowed strategy names. Empty = all strategies enabled.
+# Example: OPTIONS_ALLOWED_STRATEGIES=MomentumCall,CoveredCall
+_raw_allowed = os.getenv("OPTIONS_ALLOWED_STRATEGIES", "")
+OPTIONS_ALLOWED_STRATEGIES  = {s.strip() for s in _raw_allowed.split(",") if s.strip()} if _raw_allowed.strip() else set()
 OPTIONS_DTE_MIN             = int(os.getenv("OPTIONS_DTE_MIN", "14"))             # min days-to-expiry at entry (14 avoids forced same-day close = PDT hit)
 OPTIONS_DTE_MAX             = int(os.getenv("OPTIONS_DTE_MAX", "40"))             # max days-to-expiry at entry
 OPTIONS_DELTA_TARGET        = float(os.getenv("OPTIONS_DELTA_TARGET", "0.55"))    # target delta — 0.55 = ATM/slight ITM (higher profit/point)
@@ -41,10 +45,11 @@ OPTIONS_MIN_IV_PCT          = float(os.getenv("OPTIONS_MIN_IV_PCT", "15.0"))    
 # Options Stop-Loss & Profit-Taking Strategy (OPTIMIZED)
 # ─────────────────────────────────────────────────────────────────
 # *** SPREADS: Use strategy-specific SL (profit target + underlying movement + DTE)
-# *** NAKED: Use -35% debit SL (percentage-based) — for long calls/puts without caps
+# *** NAKED: Use -25% debit SL (percentage-based) — for long calls/puts without caps
+# Tightened from -35%: naked calls decay fast; cut losers quicker to preserve capital for re-entries.
 # Grace period extended to 3 days — options need time to settle after entry.
 # Scale-out strategy: Close 50% at first target, hold 50% with tighter stop for max profit.
-OPTIONS_STOP_LOSS_PCT       = float(os.getenv("OPTIONS_STOP_LOSS_PCT", "35.0"))      # -35% loss for NAKED options (NOT spreads)
+OPTIONS_STOP_LOSS_PCT       = float(os.getenv("OPTIONS_STOP_LOSS_PCT", "25.0"))      # -25% loss for NAKED options (NOT spreads)
 OPTIONS_PROFIT_TARGET_1_PCT = float(os.getenv("OPTIONS_PROFIT_TARGET_1_PCT", "50.0"))  # close 50% of position at +50% (lock solid profit)
 OPTIONS_PROFIT_TARGET_1_STOP_PCT = float(os.getenv("OPTIONS_PROFIT_TARGET_1_STOP_PCT", "20.0"))  # new stop for 2nd half at +20% (breakeven guard)
 OPTIONS_PROFIT_TARGET_2_PCT = float(os.getenv("OPTIONS_PROFIT_TARGET_2_PCT", "100.0"))  # close remaining 50% at +100% or max profit

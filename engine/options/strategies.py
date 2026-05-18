@@ -37,6 +37,7 @@ from engine.options._options_today import _calc_iv_rank
 from engine.utils import MarketState, get_bars, calc_rsi
 from engine.config import (
     OPTIONS_ENABLED,
+    OPTIONS_ALLOWED_STRATEGIES,
     OPTIONS_DTE_MIN,
     OPTIONS_DTE_MAX,
     OPTIONS_DELTA_TARGET,
@@ -1346,9 +1347,14 @@ class MomentumCallStrategy:
             if not trend_ok:
                 return None
 
-            # A+ Filter 2: 3-day momentum confirmation
-            if not _three_day_trend(ctx.closes, "up"):
-                return None
+            # A+ Filter 2: 3-day momentum confirmation — require last 2 closes both up
+            # (stricter than _three_day_trend which allows up-down-up whipsaws)
+            if len(ctx.closes) >= 4:
+                c = ctx.closes.iloc[-3:].tolist()
+                if not (c[-1] > c[-2] > c[-3]):
+                    # Allow if today is up AND prior 3-day trend is up (2-of-3 with recency weight)
+                    if not (c[-1] > c[-2] and ctx.chg_pct >= min_move * 1.5):
+                        return None
 
             # A+ Filter 3: breakout above prior 21-day high (stronger confirmation)
             # Uses [-22:-1] to exclude only today and look at prior 21 sessions including yesterday.
@@ -1382,6 +1388,11 @@ class MomentumCallStrategy:
             if mid <= 0:
                 return None
 
+            # Momentum calls benefit from shorter DTE — cap at 21 days so theta
+            # doesn't overwhelm the directional move. Global DTE_MAX may be 40.
+            if dte > 21:
+                return None
+
             # A+ Filter 5: Premium/spot cap
             if mid / ctx.spot * 100 > f["MAX_PREMIUM_SPOT"]:
                 return None
@@ -1398,9 +1409,11 @@ class MomentumCallStrategy:
                     return None
 
             # A+ Confidence formula (raised base from 0.72 to 0.75 for better quality)
+            # Use actual min_move threshold as baseline (not hardcoded 3.0) so bull-regime
+            # relaxed thresholds don't produce negative confidence adjustments.
             conf  = 0.75
-            conf += min(0.06, (ctx.chg_pct - 3.0) * 0.015)
-            conf += min(0.05, (ctx.vol_ratio - 1.5) * 0.025)
+            conf += min(0.06, (ctx.chg_pct - min_move) * 0.015)
+            conf += min(0.05, (ctx.vol_ratio - min_rvol) * 0.025)
             conf += min(0.04, (f["IV_RANK_CALL_MAX"] - chain.iv_rank) * 0.001)
             conf += min(0.04, (rr - f["MIN_RR"]) * 0.02)
             if ctx.spot > prior_21d_high:
@@ -3276,8 +3289,12 @@ def scan_options_universe(
 
         symbol_got_signal = False
         # Try all strategies in priority order; one signal per symbol per cycle
+        # OPTIONS_ALLOWED_STRATEGIES restricts to a named subset when non-empty.
+        _allowed = OPTIONS_ALLOWED_STRATEGIES  # empty set = all enabled
         for strat in (momentum_strat, bear_put_strat, bear_call_strat, squeeze_strat, mean_rev_strat,
                       retest_strat, trend_spread_strat, iron_condor_strat, butterfly_strat):
+            if _allowed and strat.name not in _allowed:
+                continue
             sig = strat.scan(symbol)
             if sig and sig.confidence >= conf_threshold:  # Use TI-specific or major cap threshold
                 signals.append(sig)
