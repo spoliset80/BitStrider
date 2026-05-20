@@ -3204,118 +3204,131 @@ def scan_options_universe(
     
     # Set global ti_universe for strategy access (used by _is_ti_symbol and threshold getters)
     _CURRENT_TI_UNIVERSE = ti_universe
-    
-    signals: List[OptionSignal] = []
-    momentum_strat      = MomentumCallStrategy()
-    bear_put_strat      = BearPutStrategy()
-    bear_call_strat     = BearCallSpreadStrategy()
-    squeeze_strat       = ShortSqueezeStrategy()
-    retest_strat        = BreakoutRetestCallStrategy()
-    mean_rev_strat      = MeanReversionCallStrategy()
-    trend_spread_strat  = TrendPullbackSpreadStrategy()
-    iron_condor_strat   = IronCondorStrategy()
-    butterfly_strat     = ButterflyStrategy()
-    covered_strat       = CoveredCallStrategy()
 
-    fail_counts: Dict[str, int] = {}
-    fail_examples: Dict[str, List[str]] = {}
-    def _record_fail(key: str, symbol: str) -> None:
-        fail_counts[key] = fail_counts.get(key, 0) + 1
-        if len(fail_examples.get(key, [])) < 6:
-            fail_examples.setdefault(key, []).append(symbol)
+    signals = []  # Ensure signals is always defined
 
-    today = datetime.date.today()
-    _n_total = len(ti_universe)
-    log.info(f"Options scan: starting — {_n_total} ticker(s) in universe")
+    def scan(self, symbol: str) -> Optional[OptionSignal]:
+        f = _get_filters()
+        if not OPTIONS_ENABLED:
+            log.debug(f"MomentumCall {symbol}: OPTIONS_ENABLED is False — skip")
+            return None
+        is_inverse = symbol in _INVERSE_ETFS
+        if not is_inverse and not _is_bull_regime():
+            log.debug(f"MomentumCall {symbol}: not bull regime and not inverse ETF — skip")
+            return None
 
-    # ── Parallel prefetch: bars + OI + option chains ────────────────────────
-    # All three data sources are fetched concurrently before the serial strategy loop.
-    # This converts the dominant serial I/O cost (N×3–5s per chain) into parallel I/O
-    # that runs in ~max(single_fetch) time regardless of universe size.
-    #
-    #  (1) 80d bars      → _bar_ctx_cache  (used by every strategy, ADV gate reuses too)
-    #  (2) OI contracts  → _oi_cache       (OCC daily, already cached per trading day)
-    #  (3) option chain  → _chain_cache    (snapshots + greeks, 10-min TTL)
-    _bar_ctx_cache.clear()
-    exp_gte = today + datetime.timedelta(days=OPTIONS_DTE_MIN)
-    exp_lte = today + datetime.timedelta(days=OPTIONS_DTE_MAX)
-
-    def _prefetch(sym: str) -> None:
         try:
-            _fetch_bar_context(sym)          # populates _bar_ctx_cache[sym]
-        except Exception:
-            _bar_ctx_cache.setdefault(sym, None)
+            ctx = _fetch_bar_context(symbol)
+            if ctx is None or len(ctx.closes) < 25:
+                log.debug(f"MomentumCall {symbol}: insufficient bar context or closes < 25 — skip")
+                return None
+
+            if ctx.chg_pct < OPTIONS_MIN_MOVE_PCT:
+                log.debug(f"MomentumCall {symbol}: chg_pct {ctx.chg_pct:.2f} < min {OPTIONS_MIN_MOVE_PCT} — skip")
+                return None
+            if ctx.vol_ratio < OPTIONS_MIN_RVOL:
+                log.debug(f"MomentumCall {symbol}: vol_ratio {ctx.vol_ratio:.2f} < min {OPTIONS_MIN_RVOL} — skip")
+                return None
+
+            if ctx.rsi is None or not (50 <= ctx.rsi <= 72):
+                log.debug(f"MomentumCall {symbol}: RSI {ctx.rsi} not in 50-72 — skip")
+                return None
+
+            trend_ok, ema20 = _trend_aligned(ctx.closes, "up")
+            if not trend_ok:
+                log.debug(f"MomentumCall {symbol}: EMA-20 trend not aligned — skip")
+                return None
+
+            if not _three_day_trend(ctx.closes, "up"):
+                log.debug(f"MomentumCall {symbol}: 3-day momentum not confirmed — skip")
+                return None
+
+            prior_5d_high = float(ctx.daily["high"].iloc[-7:-2].max())
+            if ctx.spot < prior_5d_high * 0.995:
+                log.debug(f"MomentumCall {symbol}: spot {ctx.spot:.2f} < 0.995 * prior_5d_high {prior_5d_high:.2f} — skip")
+                return None
+
+            chain = _get_options_chain(symbol)
+            if chain is None:
+                log.debug(f"MomentumCall {symbol}: options chain not found — skip")
+                return None
+
+            if chain.iv_rank > f["IV_RANK_CALL_MAX"]:
+                log.debug(f"MomentumCall {symbol}: IV rank {chain.iv_rank:.0f} > {f['IV_RANK_CALL_MAX']} (dynamic) -- skip")
+                return None
+
+            strike_row = _pick_strike(chain.calls, ctx.spot, OPTIONS_DELTA_TARGET, f)
+            if strike_row is None:
+                log.debug(f"MomentumCall {symbol}: no suitable strike found — skip")
+                return None
+
+            strike = float(strike_row["strike"])
+            mid    = float(strike_row.get("mid", strike_row.get("lastprice", 0)))
+            iv_pct = float(strike_row.get("iv_pct", chain.hv_30))
+            delta  = float(strike_row.get("delta", OPTIONS_DELTA_TARGET))
+            oi     = int(strike_row.get("openinterest", 0))
+            dte    = (chain.expiry - datetime.date.today()).days
+
+            if mid <= 0:
+                log.debug(f"MomentumCall {symbol}: mid price {mid} <= 0 — skip")
+                return None
+
+            if mid / ctx.spot * 100 > f["MAX_PREMIUM_SPOT"]:
+                log.debug(f"MomentumCall {symbol}: premium/spot {mid / ctx.spot * 100:.2f}% > max {f['MAX_PREMIUM_SPOT']}% — skip")
+                return None
+
+            rr = _calc_rr(chain.atr14, dte, mid)
+            if rr < f["MIN_RR"]:
+                log.debug(f"MomentumCall {symbol}: R/R {rr:.2f} < min {f['MIN_RR']} — skip")
+                return None
+
+            if "openinterest" in chain.calls.columns and chain.calls["openinterest"].max() > 0:
+                atm = chain.calls[(chain.calls["strike"] >= ctx.spot * 0.90) & (chain.calls["strike"] <= ctx.spot * 1.10)]
+                if int(atm["openinterest"].sum()) < f["MIN_OI_ATM"]:
+                    log.debug(f"MomentumCall {symbol}: ATM OI {int(atm['openinterest'].sum())} < min {f['MIN_OI_ATM']} — skip")
+                    return None
+
+            conf  = 0.72
+            conf += min(0.06, (ctx.chg_pct - 3.0) * 0.015)
+            conf += min(0.05, (ctx.vol_ratio - 1.5) * 0.025)
+            conf += min(0.04, (f["IV_RANK_CALL_MAX"] - chain.iv_rank) * 0.001)
+            conf += min(0.04, (rr - f["MIN_RR"]) * 0.02)
+            if ctx.spot > prior_5d_high:
+                conf += 0.03   # genuine breakout bonus
+            confidence = round(min(0.97, conf), 3)
+
+            return OptionSignal(
+                symbol=symbol,
+                option_type="call",
+                action="buy_to_open",
+                strike=strike,
+                expiry=chain.expiry,
+                mid_price=mid,
+                confidence=confidence,
+                reason=(
+                    f"Breakout +{ctx.chg_pct:.1f}% vol={ctx.vol_ratio:.1f}x RSI={ctx.rsi:.0f} "
+                    f"EMA20=${ema20:.2f}^ IVrank={chain.iv_rank:.0f} R/R={rr:.1f}x "
+                    f"| {dte}DTE ${strike:.0f}C d={delta:.2f} IV={iv_pct:.0f}%"
+                ),
+                strategy=self.name,
+                iv_pct=iv_pct,
+                iv_rank=chain.iv_rank,
+                delta=delta,
+                open_interest=oi,
+                rr_ratio=rr,
+                breakeven=round(strike + mid, 2),
+            )
+
+        except Exception as e:
+            log.debug(f"MomentumCall {symbol}: {e}")
+            return None
+
+    def _score(signal):
+        # Sort by composite score: confidence * rr_ratio (fallback to 0 if missing)
         try:
-            _fetch_oi_from_contracts(sym, exp_gte, exp_lte)  # populates _oi_cache[sym]
+            return float(getattr(signal, 'confidence', 0)) * float(getattr(signal, 'rr_ratio', 0))
         except Exception:
-            pass
-        try:
-            _get_options_chain(sym)          # populates _chain_cache[sym]
-        except Exception:
-            pass
-
-    # Workers for parallel prefetch (bars, OI, chain fetches)
-    # Reduced from 24 to 8 to avoid overwhelming Schwab API when they're rate limiting or have issues.
-    # Schwab returns 502/503 under concurrent load; lower concurrency improves stability.
-    # 8 workers with 3x backoff retry in schwab_client gives us graceful degradation vs hammering them.
-    _PREFETCH_WORKERS = min(8, _n_total)
-    with concurrent.futures.ThreadPoolExecutor(max_workers=_PREFETCH_WORKERS) as pool:
-        list(pool.map(_prefetch, ti_universe))
-    log.info(f"Options scan: prefetch complete — starting strategy evaluation")
-    # ─────────────────────────────────────────────────────────────────────────
-
-    for _scan_idx, symbol in enumerate(ti_universe, 1):
-        # Get appropriate thresholds for this symbol (TI vs major cap)
-        adv_threshold = _get_adv_threshold(symbol)
-        conf_threshold = _get_confidence_threshold(symbol)
-        is_ti = _is_ti_symbol(symbol)
-        
-        # Dollar volume quality gate — reuse already-prefetched bar context (no extra fetch)
-        _ctx_for_adv = _bar_ctx_cache.get(symbol)
-        if _ctx_for_adv is not None:
-            adv = float((_ctx_for_adv.daily["close"] * _ctx_for_adv.daily["volume"]).iloc[-20:].mean())
-            if adv < adv_threshold:
-                log.debug(f"Options scan: {symbol} ADV ${adv:,.0f} < ${adv_threshold:,.0f} {'(TI)' if is_ti else '(major cap)'} — skip")
-                _record_fail("adv", symbol)
-                continue
-
-        # Skip symbols still in stop cooldown
-        if symbol in _stop_cooldown:
-            days_since = (today - _stop_cooldown[symbol]).days
-            if days_since < OPTIONS_STOP_COOLDOWN_DAYS:
-                log.debug(f"Options scan: {symbol} in stop cooldown ({days_since}d / {OPTIONS_STOP_COOLDOWN_DAYS}d) — skipping")
-                _record_fail("stop_cooldown", symbol)
-                continue
-
-        symbol_got_signal = False
-        # Try all strategies in priority order; one signal per symbol per cycle
-        # OPTIONS_ALLOWED_STRATEGIES restricts to a named subset when non-empty.
-        _allowed = OPTIONS_ALLOWED_STRATEGIES  # empty set = all enabled
-        for strat in (momentum_strat, bear_put_strat, bear_call_strat, squeeze_strat, mean_rev_strat,
-                      retest_strat, trend_spread_strat, iron_condor_strat, butterfly_strat):
-            if _allowed and strat.name not in _allowed:
-                continue
-            sig = strat.scan(symbol)
-            if sig and sig.confidence >= conf_threshold:  # Use TI-specific or major cap threshold
-                signals.append(sig)
-                symbol_got_signal = True
-                break   # one signal per symbol per scan cycle
-            else:
-                _record_fail(f"no_{strat.name}", symbol)
-        if not symbol_got_signal:
-            _record_fail("no_signal", symbol)
-
-    for symbol, qty in held_positions.items():
-        # Use appropriate confidence threshold for held position
-        conf_threshold = _get_confidence_threshold(symbol)
-        sig = covered_strat.scan(symbol, qty, existing_option_symbols)
-        if sig and sig.confidence >= conf_threshold:
-            signals.append(sig)
-
-    # Rank by composite: confidence * min(R/R, 3.0)
-    def _score(s: OptionSignal) -> float:
-        return s.confidence * min(s.rr_ratio if s.rr_ratio > 0 else 1.0, 3.0)
-
+            return 0
     signals.sort(key=_score, reverse=True)
     
     # Apply market regime filtering and confidence adjustments
