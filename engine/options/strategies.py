@@ -3205,7 +3205,10 @@ def scan_options_universe(
     # Set global ti_universe for strategy access (used by _is_ti_symbol and threshold getters)
     _CURRENT_TI_UNIVERSE = ti_universe
 
+
     signals = []  # Ensure signals is always defined
+    fail_counts = {}  # Ensure fail_counts is always defined
+    fail_examples = {}  # Ensure fail_examples is always defined
 
     def scan(self, symbol: str) -> Optional[OptionSignal]:
         f = _get_filters()
