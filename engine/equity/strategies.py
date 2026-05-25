@@ -14,7 +14,7 @@ import datetime
 import time
 import pytz
 import pandas as pd
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
 
@@ -44,6 +44,8 @@ class Signal:
     reason:     str
     strategy:   str
     atr_stop:   Optional[float] = None   # ATR-based stop distance ($); None = use % fallback
+    trailing_stop: Optional[float] = None  # Trailing stop price (updated dynamically)
+    highest_price: Optional[float] = None  # Highest price since entry
 
 
 def _calc_atr14(bars: pd.DataFrame, period: int = 14) -> float:
@@ -320,7 +322,7 @@ class SweepeaStrategy:
     """Liquidity Sweep + Pinbar with Donchian Channel swing detection.
     Also fires on daily 8/20-EMA pullback after an initial squeeze (secondary move)."""
 
-    def scan(self, symbol: str) -> Optional[Signal]:
+    def scan(self, symbol: str, open_position: Optional[dict] = None) -> Optional[Signal]:
         try:
             # Daily bar only meaningful after 10 AM ET — skip pre-market noise
             if datetime.datetime.now(ET).hour >= 10:
@@ -377,11 +379,32 @@ class SweepeaStrategy:
                             htf_note = f" | HTF +{gain_4w_pct:.0f}% / 4w"
                     conf = 0.88 if is_htf else 0.82
                     conf = _sa_metrics_boost(symbol, conf)
+                    entry_price = float(cur["close"])
+                    # Trailing stop logic: set initial highest_price and trailing_stop
+                    trailing_stop = entry_price * 0.90  # 10% trailing stop
+                    highest_price = entry_price
+                    # If open_position is provided, update trailing stop and highest price
+                    if open_position is not None:
+                        prev_high = open_position.get("highest_price", entry_price)
+                        last_price = entry_price
+                        highest_price = max(prev_high, last_price)
+                        trailing_stop = highest_price * 0.90
+                        # If price falls to or below trailing stop, trigger sell
+                        if last_price <= trailing_stop:
+                            return Signal(
+                                symbol, "sell", last_price, conf,
+                                f"Trailing stop-loss hit at {trailing_stop:.2f}",
+                                "Sweepea",
+                                trailing_stop=trailing_stop,
+                                highest_price=highest_price
+                            )
                     return Signal(
-                        symbol, "buy", float(cur["close"]), conf,
+                        symbol, "buy", entry_price, conf,
                         f"Daily Sweepea pullback to {ema_lbl}{htf_note} | ATR ${atr14:.2f}",
                         "Sweepea",
                         atr_stop=atr14 * ATR_STOP_MULTIPLIER if atr14 > 0 else None,
+                        trailing_stop=trailing_stop,
+                        highest_price=highest_price
                     )
         except Exception:
             pass
