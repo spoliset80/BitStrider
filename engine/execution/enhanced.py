@@ -301,24 +301,21 @@ class EnhancedExecutor:
             if not allow:
                 return False, f"VIX spike filter: {roc:.1f}% increase"
 
-        # PDT — use live broker count (survives restarts).
-        # Block only when the count EXCEEDS the limit (4+) — an actual PDT violation.
-        # At exactly 3/3: new buys are allowed because they are held overnight (not same-day
-        # round-trips) and therefore do NOT count as additional day trades.
-        if acct.pattern_day_trader and acct.equity < PDT_ACCOUNT_MIN and acct.daytrade_count > PDT_MAX_TRADES:
-            msg = (
-                f"PDT VIOLATION: {acct.daytrade_count} day trades used "
-                f"(limit {PDT_MAX_TRADES}, equity ${acct.equity:,.0f}) — "
-                f"account may be flagged as Pattern Day Trader. Review immediately!"
-            )
-            log.error(msg)
-            if not getattr(self, "_pdt_violation_alerted", False):
-                send_email("[APEXTRADER] PDT VIOLATION ALERT", msg)
-                self._pdt_violation_alerted = True
-            return False, f"PDT violation: {acct.daytrade_count}/{PDT_MAX_TRADES} day trades exceeded"
-        dt_left = self.pdt.remaining(acct.equity, acct.daytrade_count, acct.pattern_day_trader)
-        if acct.pattern_day_trader and dt_left <= PDT_WARN_AT_REMAINING and acct.equity < PDT_ACCOUNT_MIN:
-            log.warning(f"PDT WARNING: only {dt_left} day trade(s) remaining (equity ${acct.equity:,.0f})")
+        # PDT checks disabled — trading is now allowed regardless of day trade count
+        # if acct.pattern_day_trader and acct.equity < PDT_ACCOUNT_MIN and acct.daytrade_count > PDT_MAX_TRADES:
+        #     msg = (
+        #         f"PDT VIOLATION: {acct.daytrade_count} day trades used "
+        #         f"(limit {PDT_MAX_TRADES}, equity ${acct.equity:,.0f}) — "
+        #         f"account may be flagged as Pattern Day Trader. Review immediately!"
+        #     )
+        #     log.error(msg)
+        #     if not getattr(self, "_pdt_violation_alerted", False):
+        #         send_email("[APEXTRADER] PDT VIOLATION ALERT", msg)
+        #         self._pdt_violation_alerted = True
+        #     return False, f"PDT violation: {acct.daytrade_count}/{PDT_MAX_TRADES} day trades exceeded"
+        # dt_left = self.pdt.remaining(acct.equity, acct.daytrade_count, acct.pattern_day_trader)
+        # if acct.pattern_day_trader and dt_left <= PDT_WARN_AT_REMAINING and acct.equity < PDT_ACCOUNT_MIN:
+        #     log.warning(f"PDT WARNING: only {dt_left} day trade(s) remaining (equity ${acct.equity:,.0f})")
 
         # Skip hard-to-borrow shorts cached from previous failures this session
         if order_type == OrderType.SHORT and signal.symbol in self._htb_cache:

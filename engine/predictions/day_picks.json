@@ -1,15 +1,15 @@
 {
-  "generated_at": "2026-05-18T13:50:23-04:00",
-  "date": "2026-05-18",
+  "generated_at": "2026-06-12T15:14:54-04:00",
+  "date": "2026-06-12",
   "market_regime": "bull",
   "picks": [
     {
-      "symbol": "XYLD",
+      "symbol": "HCAT",
       "action": "buy",
-      "price": 40.52,
+      "price": 1.64,
       "confidence": 0.82,
       "strategy": "Sweepea",
-      "reason": "Daily Sweepea pullback to 8-EMA | ATR $0.12"
+      "reason": "Daily Sweepea pullback to 8-EMA | ATR $0.19"
     }
   ]
 }

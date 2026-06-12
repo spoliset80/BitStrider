@@ -916,22 +916,22 @@ class OptionsExecutor:
         except Exception:
             pass  # network/parse failure — allow entry rather than block all trades
 
-        # 2. PDT & Account Guard
-        is_small_account, dt_remaining = self._check_pdt_status()
-        if is_small_account:
-            # Reserve day trades only matter for same-day closes.
-            # Options entered with DTE >= OPTIONS_DTE_MIN are swing trades by design
-            # and will NOT create a day trade on entry. Only block if we literally have
-            # no day trades left (would be unable to emergency-exit any position today).
-            if dt_remaining == 0:
-                log.info(
-                    f"[OPTIONS] PDT reserve: 0 day trades remaining — skipping {signal.symbol} entry"
-                )
-                return False
-            # Cap to 1 open option position on small accounts to conserve capital
-            if self._count_open_options() >= 1:
-                log.info(f"[OPTIONS] Small account 1-position cap reached — skipping {signal.symbol}")
-                return False
+        # 2. PDT & Account Guard (disabled — options trading allowed regardless of PDT status)
+        # is_small_account, dt_remaining = self._check_pdt_status()
+        # if is_small_account:
+        #     # Reserve day trades only matter for same-day closes.
+        #     # Options entered with DTE >= OPTIONS_DTE_MIN are swing trades by design
+        #     # and will NOT create a day trade on entry. Only block if we literally have
+        #     # no day trades left (would be unable to emergency-exit any position today).
+        #     if dt_remaining == 0:
+        #         log.info(
+        #             f"[OPTIONS] PDT reserve: 0 day trades remaining — skipping {signal.symbol} entry"
+        #         )
+        #         return False
+        #     # Cap to 1 open option position on small accounts to conserve capital
+        #     if self._count_open_options() >= 1:
+        #         log.info(f"[OPTIONS] Small account 1-position cap reached — skipping {signal.symbol}")
+        #         return False
 
         # 3. Budget & Contract Calculation
         raw_contracts = self._calc_contracts(signal, remaining)
@@ -1449,20 +1449,21 @@ class OptionsExecutor:
         stop_symbols: List[str] = []
         today = datetime.date.today()
 
-        # PDT/Account Status Logic (unchanged)
-        pdt_small_account, dt_left_today = self._check_pdt_status()
+        # PDT/Account Status Logic (disabled)
+        # pdt_small_account, dt_left_today = self._check_pdt_status()
+        pdt_block = False  # PDT checks disabled
 
         for occ_sym, pos in list(self._positions.items()):
             dte = (pos.expiry - today).days
             same_day_entry = pos.entered_at == today
             days_held = (today - pos.entered_at).days
             in_grace_period = days_held < OPTIONS_ENTRY_GRACE_DAYS
-            pdt_block = pdt_small_account and same_day_entry and dt_left_today <= 1
+            # pdt_block = pdt_small_account and same_day_entry and dt_left_today <= 1
 
             # 1. Theta guard: exit within OPTIONS_THETA_EXIT_DTE days to avoid accelerating decay
             # Skip if entered today and PDT-blocked — Alpaca will reject the close anyway
             if dte <= OPTIONS_THETA_EXIT_DTE:
-                if pdt_block or same_day_entry:
+                if same_day_entry:
                     log.debug(
                         f"OPTIONS: {occ_sym} theta guard (DTE={dte}) deferred — entered today, will close tomorrow"
                     )
