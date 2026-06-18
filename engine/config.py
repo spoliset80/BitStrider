@@ -49,10 +49,10 @@ OPTIONS_MIN_IV_PCT          = float(os.getenv("OPTIONS_MIN_IV_PCT", "15.0"))    
 # Tightened from -35%: naked calls decay fast; cut losers quicker to preserve capital for re-entries.
 # Grace period extended to 3 days — options need time to settle after entry.
 # Scale-out strategy: Close 50% at first target, hold 50% with tighter stop for max profit.
-OPTIONS_STOP_LOSS_PCT       = float(os.getenv("OPTIONS_STOP_LOSS_PCT", "25.0"))      # -25% loss for NAKED options (NOT spreads)
-OPTIONS_PROFIT_TARGET_1_PCT = float(os.getenv("OPTIONS_PROFIT_TARGET_1_PCT", "50.0"))  # close 50% of position at +50% (lock solid profit)
-OPTIONS_PROFIT_TARGET_1_STOP_PCT = float(os.getenv("OPTIONS_PROFIT_TARGET_1_STOP_PCT", "20.0"))  # new stop for 2nd half at +20% (breakeven guard)
-OPTIONS_PROFIT_TARGET_2_PCT = float(os.getenv("OPTIONS_PROFIT_TARGET_2_PCT", "100.0"))  # close remaining 50% at +100% or max profit
+OPTIONS_STOP_LOSS_PCT       = float(os.getenv("OPTIONS_STOP_LOSS_PCT", "25.0"))      # -25% loss for NAKED options (NOT spreads) — unchanged
+OPTIONS_PROFIT_TARGET_1_PCT = float(os.getenv("OPTIONS_PROFIT_TARGET_1_PCT", "25.0"))  # was 50% — close 50% of position at +25% (lock profit faster)
+OPTIONS_PROFIT_TARGET_1_STOP_PCT = float(os.getenv("OPTIONS_PROFIT_TARGET_1_STOP_PCT", "15.0"))  # was 20% — tighter stop on 2nd half (aggressive)
+OPTIONS_PROFIT_TARGET_2_PCT = float(os.getenv("OPTIONS_PROFIT_TARGET_2_PCT", "50.0"))  # was 100% — close remaining 50% at +50% (aggressive exit)
 OPTIONS_PROFIT_TARGET_PCT   = OPTIONS_PROFIT_TARGET_1_PCT  # Backward compatibility alias
 OPTIONS_ENTRY_GRACE_DAYS    = int(os.getenv("OPTIONS_ENTRY_GRACE_DAYS", "3"))        # extended from 2 to 3 days for better settling
 OPTIONS_THETA_EXIT_DTE      = int(os.getenv("OPTIONS_THETA_EXIT_DTE", "4"))           # exit by DTE ≤ 4 (was 2) — avoid theta acceleration spike
@@ -70,9 +70,9 @@ OPTIONS_UNIVERSE_OVERRIDE   = os.getenv("OPTIONS_UNIVERSE_OVERRIDE", "").strip()
 OPTIONS_STOP_COOLDOWN_DAYS  = int(os.getenv("OPTIONS_STOP_COOLDOWN_DAYS", "2"))   # no re-entry within N days after a stop on same symbol
 OPTIONS_IV_RANK_SPREAD_THRESHOLD = int(os.getenv("OPTIONS_IV_RANK_SPREAD_THRESHOLD", "60"))  # IV rank above this → force spread; below → allow naked
 OPTIONS_EARNINGS_AVOID_DAYS = int(os.getenv("OPTIONS_EARNINGS_AVOID_DAYS", "15")) # skip entries if earnings within N calendar days
-# Trailing stop: locks in gains after big moves. Flexible to let winners run.
-OPTIONS_TRAIL_ACTIVATE_PCT  = float(os.getenv("OPTIONS_TRAIL_ACTIVATE_PCT", "25.0"))  # trailing stop arms at +25% P&L (was 20%)
-OPTIONS_TRAIL_DRAWDOWN_PCT  = float(os.getenv("OPTIONS_TRAIL_DRAWDOWN_PCT", "20.0"))  # close if drops 20pp from peak (was 15pp) — more patient
+# Trailing stop: locks in gains after big moves. Tight for aggressive no-PDT trading.
+OPTIONS_TRAIL_ACTIVATE_PCT  = float(os.getenv("OPTIONS_TRAIL_ACTIVATE_PCT", "15.0"))  # was 25% — trailing stop arms at +15% P&L (aggressive)
+OPTIONS_TRAIL_DRAWDOWN_PCT  = float(os.getenv("OPTIONS_TRAIL_DRAWDOWN_PCT", "10.0"))  # was 20% — close if drops 10pp from peak (tight exit)
 
 # Spread-Specific Stop-Loss Strategy (NEW)
 # ─────────────────────────────────────────────────────────────────
@@ -315,11 +315,11 @@ STOCKS = {
 # ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 # Trading Parameters ΓÇö Swing Trading Optimized
 # ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
-MAX_POSITIONS        = 10     # 6.0% × 10 = 60% equity ceiling; options takes 35% → total 95%
+MAX_POSITIONS        = 12     # was 10 — 6.0% × 12 = 72% equity ceiling; options takes 35% → total 95%+ (aggressive)
 # When full, close the weakest position to make room if new signal conf > this threshold
 SWAP_ON_FULL         = True   # enabled — close weakest position for a better signal when full
-SWAP_MIN_CONFIDENCE  = 0.75   # Swap out weakest when new signal >= this confidence (was 0.85)
-POSITION_SIZE_PCT    = 5.0    # 5.0% per position → up to 10 positions = 50% equity ceiling
+SWAP_MIN_CONFIDENCE  = 0.68   # was 0.75 — lower threshold → more aggressive swaps
+POSITION_SIZE_PCT    = 6.0    # was 5.0% → 6.0% per position = larger positions (aggressive no-PDT)
 USE_RISK_EQUALIZED_SIZING = False  # use fixed position sizing instead of risk-scaled
 RISK_PER_TRADE_PCT   = 0.8    # Risk 0.8% of account per trade (unused with fixed sizing)
 
@@ -334,21 +334,21 @@ SMALL_ACCOUNT_POSITION_SIZE_PCT = 5.0   # same 5.0% allocation for small account
 SMALL_ACCOUNT_RISK_PER_TRADE_PCT = 0.5 # lower risk per trade for small accounts
 SMALL_ACCOUNT_MIN_POSITION_DOLLARS = 5.0  # lowered to allow ~$5 entry for cheap tickers
 
-# Tiered Profit Targets — aggressive: book profits faster
-TAKE_PROFIT_EXTREME  = 35.0   # was 50
-TAKE_PROFIT_HIGH     = 25.0   # was 40
-TAKE_PROFIT_MEDIUM   = 18.0   # was 35
-TAKE_PROFIT_NORMAL   = 12.0   # was 25
+# Tiered Profit Targets — aggressive no-PDT: book profits at 25% quickly
+TAKE_PROFIT_EXTREME  = 25.0   # was 35% — same as HIGH (no distinction needed)
+TAKE_PROFIT_HIGH     = 25.0   # was 25% — PRIMARY TARGET: 25% profit
+TAKE_PROFIT_MEDIUM   = 20.0   # was 18% — scaled down from higher tiers
+TAKE_PROFIT_NORMAL   = 15.0   # was 12% — catch smaller moves
 
-# Tiered Trailing Stops — tighter: lock in gains quickly
-TRAILING_STOP_EXTREME = 12.0  # more room for extreme movers
-TRAILING_STOP_HIGH    = 10.0  # high momentum
-TRAILING_STOP_MEDIUM  =  8.0  # medium momentum
-TRAILING_STOP_NORMAL  =  8.0  # default trailing stop
+# Tiered Trailing Stops — much tighter: lock in gains faster, no PDT concern
+TRAILING_STOP_EXTREME = 8.0   # was 12% — tighter on extreme volatility
+TRAILING_STOP_HIGH    = 6.0   # was 10% — tight on high momentum (6% drawdown triggers close)
+TRAILING_STOP_MEDIUM  = 5.0   # was 8% — very tight for normal stocks
+TRAILING_STOP_NORMAL  = 5.0   # was 8% — 5% trailing drawdown = quick exit
 
 # Legacy (backward compat)
 STOP_LOSS_PCT   = 3.0
-TAKE_PROFIT_PCT = 18.0
+TAKE_PROFIT_PCT = 25.0  # aligned with aggressive 25% target
 
 # ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 # Dynamic ATR-Based Tier Assignment

@@ -165,12 +165,13 @@ def calculate_position_size_pct(
 
 
 def get_tiered_profit_targets(confidence: float) -> Dict[str, float]:
-    """Return tiered profit-taking targets based on signal confidence (Phase 2 optimization).
+    """Return tiered profit-taking targets based on signal confidence — AGGRESSIVE no-PDT mode.
     
+    Aggressive profit-taking without PDT concerns: book profits fast.
     Confidence bands:
-    - ≥0.88: High conviction — let winners run (targets: +30%, +60%, +100%)
-    - 0.80-0.87: Standard — balanced approach (targets: +25%, +60%)
-    - <0.80: Conservative — lock in early (targets: +20%, +50%)
+    - ≥0.88: High conviction — moderate hold (targets: +25%, +40%, +60%) [was: +30%, +60%, +100%]
+    - 0.80-0.87: Standard — balanced (targets: +20%, +35%, +50%) [was: +25%, +60%]
+    - <0.80: Conservative — lock in fast (targets: +15%, +30%, +40%) [was: +20%, +50%]
     
     Returns dict with keys:
         - 'tier1_target': First profit level (% to close 50%)
@@ -180,34 +181,34 @@ def get_tiered_profit_targets(confidence: float) -> Dict[str, float]:
         - 'trail_drawdown_pct': Drawdown threshold for trailing
     """
     if confidence >= 0.88:
-        # High conviction: let it run longer
+        # High conviction: still moderate but book profits faster
         return {
-            'tier1_target': 30.0,
-            'tier1_close_pct': 0.25,     # Close only 25% at tier 1
-            'tier2_target': 60.0,
-            'tier2_close_pct': 0.25,     # Close 25% more at tier 2
-            'trail_activate_pct': 100.0, # Arm trailing at +100%
-            'trail_drawdown_pct': 15.0,  # Trail with 15pp buffer
+            'tier1_target': 25.0,        # was 30% — primary exit at 25%
+            'tier1_close_pct': 0.50,     # Close 50% at tier 1 (was 25%, now more aggressive)
+            'tier2_target': 40.0,        # was 60% — secondary exit at 40%
+            'tier2_close_pct': 0.50,     # Close remaining 50%
+            'trail_activate_pct': 50.0,  # was 100% — arm trailing at +50% (aggressive)
+            'trail_drawdown_pct': 12.0,  # was 15pp — tight trailing (12pp drawdown closes)
         }
     elif confidence >= 0.80:
-        # Standard quality: balanced
+        # Standard quality: balanced but book faster
         return {
-            'tier1_target': 25.0,
-            'tier1_close_pct': 0.50,     # Close 50% at tier 1
-            'tier2_target': 60.0,
+            'tier1_target': 20.0,        # was 25% — aggressive entry exit
+            'tier1_close_pct': 0.50,     # Close 50% at tier 1 (standard)
+            'tier2_target': 35.0,        # was 60% — secondary exit much lower (aggressive)
             'tier2_close_pct': 0.50,     # Close remaining 50%
-            'trail_activate_pct': 60.0,
-            'trail_drawdown_pct': 20.0,
+            'trail_activate_pct': 30.0,  # was 60% — arm trailing at +30% (fast)
+            'trail_drawdown_pct': 10.0,  # was 20pp — very tight trailing (10pp closes position)
         }
     else:
-        # Conservative/marginal: lock in early
+        # Conservative/marginal: lock in early & fast
         return {
-            'tier1_target': 20.0,
-            'tier1_close_pct': 0.50,     # Close 50% at tier 1
-            'tier2_target': 50.0,
-            'tier2_close_pct': 0.50,     # Close remaining 50%
-            'trail_activate_pct': 25.0,
-            'trail_drawdown_pct': 25.0,
+            'tier1_target': 15.0,        # was 20% — quick first exit
+            'tier1_close_pct': 0.60,     # Close 60% at tier 1 (more aggressive than before)
+            'tier2_target': 30.0,        # was 50% — much lower secondary target
+            'tier2_close_pct': 0.40,     # Close remaining 40%
+            'trail_activate_pct': 20.0,  # was 25% — arm early at +20%
+            'trail_drawdown_pct': 8.0,   # was 25pp — very tight trailing (8pp closes)
         }
 
 
