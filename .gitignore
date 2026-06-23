@@ -49,3 +49,27 @@ dist/
 *.egg-info/
 *.egg
 /apextrader
+
+# Discord branch: exclude everything except discord_api_reader.py
+engine/
+docs/
+tests/
+data/
+predictions/
+logs/
+.schwab_token_cache.json
+apextrader.log.*
+scripts/_*
+scripts/audit_intraday_coverage.py
+scripts/backtest_*.py
+scripts/capture_tradeideas.py
+scripts/check_*.py
+scripts/debug_*.py
+scripts/evaluate_option_strategies.py
+scripts/options_scanner.py
+scripts/predict_tomorrow.py
+scripts/print_config.py
+scripts/prune_universe.py
+scripts/run_top3.py
+scripts/scrape_discord_alerts.py
+scripts/test_*.py
