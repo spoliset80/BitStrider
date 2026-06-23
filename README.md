@@ -1,6 +1,107 @@
-# ApexTrader
+# BitStrider — Discord Alert Trader
 
-> Automated trading bot — multi-strategy equity signals, A+ options scanner, adaptive scan intervals, tiered risk management, and clean email reports.
+> Polls Discord trading-alert channels and auto-executes market orders on Alpaca.
+> No local algos, no scanning, no TI — Discord signals only.
+
+**Python:** 3.10+ · **Broker:** Alpaca (paper & live) · **Branch:** `feature/discord-alerts`
+
+---
+
+## How It Works
+
+```
+Discord channels
+     │  REST API poll (every 30s)
+     ▼
+  Parse alert  →  ticker + action + confidence score
+     │
+     ▼  (score ≥ CONFIDENCE_MIN)
+  Risk checks  →  max positions · daily spend cap · dedupe
+     │
+     ▼
+  Alpaca market order  (notional scaled by confidence tier)
+     │
+     ▼
+  logs/discord_trades_YYYYMMDD.jsonl
+```
+
+---
+
+## Quick Start
+
+```powershell
+# 1. Copy and fill credentials
+copy .env.example .env   # or edit .env directly
+
+# 2. Run
+$env:DISCORD_USER_TOKEN="your-token-here"
+apextrader\Scripts\python.exe scripts/discord_api_reader.py --loop --poll 30
+```
+
+---
+
+## Configuration (`.env`)
+
+### Mode
+| Key | Default | Description |
+|-----|---------|-------------|
+| `DISCORD_OPTIONS_MODE` | `paper` | `paper` or `live` |
+
+### Credentials
+| Key | Description |
+|-----|-------------|
+| `DISCORD_USER_TOKEN` | Your Discord user token |
+| `PAPER_ALPACA_API_KEY` / `PAPER_ALPACA_API_SECRET` | Alpaca paper keys |
+| `LIVE_ALPACA_API_KEY` / `LIVE_ALPACA_API_SECRET` | Alpaca live keys |
+
+### Channels
+| Key | Default | Description |
+|-----|---------|-------------|
+| `DISCORD_CHANNEL_IDS` | 3 hardcoded IDs | Comma-separated channel IDs to poll |
+
+### Risk / Allocation
+| Key | Default | Description |
+|-----|---------|-------------|
+| `DISCORD_ORDER_NOTIONAL` | `500` | Base $ per trade |
+| `DISCORD_TIER_LOW_MULT` | `0.5` | Multiplier for conf 70–79% → $250 |
+| `DISCORD_TIER_MED_MULT` | `1.0` | Multiplier for conf 80–89% → $500 |
+| `DISCORD_TIER_HIGH_MULT` | `1.5` | Multiplier for conf 90%+ → $750 |
+| `DISCORD_CONFIDENCE_MIN` | `70` | Minimum confidence score to place a trade |
+| `DISCORD_MAX_POSITIONS` | `10` | Max open positions at once |
+| `DISCORD_MAX_DAILY_SPEND` | `5000` | Hard daily $ cap |
+| `DISCORD_DEDUPE_TICKER` | `true` | Skip repeat buys of same ticker same day |
+
+---
+
+## Confidence Scoring
+
+| Signal | Points |
+|--------|--------|
+| Base | 50 |
+| Strike price found | +20 |
+| Expiry found | +15 |
+| Entry price found | +10 |
+| Action word found | +5 |
+| **Max** | **100** |
+
+---
+
+## Trade Log
+
+Every executed trade is appended to `logs/discord_trades_YYYYMMDD.jsonl`:
+
+```json
+{"ts": "2026-06-23T01:00:00Z", "ticker": "MSFT", "action": "BUY",
+ "conf": 85, "notional": 750.0, "daily_spent": 1500.0,
+ "order": {"status": "submitted", "id": "..."}}
+```
+
+---
+
+## Disclaimer
+
+This software is for educational and research purposes only. Use at your own risk.
+
 
 **Version:** v1.4.0 · **Python:** 3.10+ · **Broker:** Alpaca (paper & live) · **Data:** Market Data App (primary) + Alpaca · **Platform:** Windows / Linux / macOS
 
