@@ -29,7 +29,7 @@ import os
 import re
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime, date, timezone, timedelta
 from pathlib import Path
 
 import requests
@@ -90,13 +90,68 @@ def _make_client():
 
 _alpaca = None
 
-def place_order(ticker: str, side: str, notional: float) -> dict:
+# -- OCC symbol builder --------------------------------------------------------
+
+_MONTHS = {
+    "jan":1,"feb":2,"mar":3,"apr":4,"may":5,"jun":6,
+    "jul":7,"aug":8,"sep":9,"oct":10,"nov":11,"dec":12,
+}
+# e.g. "July 24th", "Jul 24", "July 24th 2026", "7/24", "7/24/25"
+_EXPIRY_NATURAL = re.compile(
+    r"(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s*(\d{1,2})(?:st|nd|rd|th)?(?:[,\s]+(\d{2,4}))?",
+    re.I,
+)
+_EXPIRY_SLASH = re.compile(r"(\d{1,2})/(\d{1,2})(?:/(\d{2,4}))?")
+
+def _parse_expiry_date(text: str) -> date | None:
+    """Return expiry as a date object, or None if unparseable."""
+    m = _EXPIRY_NATURAL.search(text)
+    if m:
+        mon = _MONTHS[m.group(1).lower()[:3]]
+        day = int(m.group(2))
+        yr_raw = m.group(3)
+        if yr_raw:
+            yr = int(yr_raw)
+            yr = yr + 2000 if yr < 100 else yr
+        else:
+            today = date.today()
+            yr = today.year
+            if date(yr, mon, day) < today:
+                yr += 1
+        return date(yr, mon, day)
+    m = _EXPIRY_SLASH.search(text)
+    if m:
+        mon, day = int(m.group(1)), int(m.group(2))
+        yr_raw = m.group(3)
+        if yr_raw:
+            yr = int(yr_raw)
+            yr = yr + 2000 if yr < 100 else yr
+        else:
+            today = date.today()
+            yr = today.year
+            if date(yr, mon, day) < today:
+                yr += 1
+        return date(yr, mon, day)
+    return None
+
+def build_occ(ticker: str, expiry_str: str, opt_type: str, strike: float) -> str | None:
+    """Build OCC option symbol e.g. HIMS240724C00042000"""
+    d = _parse_expiry_date(expiry_str)
+    if not d:
+        return None
+    cp = "C" if opt_type == "CALL" else "P"
+    strike_int = int(round(strike * 1000))
+    return f"{ticker.upper()}{d.strftime('%y%m%d')}{cp}{strike_int:08d}"
+
+# -- Order placement -----------------------------------------------------------
+
+def place_equity_order(ticker: str, side: str, notional: float) -> dict:
     global _alpaca
     if _alpaca is None:
         _alpaca = _make_client()
     if _alpaca is None:
-        logger.info(f"  [DRY RUN] {side.upper()} ${notional} {ticker}")
-        return {"status": "dry_run", "ticker": ticker, "side": side, "notional": notional}
+        logger.info(f"  [DRY RUN] EQUITY {side.upper()} ${notional} {ticker}")
+        return {"status": "dry_run", "type": "equity", "ticker": ticker, "side": side}
     try:
         from alpaca.trading.requests import MarketOrderRequest
         from alpaca.trading.enums import OrderSide, TimeInForce
@@ -105,11 +160,32 @@ def place_order(ticker: str, side: str, notional: float) -> dict:
             side=OrderSide.BUY if side == "buy" else OrderSide.SELL,
             time_in_force=TimeInForce.DAY,
         ))
-        logger.info(f"  SUBMITTED {side.upper()} ${notional} {ticker} id={order.id}")
-        return {"status": "submitted", "id": str(order.id), "ticker": ticker, "side": side, "notional": notional}
+        logger.info(f"  SUBMITTED EQUITY {side.upper()} ${notional} {ticker} id={order.id}")
+        return {"status": "submitted", "type": "equity", "id": str(order.id), "ticker": ticker}
     except Exception as e:
         logger.error(f"  ORDER FAILED {ticker}: {e}")
         return {"status": "error", "ticker": ticker, "error": str(e)}
+
+def place_option_order(occ: str, side: str, qty: int = 1) -> dict:
+    global _alpaca
+    if _alpaca is None:
+        _alpaca = _make_client()
+    if _alpaca is None:
+        logger.info(f"  [DRY RUN] OPTION {side.upper()} {qty}x {occ}")
+        return {"status": "dry_run", "type": "option", "occ": occ, "side": side, "qty": qty}
+    try:
+        from alpaca.trading.requests import MarketOrderRequest
+        from alpaca.trading.enums import OrderSide, TimeInForce
+        order = _alpaca.submit_order(MarketOrderRequest(
+            symbol=occ, qty=qty,
+            side=OrderSide.BUY if side == "buy" else OrderSide.SELL,
+            time_in_force=TimeInForce.DAY,
+        ))
+        logger.info(f"  SUBMITTED OPTION {side.upper()} {qty}x {occ} id={order.id}")
+        return {"status": "submitted", "type": "option", "id": str(order.id), "occ": occ, "qty": qty}
+    except Exception as e:
+        logger.error(f"  ORDER FAILED {occ}: {e}")
+        return {"status": "error", "occ": occ, "error": str(e)}
 
 # -- Parser --------------------------------------------------------------------
 
@@ -125,15 +201,24 @@ SYMBOL_LINE = re.compile(r"Symbol:\s*\$([A-Z]{1,5})", re.I)
 DOLLAR_TKR  = re.compile(r"\$([A-Z]{1,5})\b")
 BARE_TKR    = re.compile(r"\b([A-Z]{2,5})\b")
 ACTION      = re.compile(r"\b(BUY|SELL|Entered|Exited|Closed|Bought|Sold)\b", re.I)
-OPT_TYPE    = re.compile(r"\b(CALLS?|PUTS?|CSP)\b", re.I)
+# Matches: $42C, $42P, $42.5C, CALLS, PUTS, CSP
+OPT_TYPE    = re.compile(r"\$(\d+(?:\.\d+)?)(C|P)\b|\b(CALLS?|PUTS?|CSP)\b", re.I)
 STRIKE      = re.compile(r"\$(\d{2,4}(?:\.\d+)?)[CP]?\b")
-EXPIRY      = re.compile(r"\b(\d{1,2}/\d{1,2}(?:/\d{2,4})?|\d+\s*DTE)\b", re.I)
+# Matches: 7/24, 7/24/25, July 24th, Jan 2028, Jan-2028
+EXPIRY      = re.compile(
+    r"((?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*[.\-]?\s*\d{1,2}(?:st|nd|rd|th)?(?:[,\s]+\d{2,4})?)"
+    r"|\b(\d{1,2}/\d{1,2}(?:/\d{2,4})?)"
+    r"|\b(\d+\s*DTE)\b",
+    re.I,
+)
 AT_PRICE    = re.compile(r"@\s*\$?(\d+(?:\.\d+)?)")
 
 
 def parse(text: str) -> dict:
     r = {"ticker": None, "action": None, "option_type": None,
          "strike": None, "expiry": None, "price": None}
+
+    # Ticker
     m = SYMBOL_LINE.search(text) or DOLLAR_TKR.search(text)
     if m:
         r["ticker"] = m.group(1).upper()
@@ -141,28 +226,44 @@ def parse(text: str) -> dict:
         for m2 in BARE_TKR.finditer(text):
             if m2.group(1) not in SKIP:
                 r["ticker"] = m2.group(1); break
+
+    # Action
     m = ACTION.search(text)
     if m:
         v = m.group(1).upper()
         r["action"] = "BUY" if v in ("BUY","ENTERED","BOUGHT") else "SELL"
+
+    # Option type — check $42C/$42P first, then CALL/PUT/CSP words
     m = OPT_TYPE.search(text)
     if m:
-        r["option_type"] = "PUT" if m.group(1).upper().startswith("PUT") else "CALL"
-    m = STRIKE.search(text)
-    if m: r["strike"] = float(m.group(1))
+        if m.group(2):  # matched $42C or $42P form
+            r["option_type"] = "CALL" if m.group(2).upper() == "C" else "PUT"
+            r["strike"] = float(m.group(1))
+        else:           # matched CALLS/PUTS/CSP word
+            r["option_type"] = "PUT" if m.group(3).upper().startswith("PUT") else "CALL"
+
+    # Strike (if not already set from $42C pattern)
+    if not r["strike"]:
+        m = STRIKE.search(text)
+        if m: r["strike"] = float(m.group(1))
+
+    # Expiry
     m = EXPIRY.search(text)
-    if m: r["expiry"] = m.group(1)
+    if m: r["expiry"] = (m.group(1) or m.group(2) or m.group(3)).strip()
+
+    # Entry price
     m = AT_PRICE.search(text)
     if m: r["price"] = float(m.group(1))
+
     return r
 
 
 def confidence(p: dict) -> int:
     s = 50
-    if p.get("strike"):  s += 20
-    if p.get("expiry"):  s += 15
-    if p.get("price"):   s += 10
-    if p.get("action"):  s += 5
+    if p.get("strike"):      s += 20
+    if p.get("expiry"):      s += 15
+    if p.get("price"):       s += 10
+    if p.get("action"):      s += 5
     return min(s, 100)
 
 # -- Discord API ---------------------------------------------------------------
@@ -257,8 +358,22 @@ def run(loop: bool = False, poll_secs: int = 30):
                         logger.info(f"  [SKIP SELL] No position in {ticker}")
                         continue
 
-                result = place_order(ticker, "buy" if is_buy else "sell", notional)
-                logger.info(f"[{conf}%] {ticker} {p['action']} ${notional} @{author}: {content[:60].replace(chr(10),' ')}")
+                # -- Route to options or equity order -------------------------
+                occ = None
+                if p["option_type"] and p["strike"] and p["expiry"]:
+                    occ = build_occ(ticker, p["expiry"], p["option_type"], p["strike"])
+
+                if occ:
+                    # Options contract order (1 contract = 100 shares)
+                    qty = max(1, int(notional // (p["price"] * 100))) if p["price"] else 1
+                    result = place_option_order(occ, "buy" if is_buy else "sell", qty)
+                    label = f"{ticker} {p['option_type']} ${p['strike']} exp={p['expiry']} x{qty}"
+                else:
+                    # Equity market order
+                    result = place_equity_order(ticker, "buy" if is_buy else "sell", notional)
+                    label = f"{ticker} equity ${notional}"
+
+                logger.info(f"[{conf}%] {p['action']} {label} @{author}: {content[:60].replace(chr(10),' ')}")
 
                 if is_buy and result.get("status") == "submitted":
                     daily_spent += notional
@@ -266,6 +381,7 @@ def run(loop: bool = False, poll_secs: int = 30):
 
                 entry = {"ts": datetime.now(timezone.utc).isoformat(), "channel": cid, "author": author,
                          "ticker": ticker, "action": p["action"], "conf": conf, "notional": notional,
+                         "occ": occ, "option_type": p["option_type"],
                          "daily_spent": daily_spent, "order": result, "msg": content[:200]}
                 with open(log_dir / f"discord_trades_{today}.jsonl", "a") as f:
                     f.write(json.dumps(entry) + "\n")
