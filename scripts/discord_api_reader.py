@@ -1,39 +1,17 @@
-"""
-Discord Alert Trader
-=====================
-Polls Discord channels -> parses alerts -> executes market orders on Alpaca.
-No local algos, no TI, no scanning. Discord-only signal source.
-
-Required env vars (loaded from .env):
-  DISCORD_USER_TOKEN       - Your Discord user token
-  PAPER_ALPACA_API_KEY     - Alpaca paper key
-  PAPER_ALPACA_API_SECRET  - Alpaca paper secret
-
-Optional:
-  DISCORD_CHANNEL_IDS      - Comma-separated channel IDs (default: 3 hardcoded)
-  DISCORD_CONFIDENCE_MIN   - Min confidence to execute (default: 70)
-  DISCORD_ORDER_NOTIONAL   - $ per trade (default: 500)
-  DISCORD_OPTIONS_MODE     - paper or live (default: paper)
-
-Usage:
-  apextrader\Scripts\python.exe scripts/discord_api_reader.py --loop
-  apextrader\Scripts\python.exe scripts/discord_api_reader.py --loop --poll 60
-"""
-
 from __future__ import annotations
 
 import argparse
 import json
 import logging
 import os
-import re
 import sys
 import time
-from datetime import datetime, date, timezone, timedelta
+from datetime import datetime, timezone
 from pathlib import Path
 
 import requests
 from dotenv import load_dotenv
+from scripts.discord_parser import parse_trade, Trade
 
 load_dotenv(Path(__file__).parent.parent / ".env")
 
@@ -49,18 +27,16 @@ MODE           = os.getenv("DISCORD_OPTIONS_MODE", "paper")
 API_BASE       = "https://discord.com/api/v10"
 
 # Risk / allocation
-CONFIDENCE_MIN    = int(os.getenv("DISCORD_CONFIDENCE_MIN", "70"))      # minimum score to trade
-ORDER_NOTIONAL    = float(os.getenv("DISCORD_ORDER_NOTIONAL", "500"))   # fallback $ when BP unavailable
-MAX_POSITIONS     = int(os.getenv("DISCORD_MAX_POSITIONS", "10"))       # max open positions at once
-MAX_DAILY_SPEND   = float(os.getenv("DISCORD_MAX_DAILY_SPEND", "5000")) # hard $ cap per day
+CONFIDENCE_MIN    = int(os.getenv("DISCORD_CONFIDENCE_MIN", "70"))
+ORDER_NOTIONAL    = float(os.getenv("DISCORD_ORDER_NOTIONAL", "500"))
+MAX_POSITIONS     = int(os.getenv("DISCORD_MAX_POSITIONS", "10"))
+MAX_DAILY_SPEND   = float(os.getenv("DISCORD_MAX_DAILY_SPEND", "5000"))
 DEDUPE_TICKER     = os.getenv("DISCORD_DEDUPE_TICKER", "true").lower() == "true"
 
-# Buying-power allocation by confidence tier (% of available buying power)
-# conf 70-79 → ALLOC_LOW_PCT,  80-89 → ALLOC_MED_PCT,  90+ → ALLOC_HIGH_PCT
 _BP_TIERS = [
-    (90, float(os.getenv("DISCORD_ALLOC_HIGH_PCT", "3.0"))),  # 90%+ conf → 3% of BP
-    (80, float(os.getenv("DISCORD_ALLOC_MED_PCT",  "2.0"))),  # 80-89%   → 2% of BP
-    (70, float(os.getenv("DISCORD_ALLOC_LOW_PCT",  "1.0"))),  # 70-79%   → 1% of BP
+    (90, float(os.getenv("DISCORD_ALLOC_HIGH_PCT", "3.0"))),
+    (80, float(os.getenv("DISCORD_ALLOC_MED_PCT",  "2.0"))),
+    (70, float(os.getenv("DISCORD_ALLOC_LOW_PCT",  "1.0"))),
 ]
 
 def _alloc_pct(conf: int) -> float:
@@ -73,11 +49,10 @@ def notional_for(conf: int, buying_power: float | None = None) -> float:
     """Return $ to deploy. Uses % of buying_power when available, else ORDER_NOTIONAL fallback."""
     if buying_power and buying_power > 0:
         return round(buying_power * _alloc_pct(conf) / 100, 2)
-    # Fallback: fixed tiers from ORDER_NOTIONAL
     pct = _alloc_pct(conf)
     return round(ORDER_NOTIONAL * pct / _BP_TIERS[-1][1], 2)
 
-# -- Alpaca --------------------------------------------------------------------
+# -- Alpaca Client & Telemetry -------------------------------------------------
 
 def _make_client():
     try:
@@ -120,67 +95,6 @@ def get_buying_power() -> float | None:
         logger.warning(f"  [BP] failed to fetch buying power: {e}")
         return None
 
-_MONTHS = {
-    "jan":1,"feb":2,"mar":3,"apr":4,"may":5,"jun":6,
-    "jul":7,"aug":8,"sep":9,"oct":10,"nov":11,"dec":12,
-}
-# e.g. "July 24th", "Jul 24", "July 24th 2026", "7/24", "7/24/25", "Mar-2027", "Jan 2028"
-_EXPIRY_NATURAL = re.compile(
-    r"(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*[.\-]?\s*(\d{1,4})(?:st|nd|rd|th)?(?:[,\s]+(\d{2,4}))?",
-    re.I,
-)
-_EXPIRY_SLASH = re.compile(r"(\d{1,2})/(\d{1,2})(?:/(\d{2,4}))?")
-
-def _third_friday(yr: int, mon: int) -> date:
-    """Standard monthly options expiry: 3rd Friday of the month."""
-    d = date(yr, mon, 1)
-    first_fri = d + timedelta(days=(4 - d.weekday()) % 7)
-    return first_fri + timedelta(weeks=2)
-
-def _parse_expiry_date(text: str) -> date | None:
-    """Return expiry as a date object, or None if unparseable."""
-    m = _EXPIRY_NATURAL.search(text)
-    if m:
-        mon = _MONTHS[m.group(1).lower()[:3]]
-        raw2 = int(m.group(2))
-        yr_raw = m.group(3)
-        # Distinguish: "Mar-2027" (raw2=2027, no yr_raw) vs "Jul 24th" (raw2=24)
-        if raw2 > 31:  # it's a year, no day specified
-            yr = raw2 + 2000 if raw2 < 100 else raw2
-            return _third_friday(yr, mon)
-        day = raw2
-        if yr_raw:
-            yr = int(yr_raw)
-            yr = yr + 2000 if yr < 100 else yr
-        else:
-            today = date.today()
-            yr = today.year
-            if date(yr, mon, day) < today:
-                yr += 1
-        return date(yr, mon, day)
-    m = _EXPIRY_SLASH.search(text)
-    if m:
-        mon, day = int(m.group(1)), int(m.group(2))
-        yr_raw = m.group(3)
-        if yr_raw:
-            yr = int(yr_raw)
-            yr = yr + 2000 if yr < 100 else yr
-        else:
-            today = date.today()
-            yr = today.year
-            if date(yr, mon, day) < today:
-                yr += 1
-        return date(yr, mon, day)
-    return None
-
-def build_occ(ticker: str, expiry_str: str, opt_type: str, strike: float) -> str | None:
-    """Build OCC option symbol e.g. HIMS240724C00042000"""
-    d = _parse_expiry_date(expiry_str)
-    if not d:
-        return None
-    cp = "C" if opt_type == "CALL" else "P"
-    strike_int = int(round(strike * 1000))
-    return f"{ticker.upper()}{d.strftime('%y%m%d')}{cp}{strike_int:08d}"
 
 # -- Order placement -----------------------------------------------------------
 
@@ -226,137 +140,45 @@ def place_option_order(occ: str, side: str, qty: int = 1) -> dict:
         logger.error(f"  ORDER FAILED {occ}: {e}")
         return {"status": "error", "occ": occ, "error": str(e)}
 
-# -- Parser --------------------------------------------------------------------
-
-SKIP = {
-    "THE","AND","FOR","ARE","BUT","NOT","YOU","ALL","CAN","WAS","ONE","OUR",
-    "OUT","DAY","GET","HAS","HOW","MAY","NEW","OLD","SEE","TWO","WHO",
-    "DID","LET","SAY","SHE","TOO","USE","ATM","OTM","ITM","EOD","EOW","CEO",
-    "CFO","IPO","ETF","EPS","GDP","CPI","PPI","FED","SEC","FDA","BOT","TOP",
-    "LOW","HIGH","TYPE","MID","LONG","TERM","SWING","STOP","SYMBOL","TARGET",
-}
-
-SYMBOL_LINE = re.compile(r"Symbol:\s*\$([A-Z]{1,5})", re.I)
-DOLLAR_TKR  = re.compile(r"\$([A-Z]{1,5})\b")
-BARE_TKR    = re.compile(r"\b([A-Z]{2,5})\b")
-ACTION      = re.compile(r"\b(BUY|SELL|Entered|Exited|Closed?|Bought|Sold|close)\b", re.I)
-# Matches: $42C, $42P, 95c, 95p (bare), CALLS, PUTS, CSP
-OPT_TYPE    = re.compile(r"\$(\d+(?:\.\d+)?)(C|P)\b|\b(\d{2,4}(?:\.\d+)?)(C|P)\b|\b(CALLS?|PUTS?|CSP)\b", re.I)
-STRIKE      = re.compile(r"\$?(\d{2,4}(?:\.\d+)?)[CP]\b|\$(\d{2,4}(?:\.\d+)?)")
-# Matches: 7/24, 7/24/25, July 24th, Jan 2028, Mar-2027
-EXPIRY      = re.compile(
-    r"((?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*[.\-]?\s*\d{1,4}(?:st|nd|rd|th)?(?:[,\s]+\d{2,4})?)"
-    r"|\b(\d{1,2}/\d{1,2}(?:/\d{2,4})?)"
-    r"|\b(\d+\s*DTE)\b",
-    re.I,
-)
-AT_PRICE    = re.compile(r"(?:@|\bat)\s*\$?(\d+(?:\.\d+)?)", re.I)
-
-
-def parse(text: str) -> dict:
-    r = {"ticker": None, "action": None, "option_type": None,
-         "strike": None, "expiry": None, "price": None}
-
-    # Ticker
-    m = SYMBOL_LINE.search(text) or DOLLAR_TKR.search(text)
-    if m:
-        r["ticker"] = m.group(1).upper()
-    else:
-        for m2 in BARE_TKR.finditer(text):
-            if m2.group(1) not in SKIP:
-                r["ticker"] = m2.group(1); break
-
-    # Action
-    m = ACTION.search(text)
-    if m:
-        v = m.group(1).upper()
-        r["action"] = "BUY" if v in ("BUY","ENTERED","BOUGHT") else "SELL"
-
-    # Option type — check $42C/$42P or bare 95c/95p first, then CALL/PUT/CSP words
-    m = OPT_TYPE.search(text)
-    if m:
-        if m.group(2):    # $42C / $42P
-            r["option_type"] = "CALL" if m.group(2).upper() == "C" else "PUT"
-            r["strike"] = float(m.group(1))
-        elif m.group(4):  # bare 95c / 95p
-            r["option_type"] = "CALL" if m.group(4).upper() == "C" else "PUT"
-            r["strike"] = float(m.group(3))
-        else:             # CALLS/PUTS/CSP word
-            r["option_type"] = "PUT" if m.group(5).upper().startswith("PUT") else "CALL"
-
-    # Strike (if not already set)
-    if not r["strike"]:
-        m = STRIKE.search(text)
-        if m: r["strike"] = float(m.group(1) or m.group(2))
-
-    # Expiry
-    m = EXPIRY.search(text)
-    if m: r["expiry"] = (m.group(1) or m.group(2) or m.group(3)).strip()
-
-    # Entry price
-    m = AT_PRICE.search(text)
-    if m: r["price"] = float(m.group(1))
-
-    # Infer action: strike present with no action word → BUY (it's an entry alert)
-    if not r["action"] and r["strike"] and r["option_type"]:
-        r["action"] = "BUY"
-
-    # Default expiry: next standard monthly (3rd Friday) when missing but it's an option
-    if not r["expiry"] and r["option_type"] and r["action"] == "BUY":
-        today = date.today()
-        # Use next month if we're past mid-month, else this month
-        mon = today.month if today.day < 15 else (today.month % 12) + 1
-        yr = today.year if mon >= today.month else today.year + 1
-        r["expiry"] = _third_friday(yr, mon).strftime("%Y-%m-%d")
-
-    return r
-
-
-def confidence(p: dict) -> int:
-    s = 50
-    if p.get("strike"):      s += 20
-    if p.get("expiry"):      s += 15
-    if p.get("price"):       s += 10
-    if p.get("action"):      s += 5
-    return min(s, 100)
 
 # -- Discord API ---------------------------------------------------------------
 
 def fetch(channel_id: str, after: str = None, limit: int = 50) -> list[dict]:
     params = {"limit": limit}
-    if after: params["after"] = after
+    if after: 
+        params["after"] = after
     r = requests.get(f"{API_BASE}/channels/{channel_id}/messages",
                      headers={"Authorization": USER_TOKEN}, params=params, timeout=10)
-    if r.status_code == 200: return r.json()
-    if r.status_code == 401: logger.error("Invalid DISCORD_USER_TOKEN"); sys.exit(1)
-    if r.status_code == 403: logger.warning(f"No access to channel {channel_id}"); return []
+    if r.status_code == 200: 
+        return r.json()
+    if r.status_code == 401: 
+        logger.error("Invalid DISCORD_USER_TOKEN"); sys.exit(1)
+    if r.status_code == 403: 
+        logger.warning(f"No access to channel {channel_id}"); return []
     if r.status_code == 429:
         wait = r.json().get("retry_after", 5)
         logger.warning(f"Rate limited {wait}s"); time.sleep(float(wait))
         return fetch(channel_id, after, limit)
     logger.error(f"API {r.status_code}: {r.text[:100]}"); return []
 
-# -- Main ----------------------------------------------------------------------
+
+# -- Main Execution Pipeline ---------------------------------------------------
 
 def run(loop: bool = False, poll_secs: int = 30):
     if not USER_TOKEN:
         logger.error("DISCORD_USER_TOKEN not set"); sys.exit(1)
 
     logger.info(f"Discord Alert Trader | mode={MODE} | conf>={CONFIDENCE_MIN}% | fallback=${ORDER_NOTIONAL}")
-    logger.info(f"  alloc tiers: 70%={_alloc_pct(70)}% of BP | 80%={_alloc_pct(80)}% of BP | 90%={_alloc_pct(90)}% of BP")
-    logger.info(f"  risk limits: max_positions={MAX_POSITIONS} | max_daily_spend=${MAX_DAILY_SPEND} | dedupe={DEDUPE_TICKER}")
-    for cid in CHANNEL_IDS:
-        logger.info(f"  channel {cid}")
-
-    last: dict      = {cid: None for cid in CHANNEL_IDS}
-    first           = True
-    today           = datetime.now().strftime("%Y%m%d")
-    daily_spent     = 0.0      # tracks $ deployed today
-    bought_today: set = set()  # deduplication: tickers bought this session
+    logger.info(f"  alloc tiers: 70%={_alloc_pct(70)}% | 80%={_alloc_pct(80)}% | 90%={_alloc_pct(90)}%")
+    
+    last: dict        = {cid: None for cid in CHANNEL_IDS}
+    first             = True
+    today             = datetime.now().strftime("%Y%m%d")
+    daily_spent       = 0.0  
+    bought_today: set = set()  
     log_dir = Path("logs"); log_dir.mkdir(exist_ok=True)
 
     while True:
-        # Reset daily counters on date rollover
         if datetime.now().strftime("%Y%m%d") != today:
             today = datetime.now().strftime("%Y%m%d")
             daily_spent = 0.0
@@ -364,85 +186,99 @@ def run(loop: bool = False, poll_secs: int = 30):
             logger.info("New trading day -- daily counters reset")
 
         for cid in CHANNEL_IDS:
-            msgs = fetch(cid, limit=50) if first else (fetch(cid, after=last[cid]) if last[cid] else [])
-            if not msgs: continue
+            # SAFETY FIX: On the first loop iteration, gather only the single most recent message 
+            # to set the baseline anchor ID without processing historical trade logs.
+            if first:
+                initial_msgs = fetch(cid, limit=1)
+                if initial_msgs:
+                    last[cid] = initial_msgs[0]["id"]
+                continue
+
+            msgs = fetch(cid, after=last[cid]) if last[cid] else []
+            if not msgs: 
+                continue
+            
             msgs = list(reversed(msgs))
             last[cid] = msgs[-1]["id"]
 
             for msg in msgs:
                 content = msg.get("content", "").strip()
-                if not content: continue
-                p = parse(content)
-                if not p["ticker"] or not p["action"]: continue
-                conf = confidence(p)
-                if conf < CONFIDENCE_MIN: continue
+                if not content: 
+                    continue
 
-                author  = msg.get("author", {}).get("username", "?")
-                ticker  = p["ticker"]
-                is_buy  = p["action"] == "BUY"
-                bp      = get_buying_power() if is_buy else None
-                notional = notional_for(conf, bp)
+                trade = parse_trade(content)
+                if not trade or trade.confidence < CONFIDENCE_MIN:
+                    continue
+
+                author   = msg.get("author", {}).get("username", "?")
+                ticker   = trade.ticker
+                is_buy   = trade.action == "BUY"
+                bp       = get_buying_power() if is_buy else None
+                notional = notional_for(trade.confidence, bp)
 
                 if is_buy:
-                    # -- Risk checks (BUY only) --------------------------------
+                    # -- Risk limits validation (BUY orders) -------------------
                     if DEDUPE_TICKER and ticker in bought_today:
                         logger.info(f"  [SKIP DEDUPE] Already bought {ticker} today")
                         continue
                     if daily_spent + notional > MAX_DAILY_SPEND:
                         logger.warning(f"  [SKIP DAILY CAP] ${daily_spent:.0f} spent, cap=${MAX_DAILY_SPEND}")
                         continue
-                    # Count open positions
+                    
                     open_count = 0
                     if _alpaca:
                         try:
                             open_count = len(_alpaca.get_all_positions())
-                        except Exception:
-                            pass
+                        except Exception as e:
+                            logger.error(f"  [CRITICAL] Position check failed: {e}. Skipping trade for safety.")
+                            continue  # Stop execution loop if risk telemetry is broken
+                    
                     if open_count >= MAX_POSITIONS:
                         logger.warning(f"  [SKIP MAX POS] {open_count}/{MAX_POSITIONS} positions open")
                         continue
                 else:
-                    # -- SELL: only if position held ---------------------------
+                    # -- Validation check (SELL orders) -----------------------
                     pos = None
                     if _alpaca:
                         try:
-                            pos = _alpaca.get_open_position(ticker)
+                            # If it's an option symbol trade, query Alpaca using the full OCC identifier string
+                            lookup_symbol = trade.occ if trade.occ else ticker
+                            pos = _alpaca.get_open_position(lookup_symbol)
                         except Exception:
                             pass
                     if not pos:
-                        logger.info(f"  [SKIP SELL] No position in {ticker}")
+                        logger.info(f"  [SKIP SELL] No asset position found in {trade.occ or ticker}")
                         continue
 
-                # -- Route to options or equity order -------------------------
-                occ = None
-                if p["option_type"] and p["strike"] and p["expiry"]:
-                    occ = build_occ(ticker, p["expiry"], p["option_type"], p["strike"])
-
-                if occ:
-                    # Options contract order (1 contract = 100 shares)
-                    qty = max(1, int(notional // (p["price"] * 100))) if p["price"] else 1
-                    result = place_option_order(occ, "buy" if is_buy else "sell", qty)
-                    label = f"{ticker} {p['option_type']} ${p['strike']} exp={p['expiry']} x{qty}"
+                # -- Order routing execution engine ---------------------------
+                if trade.occ:
+                    # Safety guard: Prevent divide-by-zero or default mapping executions
+                    if not trade.entry_price or trade.entry_price <= 0:
+                        logger.warning(f"  [SKIP TRADE] Option order execution requires a clear premiums layout: {trade}")
+                        continue
+                    qty = max(1, int(notional // (trade.entry_price * 100)))
+                    result = place_option_order(trade.occ, "buy" if is_buy else "sell", qty)
                 else:
-                    # Equity market order
                     result = place_equity_order(ticker, "buy" if is_buy else "sell", notional)
-                    label = f"{ticker} equity ${notional}"
 
-                logger.info(f"[{conf}%] {p['action']} {label} @{author}: {content[:60].replace(chr(10),' ')}")
+                logger.info(f"[{trade.confidence}%] {trade} @{author}")
 
                 if is_buy and result.get("status") == "submitted":
                     daily_spent += notional
                     bought_today.add(ticker)
 
-                entry = {"ts": datetime.now(timezone.utc).isoformat(), "channel": cid, "author": author,
-                         "ticker": ticker, "action": p["action"], "conf": conf, "notional": notional,
-                         "occ": occ, "option_type": p["option_type"],
-                         "daily_spent": daily_spent, "order": result, "msg": content[:200]}
+                entry = {
+                    "ts": datetime.now(timezone.utc).isoformat(), "channel": cid, "author": author,
+                    "trade": str(trade), "occ": trade.occ, "conf": trade.confidence,
+                    "notional": notional, "daily_spent": daily_spent,
+                    "order": result, "msg": content[:200]
+                }
                 with open(log_dir / f"discord_trades_{today}.jsonl", "a") as f:
                     f.write(json.dumps(entry) + "\n")
 
         first = False
-        if not loop: break
+        if not loop: 
+            break
         time.sleep(poll_secs)
 
 

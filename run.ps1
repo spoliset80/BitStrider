@@ -4,4 +4,5 @@ param(
 )
 
 $env:DISCORD_OPTIONS_MODE = $Mode
-apextrader\Scripts\python.exe scripts/discord_api_reader.py --loop --poll $Poll
+# Invokes python using the module path relative to your project root
+apextrader\Scripts\python.exe -m scripts.discord_api_reader --loop --poll $Poll
