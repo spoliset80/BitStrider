@@ -49,25 +49,33 @@ MODE           = os.getenv("DISCORD_OPTIONS_MODE", "paper")
 API_BASE       = "https://discord.com/api/v10"
 
 # Risk / allocation
-CONFIDENCE_MIN    = int(os.getenv("DISCORD_CONFIDENCE_MIN", "70"))   # minimum score to trade
-ORDER_NOTIONAL    = float(os.getenv("DISCORD_ORDER_NOTIONAL", "500")) # base $ per trade
-MAX_POSITIONS     = int(os.getenv("DISCORD_MAX_POSITIONS", "10"))     # max open positions at once
+CONFIDENCE_MIN    = int(os.getenv("DISCORD_CONFIDENCE_MIN", "70"))      # minimum score to trade
+ORDER_NOTIONAL    = float(os.getenv("DISCORD_ORDER_NOTIONAL", "500"))   # fallback $ when BP unavailable
+MAX_POSITIONS     = int(os.getenv("DISCORD_MAX_POSITIONS", "10"))       # max open positions at once
 MAX_DAILY_SPEND   = float(os.getenv("DISCORD_MAX_DAILY_SPEND", "5000")) # hard $ cap per day
-DEDUPE_TICKER     = os.getenv("DISCORD_DEDUPE_TICKER", "true").lower() == "true" # skip repeat buys
+DEDUPE_TICKER     = os.getenv("DISCORD_DEDUPE_TICKER", "true").lower() == "true"
 
-# Confidence tiers: multiplier applied to ORDER_NOTIONAL
-# conf 70-79 → 0.5x,  80-89 → 1.0x,  90+ → 1.5x
-_CONF_TIERS = [
-    (90, float(os.getenv("DISCORD_TIER_HIGH_MULT",  "1.5"))),
-    (80, float(os.getenv("DISCORD_TIER_MED_MULT",   "1.0"))),
-    (70, float(os.getenv("DISCORD_TIER_LOW_MULT",   "0.5"))),
+# Buying-power allocation by confidence tier (% of available buying power)
+# conf 70-79 → ALLOC_LOW_PCT,  80-89 → ALLOC_MED_PCT,  90+ → ALLOC_HIGH_PCT
+_BP_TIERS = [
+    (90, float(os.getenv("DISCORD_ALLOC_HIGH_PCT", "3.0"))),  # 90%+ conf → 3% of BP
+    (80, float(os.getenv("DISCORD_ALLOC_MED_PCT",  "2.0"))),  # 80-89%   → 2% of BP
+    (70, float(os.getenv("DISCORD_ALLOC_LOW_PCT",  "1.0"))),  # 70-79%   → 1% of BP
 ]
 
-def notional_for(conf: int) -> float:
-    for threshold, mult in _CONF_TIERS:
+def _alloc_pct(conf: int) -> float:
+    for threshold, pct in _BP_TIERS:
         if conf >= threshold:
-            return round(ORDER_NOTIONAL * mult, 2)
-    return ORDER_NOTIONAL
+            return pct
+    return _BP_TIERS[-1][1]
+
+def notional_for(conf: int, buying_power: float | None = None) -> float:
+    """Return $ to deploy. Uses % of buying_power when available, else ORDER_NOTIONAL fallback."""
+    if buying_power and buying_power > 0:
+        return round(buying_power * _alloc_pct(conf) / 100, 2)
+    # Fallback: fixed tiers from ORDER_NOTIONAL
+    pct = _alloc_pct(conf)
+    return round(ORDER_NOTIONAL * pct / _BP_TIERS[-1][1], 2)
 
 # -- Alpaca --------------------------------------------------------------------
 
@@ -89,8 +97,28 @@ def _make_client():
         return None
 
 _alpaca = None
+_buying_power_cache: dict = {"bp": None, "ts": 0.0}
 
-# -- OCC symbol builder --------------------------------------------------------
+def get_buying_power() -> float | None:
+    """Fetch option buying power from Alpaca; cached for 60s."""
+    global _alpaca
+    if _alpaca is None:
+        _alpaca = _make_client()
+    if _alpaca is None:
+        return None
+    now = time.time()
+    if _buying_power_cache["bp"] is not None and now - _buying_power_cache["ts"] < 60:
+        return _buying_power_cache["bp"]
+    try:
+        acct = _alpaca.get_account()
+        bp = float(getattr(acct, "options_buying_power", None) or acct.buying_power or 0)
+        _buying_power_cache["bp"] = bp
+        _buying_power_cache["ts"] = now
+        logger.info(f"  [BP] options_buying_power=${bp:,.2f}")
+        return bp
+    except Exception as e:
+        logger.warning(f"  [BP] failed to fetch buying power: {e}")
+        return None
 
 _MONTHS = {
     "jan":1,"feb":2,"mar":3,"apr":4,"may":5,"jun":6,
@@ -314,9 +342,9 @@ def run(loop: bool = False, poll_secs: int = 30):
     if not USER_TOKEN:
         logger.error("DISCORD_USER_TOKEN not set"); sys.exit(1)
 
-    logger.info(f"Discord Alert Trader | mode={MODE} | conf>={CONFIDENCE_MIN}% | base=${ORDER_NOTIONAL}")
+    logger.info(f"Discord Alert Trader | mode={MODE} | conf>={CONFIDENCE_MIN}% | fallback=${ORDER_NOTIONAL}")
+    logger.info(f"  alloc tiers: 70%={_alloc_pct(70)}% of BP | 80%={_alloc_pct(80)}% of BP | 90%={_alloc_pct(90)}% of BP")
     logger.info(f"  risk limits: max_positions={MAX_POSITIONS} | max_daily_spend=${MAX_DAILY_SPEND} | dedupe={DEDUPE_TICKER}")
-    logger.info(f"  tiers: 70%={notional_for(70)} | 80%={notional_for(80)} | 90%={notional_for(90)}")
     for cid in CHANNEL_IDS:
         logger.info(f"  channel {cid}")
 
@@ -352,7 +380,8 @@ def run(loop: bool = False, poll_secs: int = 30):
                 author  = msg.get("author", {}).get("username", "?")
                 ticker  = p["ticker"]
                 is_buy  = p["action"] == "BUY"
-                notional = notional_for(conf)
+                bp      = get_buying_power() if is_buy else None
+                notional = notional_for(conf, bp)
 
                 if is_buy:
                     # -- Risk checks (BUY only) --------------------------------
