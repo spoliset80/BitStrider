@@ -96,20 +96,31 @@ _MONTHS = {
     "jan":1,"feb":2,"mar":3,"apr":4,"may":5,"jun":6,
     "jul":7,"aug":8,"sep":9,"oct":10,"nov":11,"dec":12,
 }
-# e.g. "July 24th", "Jul 24", "July 24th 2026", "7/24", "7/24/25"
+# e.g. "July 24th", "Jul 24", "July 24th 2026", "7/24", "7/24/25", "Mar-2027", "Jan 2028"
 _EXPIRY_NATURAL = re.compile(
-    r"(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s*(\d{1,2})(?:st|nd|rd|th)?(?:[,\s]+(\d{2,4}))?",
+    r"(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*[.\-]?\s*(\d{1,4})(?:st|nd|rd|th)?(?:[,\s]+(\d{2,4}))?",
     re.I,
 )
 _EXPIRY_SLASH = re.compile(r"(\d{1,2})/(\d{1,2})(?:/(\d{2,4}))?")
+
+def _third_friday(yr: int, mon: int) -> date:
+    """Standard monthly options expiry: 3rd Friday of the month."""
+    d = date(yr, mon, 1)
+    first_fri = d + timedelta(days=(4 - d.weekday()) % 7)
+    return first_fri + timedelta(weeks=2)
 
 def _parse_expiry_date(text: str) -> date | None:
     """Return expiry as a date object, or None if unparseable."""
     m = _EXPIRY_NATURAL.search(text)
     if m:
         mon = _MONTHS[m.group(1).lower()[:3]]
-        day = int(m.group(2))
+        raw2 = int(m.group(2))
         yr_raw = m.group(3)
+        # Distinguish: "Mar-2027" (raw2=2027, no yr_raw) vs "Jul 24th" (raw2=24)
+        if raw2 > 31:  # it's a year, no day specified
+            yr = raw2 + 2000 if raw2 < 100 else raw2
+            return _third_friday(yr, mon)
+        day = raw2
         if yr_raw:
             yr = int(yr_raw)
             yr = yr + 2000 if yr < 100 else yr
@@ -191,7 +202,7 @@ def place_option_order(occ: str, side: str, qty: int = 1) -> dict:
 
 SKIP = {
     "THE","AND","FOR","ARE","BUT","NOT","YOU","ALL","CAN","WAS","ONE","OUR",
-    "OUT","DAY","GET","HAS","HOW","MAY","NEW","NOW","OLD","SEE","TWO","WHO",
+    "OUT","DAY","GET","HAS","HOW","MAY","NEW","OLD","SEE","TWO","WHO",
     "DID","LET","SAY","SHE","TOO","USE","ATM","OTM","ITM","EOD","EOW","CEO",
     "CFO","IPO","ETF","EPS","GDP","CPI","PPI","FED","SEC","FDA","BOT","TOP",
     "LOW","HIGH","TYPE","MID","LONG","TERM","SWING","STOP","SYMBOL","TARGET",
@@ -200,18 +211,18 @@ SKIP = {
 SYMBOL_LINE = re.compile(r"Symbol:\s*\$([A-Z]{1,5})", re.I)
 DOLLAR_TKR  = re.compile(r"\$([A-Z]{1,5})\b")
 BARE_TKR    = re.compile(r"\b([A-Z]{2,5})\b")
-ACTION      = re.compile(r"\b(BUY|SELL|Entered|Exited|Closed|Bought|Sold)\b", re.I)
-# Matches: $42C, $42P, $42.5C, CALLS, PUTS, CSP
-OPT_TYPE    = re.compile(r"\$(\d+(?:\.\d+)?)(C|P)\b|\b(CALLS?|PUTS?|CSP)\b", re.I)
-STRIKE      = re.compile(r"\$(\d{2,4}(?:\.\d+)?)[CP]?\b")
-# Matches: 7/24, 7/24/25, July 24th, Jan 2028, Jan-2028
+ACTION      = re.compile(r"\b(BUY|SELL|Entered|Exited|Closed?|Bought|Sold|close)\b", re.I)
+# Matches: $42C, $42P, 95c, 95p (bare), CALLS, PUTS, CSP
+OPT_TYPE    = re.compile(r"\$(\d+(?:\.\d+)?)(C|P)\b|\b(\d{2,4}(?:\.\d+)?)(C|P)\b|\b(CALLS?|PUTS?|CSP)\b", re.I)
+STRIKE      = re.compile(r"\$?(\d{2,4}(?:\.\d+)?)[CP]\b|\$(\d{2,4}(?:\.\d+)?)")
+# Matches: 7/24, 7/24/25, July 24th, Jan 2028, Mar-2027
 EXPIRY      = re.compile(
-    r"((?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*[.\-]?\s*\d{1,2}(?:st|nd|rd|th)?(?:[,\s]+\d{2,4})?)"
+    r"((?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*[.\-]?\s*\d{1,4}(?:st|nd|rd|th)?(?:[,\s]+\d{2,4})?)"
     r"|\b(\d{1,2}/\d{1,2}(?:/\d{2,4})?)"
     r"|\b(\d+\s*DTE)\b",
     re.I,
 )
-AT_PRICE    = re.compile(r"@\s*\$?(\d+(?:\.\d+)?)")
+AT_PRICE    = re.compile(r"(?:@|\bat)\s*\$?(\d+(?:\.\d+)?)", re.I)
 
 
 def parse(text: str) -> dict:
@@ -233,19 +244,22 @@ def parse(text: str) -> dict:
         v = m.group(1).upper()
         r["action"] = "BUY" if v in ("BUY","ENTERED","BOUGHT") else "SELL"
 
-    # Option type — check $42C/$42P first, then CALL/PUT/CSP words
+    # Option type — check $42C/$42P or bare 95c/95p first, then CALL/PUT/CSP words
     m = OPT_TYPE.search(text)
     if m:
-        if m.group(2):  # matched $42C or $42P form
+        if m.group(2):    # $42C / $42P
             r["option_type"] = "CALL" if m.group(2).upper() == "C" else "PUT"
             r["strike"] = float(m.group(1))
-        else:           # matched CALLS/PUTS/CSP word
-            r["option_type"] = "PUT" if m.group(3).upper().startswith("PUT") else "CALL"
+        elif m.group(4):  # bare 95c / 95p
+            r["option_type"] = "CALL" if m.group(4).upper() == "C" else "PUT"
+            r["strike"] = float(m.group(3))
+        else:             # CALLS/PUTS/CSP word
+            r["option_type"] = "PUT" if m.group(5).upper().startswith("PUT") else "CALL"
 
-    # Strike (if not already set from $42C pattern)
+    # Strike (if not already set)
     if not r["strike"]:
         m = STRIKE.search(text)
-        if m: r["strike"] = float(m.group(1))
+        if m: r["strike"] = float(m.group(1) or m.group(2))
 
     # Expiry
     m = EXPIRY.search(text)
@@ -254,6 +268,18 @@ def parse(text: str) -> dict:
     # Entry price
     m = AT_PRICE.search(text)
     if m: r["price"] = float(m.group(1))
+
+    # Infer action: strike present with no action word → BUY (it's an entry alert)
+    if not r["action"] and r["strike"] and r["option_type"]:
+        r["action"] = "BUY"
+
+    # Default expiry: next standard monthly (3rd Friday) when missing but it's an option
+    if not r["expiry"] and r["option_type"] and r["action"] == "BUY":
+        today = date.today()
+        # Use next month if we're past mid-month, else this month
+        mon = today.month if today.day < 15 else (today.month % 12) + 1
+        yr = today.year if mon >= today.month else today.year + 1
+        r["expiry"] = _third_friday(yr, mon).strftime("%Y-%m-%d")
 
     return r
 
