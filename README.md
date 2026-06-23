@@ -49,6 +49,7 @@
 **Infrastructure**
 - **Market Data App (primary)** + Alpaca + yfinance (fallback) — MDA provides consolidated SIP-level data for bars and quotes
 - **Trade Ideas integration** — headless Selenium scrape refreshes the universe every 30 min
+- **Discord alerts listener** — real-time parsing of Discord channel alerts, auto-executes options trades on identified signals with confidence scoring
 - **TI primary universe** — latest TI captures persist to `data/ti_primary.json`, with `data/universe.json` as TTL-backed fallback
 - **Dynamic universe** — `data/universe.json` with TTL-managed tiers; auto-pruned daily
 - **Clean email reports** — light-theme HTML with regime badge, confidence bars, per-pick metrics

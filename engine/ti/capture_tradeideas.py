@@ -75,22 +75,22 @@ TI_PRIMARY_FILE = REPO_ROOT / "data" / "ti_primary.json"
 # ── Trade Ideas scan URLs ────────────────────────────────────────
 SCANS: dict[str, dict] = {
     "highshortfloat": {
-        "url":    "https://www.trade-ideas.com/TIPro/highshortfloat/",
+        "url":    "https://www.trade-ideas.com/short-squeeze-stocks/",
         "label":  "high_short_float",
         "target": "PRIORITY_2_ESTABLISHED",   # squeeze / short-float candidates
     },
     "marketscope360": {
-        "url":    "https://www.trade-ideas.com/TIPro/marketscope360/",
+        "url":    "https://www.trade-ideas.com/stock-market-dashboard/",
         "label":  "market_scope_360",
         "target": "PRIORITY_1_MOMENTUM",      # momentum leaders
     },
     "unusualoptionsvolume": {
-        "url":    "https://www.trade-ideas.com/TIPro/unusualoptionsvolume/",
+        "url":    "https://www.trade-ideas.com/unusual-options-activity/",
         "label":  "unusual_options_volume",
         "target": "PRIORITY_1_MOMENTUM",   # directional-conviction tickers → tier 1
     },
     "toplists": {
-        "url":    "https://www.trade-ideas.com/TIPro/toplists/",
+        "url":    "https://www.trade-ideas.com/momentum-scanner/",
         "label":  "toplists",
         "target": "PRIORITY_1_MOMENTUM",   # Explore Stock Groups top list tickers
     },

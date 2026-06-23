@@ -1,15 +1,23 @@
 {
-  "generated_at": "2026-06-12T15:14:54-04:00",
-  "date": "2026-06-12",
+  "generated_at": "2026-06-22T22:31:21-04:00",
+  "date": "2026-06-22",
   "market_regime": "bull",
   "picks": [
     {
-      "symbol": "HCAT",
+      "symbol": "TRAX",
       "action": "buy",
-      "price": 1.64,
+      "price": 17.42,
       "confidence": 0.82,
       "strategy": "Sweepea",
-      "reason": "Daily Sweepea pullback to 8-EMA | ATR $0.19"
+      "reason": "Daily Sweepea pullback to 8-EMA | ATR $1.85"
+    },
+    {
+      "symbol": "ANAB",
+      "action": "buy",
+      "price": 57.51,
+      "confidence": 0.82,
+      "strategy": "Sweepea",
+      "reason": "Daily Sweepea pullback to 8-EMA | ATR $2.85"
     }
   ]
 }
