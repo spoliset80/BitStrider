@@ -1,0 +1,50 @@
+# BitStrider Discord Trader — Environment Variable Reference
+# Copy these into your .env file and fill in real values.
+# DO NOT commit your actual .env (it is in .gitignore).
+
+# ── Discord ───────────────────────────────────────────────────────
+DISCORD_USER_TOKEN=              # Discord user token (see README)
+DISCORD_OPTIONS_MODE=paper       # paper | live
+
+# Channel routing — only these three channels auto-execute:
+#   spx-fire-trades   → 0DTE SPY options (fast directional)
+#   stock-breakouts   → swing calls ~45 DTE (embed-based)
+#   alerts-long-term  → structured options/equity swing entries
+DISCORD_CHANNEL_IDS=1119663300909731910,1087572272052715602,753377655532945558
+DISCORD_CHANNEL_TYPES=1119663300909731910:spx,1087572272052715602:breakout,753377655532945558:options
+
+# ── Risk limits ───────────────────────────────────────────────────
+DISCORD_CONFIDENCE_MIN=70        # minimum parse confidence to trade (0–100)
+DISCORD_MAX_POSITIONS=70         # max open positions at once
+DISCORD_MAX_DAILY_SPEND=5000     # hard daily $ cap across all trades
+DISCORD_DEDUPE_TICKER=true       # skip repeat buys of same ticker per day
+
+# Buying-power allocation tiers (% of options_buying_power per trade)
+DISCORD_ALLOC_LOW_PCT=1.0        # conf 70–79 % → 1 % of BP
+DISCORD_ALLOC_MED_PCT=2.0        # conf 80–89 % → 2 % of BP
+DISCORD_ALLOC_HIGH_PCT=3.0       # conf 90 %+   → 3 % of BP
+DISCORD_ORDER_NOTIONAL=500       # fallback $ per trade when BP unavailable
+
+# ── SPX / SPY 0DTE settings ───────────────────────────────────────
+DISCORD_SPX_NOTIONAL=300         # $ per SPY 0DTE trade
+DISCORD_SPX_STOP_PCT=50          # stop-loss at 50 % of premium paid
+DISCORD_SPX_TARGET_PCT=100       # profit target at 2× premium paid
+
+# ── Breakout swing-option settings ───────────────────────────────
+DISCORD_BREAKOUT_NOTIONAL=400    # $ per swing call
+DISCORD_BREAKOUT_DTE=45          # target days-to-expiry
+DISCORD_BREAKOUT_MIN_DTE=30      # never pick an expiry closer than this
+
+# ── Market hours ──────────────────────────────────────────────────
+DISCORD_MARKET_HOURS_ONLY=true
+DISCORD_MARKET_OPEN=09:30
+DISCORD_MARKET_CLOSE=16:00
+DISCORD_MARKET_TZ=America/New_York
+
+# ── Alpaca (paper) ────────────────────────────────────────────────
+PAPER_ALPACA_API_KEY=
+PAPER_ALPACA_API_SECRET=
+
+# ── Alpaca (live — only used when DISCORD_OPTIONS_MODE=live) ─────
+LIVE_ALPACA_API_KEY=
+LIVE_ALPACA_API_SECRET=
