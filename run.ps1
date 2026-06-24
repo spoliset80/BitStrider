@@ -8,6 +8,27 @@ param(
 
 $env:DISCORD_OPTIONS_MODE = $Mode
 
+# ── Single-instance guard (PID file) ─────────────────────────────────────────
+$PidFile = Join-Path $PSScriptRoot "discord_bot.pid"
+if (Test-Path $PidFile) {
+    $oldPid = Get-Content $PidFile -Raw
+    $running = Get-Process -Id $oldPid -ErrorAction SilentlyContinue
+    if ($running) {
+        Write-Warning "Bot already running (PID $oldPid). Exiting to prevent duplicate orders."
+        exit 1
+    } else {
+        Write-Host "Stale PID file found (PID $oldPid no longer running). Continuing."
+    }
+}
+$PID | Out-File $PidFile -Encoding ascii
+Write-Host "PID $PID written to $PidFile"
+
+# Clean up PID file on exit (Ctrl+C, error, normal exit)
+$null = Register-EngineEvent -SourceIdentifier PowerShell.Exiting -Action {
+    Remove-Item $PidFile -ErrorAction SilentlyContinue
+}
+try {
+
 $tz     = [System.TimeZoneInfo]::FindSystemTimeZoneById($TimeZone)
 $open   = [System.TimeSpan]::Parse($MarketOpen)
 $close  = [System.TimeSpan]::Parse($MarketClose)
@@ -49,4 +70,8 @@ while ($true) {
             $slept += 300
         }
     }
+}
+} finally {
+    Remove-Item $PidFile -ErrorAction SilentlyContinue
+    Write-Host "Bot stopped. PID file removed."
 }
