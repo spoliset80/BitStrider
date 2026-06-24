@@ -11,7 +11,7 @@
 
 ```
 Discord channels
-     │  REST API poll (every 30s)
+     │  REST API poll (every 60s, market hours only)
      ▼
   Parse alert  →  ticker + action + confidence score
      │
@@ -27,15 +27,94 @@ Discord channels
 
 ---
 
-## Quick Start
+## Running Locally
+
+### Prerequisites
 
 ```powershell
-# 1. Copy and fill credentials
-copy .env.example .env   # or edit .env directly
+# Clone and switch to the discord branch
+git checkout feature/discord-alerts
 
-# 2. Run
-$env:DISCORD_USER_TOKEN="your-token-here"
-apextrader\Scripts\python.exe scripts/discord_api_reader.py --loop --poll 30
+# Create and activate the virtual environment (first time only)
+python -m venv apextrader
+apextrader\Scripts\Activate.ps1
+
+# Install dependencies
+pip install -r requirements.txt
+```
+
+### Configure `.env`
+
+Create a `.env` file in the project root (copy from `.env.example` if present):
+
+```env
+DISCORD_USER_TOKEN=your-discord-user-token
+DISCORD_OPTIONS_MODE=paper
+
+PAPER_ALPACA_API_KEY=your-paper-key
+PAPER_ALPACA_API_SECRET=your-paper-secret
+
+# Optional overrides
+DISCORD_CHANNEL_IDS=753377655532945558,752750381918060589,769046364738289734,744643208973254726
+DISCORD_CONFIDENCE_MIN=70
+DISCORD_MAX_POSITIONS=10
+DISCORD_ORDER_NOTIONAL=500
+DISCORD_MAX_DAILY_SPEND=5000
+```
+
+### Start the bot
+
+```powershell
+# Paper trading (default) — polls every 60s during market hours 9:30am–4pm EST
+.\run.ps1
+
+# Live trading
+.\run.ps1 -Mode live
+
+# Custom poll interval (e.g. every 30 seconds)
+.\run.ps1 -Poll 30
+
+# Pre-market start
+.\run.ps1 -MarketOpen 09:00
+
+# Specific paper key via env (no .env file)
+$env:DISCORD_USER_TOKEN="..."; $env:PAPER_ALPACA_API_KEY="..."; .\run.ps1
+```
+
+The script:
+- Only polls between `$MarketOpen` and `$MarketClose` (default 9:30–16:00 EST)
+- Skips weekends automatically
+- Sleeps until next market open when outside hours
+- Writes a `discord_bot.pid` lock file — a second `.\run.ps1` will exit immediately to prevent duplicate orders
+- Removes the PID file on exit (Ctrl+C or normal stop)
+
+### Analyze a channel before adding it
+
+```powershell
+# Show last 10 raw messages
+apextrader\Scripts\python.exe scripts\_probe_channel.py <channel_id>
+
+# Full 7-day parse + simulated orders
+apextrader\Scripts\python.exe scripts\_fetch_channel_history.py
+# (edit CID = "..." at the top of that file)
+```
+
+### Add a channel
+
+Either set it in `.env`:
+```env
+DISCORD_CHANNEL_IDS=753377655532945558,752750381918060589,769046364738289734,744643208973254726,<new_id>
+```
+Or edit the default list in [scripts/discord_api_reader.py](scripts/discord_api_reader.py#L28).
+
+### Trade log
+
+Every executed trade is appended to `logs/discord_trades_YYYYMMDD.jsonl`:
+```json
+{"ts": "2026-06-23T14:00:00Z", "channel": "769046364738289734",
+ "ticker": "HIMS", "action": "BUY", "conf": 100,
+ "occ": "HIMS  260724C00042000", "notional": 410.0,
+ "order": {"status": "submitted", "id": "..."}}
 ```
 
 ---
