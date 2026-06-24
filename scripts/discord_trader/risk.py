@@ -44,12 +44,9 @@ class RiskManager:
         return round(self._base_notional * pct / self._alloc[-1][1], 2)
 
     def check_buy(self, ticker: str, notional: float, open_count: int, conf: int) -> tuple[bool, str]:
-        """Returns (allowed, reason). Call before placing any BUY."""
+        """Returns (allowed, reason). Call before placing any BUY.
+        Confidence filtering is handled upstream in the router."""
         self._check_date_rollover()
-
-        if conf < self.confidence_min:
-            return False, f"conf {conf}% < min {self.confidence_min}%"
-
         if self.dedupe_ticker and ticker in self._bought_today:
             return False, f"dedupe: already bought {ticker} today"
 

@@ -50,7 +50,7 @@ while ($true) {
 
     if ($nowTime -ge $open -and $nowTime -lt $close) {
         # Market hours: run one poll cycle and sleep $Poll seconds
-        apextrader\Scripts\python.exe -m scripts.discord_api_reader_v2 --poll $Poll --history 10
+        apextrader\Scripts\python.exe -m scripts.discord_api_reader --poll $Poll --history 10
         Start-Sleep -Seconds $Poll
     } else {
         # Outside market hours: sleep until next open (or 5 min if already past close)

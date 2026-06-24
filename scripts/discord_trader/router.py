@@ -80,8 +80,9 @@ class ChannelRouter:
 
         is_buy = trade.action == "BUY"
 
-        # Confidence gate — BUYs only
-        if is_buy and trade.confidence < self.config.confidence_min:
+        # Confidence gate — BUYs on options channels only
+        # (equity messages never have strike/expiry so scoring is structurally lower)
+        if ctype == "options" and is_buy and trade.confidence < self.config.confidence_min:
             return None
 
         if ctype == "equity":
