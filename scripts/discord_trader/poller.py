@@ -91,16 +91,21 @@ def run(config: Config, loop: bool = False,
 
         for cid in channel_ids:
             if last[cid] is None:
-                # Startup: fetch history only to establish cursor — do NOT dispatch
-                msgs = _fetch(cid, config.user_token, limit=history_limit)
-                if msgs:
-                    last[cid] = max(msgs, key=lambda m: m["id"])["id"]
+                # Startup: fetch history to set cursor, then immediately fetch anything newer
+                history = _fetch(cid, config.user_token, limit=history_limit)
+                if history:
+                    last[cid] = max(history, key=lambda m: m["id"])["id"]
                     logger.info(f"  channel {cid}({config.channel_types[cid]}): "
-                                f"cursor set from {len(msgs)} history messages — not dispatched")
+                                f"cursor set to msg {last[cid]} ({len(history)} history msgs skipped)")
                 else:
-                    last[cid] = "0"  # no history; accept everything going forward
+                    last[cid] = "0"
                     logger.info(f"  channel {cid}: no history, starting fresh")
-                continue  # skip dispatch for this first pass
+                # Fall through to fetch any messages that arrived since cursor
+                msgs = _fetch(cid, config.user_token, after=last[cid])
+                if not msgs:
+                    continue
+                msgs = list(reversed(msgs))
+                last[cid] = msgs[-1]["id"]
             else:
                 msgs = _fetch(cid, config.user_token, after=last[cid])
                 if not msgs:
