@@ -235,3 +235,63 @@ class Broker:
         except Exception as e:
             logger.error(f"  [SPX] Contract lookup error: {e}")
             return None
+
+    def find_swing_call(self, ticker: str, near_price: float,
+                        target_dte: int = 45, min_dte: int = 30) -> Optional[dict]:
+        """
+        Find an ATM-ish call for a swing trade.
+
+        Picks the expiration closest to `target_dte` (but >= `min_dte` out),
+        then the strike closest to `near_price`. Returns the contract dict
+        (with 'symbol', 'strike_price', 'expiration_date', 'close_price') or None.
+        """
+        import requests as req_lib
+        from datetime import date, timedelta
+
+        today    = date.today()
+        gte_date = (today + timedelta(days=min_dte)).strftime("%Y-%m-%d")
+        lte_date = (today + timedelta(days=max(target_dte * 2, min_dte + 30))).strftime("%Y-%m-%d")
+
+        c = self._client
+        headers = {
+            "APCA-API-KEY-ID":     c._api_key,     # type: ignore
+            "APCA-API-SECRET-KEY": c._secret_key,  # type: ignore
+        }
+        base = "https://paper-api.alpaca.markets" if self._paper else "https://api.alpaca.markets"
+        try:
+            r = req_lib.get(
+                f"{base}/v2/options/contracts",
+                headers=headers,
+                params={
+                    "underlying_symbols":   ticker.upper(),
+                    "type":                 "call",
+                    "expiration_date_gte":  gte_date,
+                    "expiration_date_lte":  lte_date,
+                    "limit":                1000,
+                },
+                timeout=10,
+            )
+            if not r.ok:
+                logger.warning(f"  [BREAKOUT] Contract search failed {r.status_code} for {ticker}")
+                return None
+            contracts = [c for c in r.json().get("option_contracts", []) if c.get("tradable")]
+            if not contracts:
+                logger.warning(f"  [BREAKOUT] No tradable {ticker} calls {gte_date}..{lte_date}")
+                return None
+
+            # Choose expiration closest to target_dte
+            target_exp = today + timedelta(days=target_dte)
+            def exp_key(c):
+                ed = date.fromisoformat(c["expiration_date"])
+                return abs((ed - target_exp).days)
+            best_exp = min(contracts, key=exp_key)["expiration_date"]
+            same_exp = [c for c in contracts if c["expiration_date"] == best_exp]
+
+            # Among that expiry, strike closest to near_price (ATM)
+            best = min(same_exp, key=lambda c: abs(float(c["strike_price"]) - near_price))
+            logger.info(f"  [BREAKOUT] Selected {ticker} call {best['symbol']} "
+                        f"strike={best['strike_price']} exp={best['expiration_date']}")
+            return best
+        except Exception as e:
+            logger.error(f"  [BREAKOUT] Contract lookup error for {ticker}: {e}")
+            return None

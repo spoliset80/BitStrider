@@ -11,7 +11,8 @@ from .broker   import Broker
 from .risk     import RiskManager
 from .parsers  import parse_trade
 from .parsers.spx import SpxStateMachine
-from .strategies import handle_equity, handle_options, handle_spx_action
+from .parsers.breakout import parse_breakout
+from .strategies import handle_equity, handle_options, handle_spx_action, handle_breakout
 
 logger = logging.getLogger(__name__)
 
@@ -50,10 +51,29 @@ class ChannelRouter:
         """
         content = msg.get("content", "").strip()
         author  = msg.get("author", {}).get("username", "?")
+        ctype   = self.config.channel_types.get(channel_id, "options")
+
+        # ── Breakout channel (rich embeds, no plain content) ──────────────────
+        if ctype == "breakout":
+            signal = parse_breakout(msg)
+            if not signal:
+                return None
+            logger.info(f"  MSG [breakout] @{author}: {signal.ticker} "
+                        f"entry=${signal.entry} stop=${signal.stop}")
+            result = handle_breakout(signal, self.broker, self.risk, self.config)
+            if result and result.get("status") == "submitted":
+                label = f"BREAKOUT {signal.ticker} {result.get('occ','')}"
+                logger.info(f"  [SWING] {label} @{author}")
+                self._log(channel_id, author, signal.raw, label, result)
+            else:
+                status = (result or {}).get("status", "no-op")
+                reason = (result or {}).get("reason", "")
+                logger.info(f"    -> {signal.ticker} breakout not placed "
+                            f"(status={status}{': ' + reason if reason else ''})")
+            return result
+
         if not content:
             return None
-
-        ctype   = self.config.channel_types.get(channel_id, "options")
 
         # Always show what arrived, even when no action is taken.
         preview = content.replace("\n", " ")
