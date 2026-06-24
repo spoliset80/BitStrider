@@ -75,7 +75,7 @@ def run(config: Config, loop: bool = False,
 
     logger.info(f"Discord Alert Trader | mode={config.mode} | conf>={config.confidence_min}%")
     logger.info(f"  channels: {', '.join(f'{cid}({t})' for cid,t in config.channel_types.items())}")
-    logger.info(f"  startup: processing last {history_limit} msgs per channel, polling every {poll_secs}s")
+    logger.info(f"  startup: reading last {history_limit} msgs per channel to set cursor (not dispatched), then live-only")
 
     last: Dict[str, Optional[str]] = {cid: None for cid in channel_ids}
     today = datetime.now().strftime("%Y%m%d")
@@ -91,14 +91,16 @@ def run(config: Config, loop: bool = False,
 
         for cid in channel_ids:
             if last[cid] is None:
+                # Startup: fetch history only to establish cursor — do NOT dispatch
                 msgs = _fetch(cid, config.user_token, limit=history_limit)
-                if not msgs:
-                    logger.info(f"  channel {cid}: no messages")
-                    continue
-                msgs = list(reversed(msgs))
-                last[cid] = msgs[-1]["id"]
-                logger.info(f"  channel {cid}({config.channel_types[cid]}): "
-                            f"processing {len(msgs)} history messages")
+                if msgs:
+                    last[cid] = max(msgs, key=lambda m: m["id"])["id"]
+                    logger.info(f"  channel {cid}({config.channel_types[cid]}): "
+                                f"cursor set from {len(msgs)} history messages — not dispatched")
+                else:
+                    last[cid] = "0"  # no history; accept everything going forward
+                    logger.info(f"  channel {cid}: no history, starting fresh")
+                continue  # skip dispatch for this first pass
             else:
                 msgs = _fetch(cid, config.user_token, after=last[cid])
                 if not msgs:
