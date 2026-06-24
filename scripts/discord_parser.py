@@ -100,9 +100,8 @@ def resolve_expiry(text: str) -> Optional[date]:
 
 def build_occ(ticker: str, expiry: date, opt_type: str, strike: float) -> str:
     cp = "C" if opt_type == "CALL" else "P"
-    # OCC requires ticker padded to 6 characters right-aligned with spaces
-    padded_ticker = f"{ticker.upper():<6}"
-    return f"{padded_ticker}{expiry.strftime('%y%m%d')}{cp}{int(round(strike * 1000)):08d}"
+    # Alpaca OCC format: no spaces — ticker immediately followed by date/type/strike
+    return f"{ticker.upper()}{expiry.strftime('%y%m%d')}{cp}{int(round(strike * 1000)):08d}"
 
 
 # ---------------------------------------------------------------------------

@@ -113,6 +113,20 @@ def place_equity_order(ticker: str, side: str, notional: float) -> dict:
     try:
         from alpaca.trading.requests import MarketOrderRequest
         from alpaca.trading.enums import OrderSide, TimeInForce
+        if side == "sell":
+            # Use actual held qty for sells to avoid "insufficient qty" error
+            try:
+                pos = _alpaca.get_open_position(ticker)
+                qty = float(pos.qty)
+            except Exception:
+                qty = None
+            if qty:
+                order = _alpaca.submit_order(MarketOrderRequest(
+                    symbol=ticker, qty=qty,
+                    side=OrderSide.SELL, time_in_force=TimeInForce.DAY,
+                ))
+                logger.info(f"  SUBMITTED EQUITY SELL {qty} shares {ticker} id={order.id}")
+                return {"status": "submitted", "type": "equity", "id": str(order.id), "ticker": ticker}
         order = _alpaca.submit_order(MarketOrderRequest(
             symbol=ticker, notional=notional,
             side=OrderSide.BUY if side == "buy" else OrderSide.SELL,
@@ -121,6 +135,19 @@ def place_equity_order(ticker: str, side: str, notional: float) -> dict:
         logger.info(f"  SUBMITTED EQUITY {side.upper()} ${notional} {ticker} id={order.id}")
         return {"status": "submitted", "type": "equity", "id": str(order.id), "ticker": ticker}
     except Exception as e:
+        err = str(e)
+        if "not fractionable" in err and side == "buy":
+            # Fallback: use qty=1 for non-fractionable assets
+            try:
+                order = _alpaca.submit_order(MarketOrderRequest(
+                    symbol=ticker, qty=1,
+                    side=OrderSide.BUY, time_in_force=TimeInForce.DAY,
+                ))
+                logger.info(f"  SUBMITTED EQUITY BUY 1 share {ticker} (non-fractionable) id={order.id}")
+                return {"status": "submitted", "type": "equity", "id": str(order.id), "ticker": ticker}
+            except Exception as e2:
+                logger.error(f"  ORDER FAILED {ticker} (qty=1 fallback): {e2}")
+                return {"status": "error", "ticker": ticker, "error": str(e2)}
         logger.error(f"  ORDER FAILED {ticker}: {e}")
         return {"status": "error", "ticker": ticker, "error": str(e)}
 
