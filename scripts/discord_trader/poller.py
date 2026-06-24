@@ -24,12 +24,19 @@ def _fetch(channel_id: str, token: str, after: Optional[str] = None,
     params = {"limit": limit}
     if after:
         params["after"] = after
-    r = requests.get(
-        f"{_API_BASE}/channels/{channel_id}/messages",
-        headers={"Authorization": token},
-        params=params,
-        timeout=10,
-    )
+    try:
+        r = requests.get(
+            f"{_API_BASE}/channels/{channel_id}/messages",
+            headers={"Authorization": token},
+            params=params,
+            timeout=15,
+        )
+    except requests.exceptions.Timeout:
+        logger.warning(f"Discord request timed out for channel {channel_id} — skipping poll")
+        return []
+    except requests.exceptions.ConnectionError as e:
+        logger.warning(f"Discord connection error for channel {channel_id}: {e} — skipping poll")
+        return []
     if r.status_code == 200:
         return r.json()
     if r.status_code == 401:
