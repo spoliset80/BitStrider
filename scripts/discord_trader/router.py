@@ -54,6 +54,13 @@ class ChannelRouter:
             return None
 
         ctype   = self.config.channel_types.get(channel_id, "options")
+
+        # Always show what arrived, even when no action is taken.
+        preview = content.replace("\n", " ")
+        if len(preview) > 160:
+            preview = preview[:157] + "..."
+        logger.info(f"  MSG [{ctype}] @{author}: {preview}")
+
         bp      = self.broker.buying_power() if ctype in ("options", "equity") else None
         result  = None
 
@@ -71,11 +78,14 @@ class ChannelRouter:
                 )
                 if result:
                     self._log(channel_id, author, content, f"SPX:{action.kind}", result)
+            else:
+                logger.info("    -> no SPX action (waiting for setup/entry/exit trigger)")
             return result
 
         # ── Options / equity channels ─────────────────────────────────────────
         trade = parse_trade(content)
         if not trade:
+            logger.info("    -> not a trade signal (parse skip)")
             return None
 
         is_buy = trade.action == "BUY"
@@ -83,6 +93,8 @@ class ChannelRouter:
         # Confidence gate — BUYs on options channels only
         # (equity messages never have strike/expiry so scoring is structurally lower)
         if ctype == "options" and is_buy and trade.confidence < self.config.confidence_min:
+            logger.info(f"    -> {trade.action} {trade.ticker} skipped: "
+                        f"conf {trade.confidence}% < min {self.config.confidence_min}%")
             return None
 
         if ctype == "equity":
@@ -96,6 +108,11 @@ class ChannelRouter:
                 label += f" OCC={trade.occ}"
             logger.info(f"  [{trade.confidence}%] {label} @{author}")
             self._log(channel_id, author, content, label, result)
+        else:
+            status = (result or {}).get("status", "no-op")
+            reason = (result or {}).get("reason", "")
+            logger.info(f"    -> {trade.action} {trade.ticker} not placed "
+                        f"(status={status}{': ' + reason if reason else ''})")
 
         return result
 
