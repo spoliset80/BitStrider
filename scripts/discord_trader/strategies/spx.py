@@ -27,25 +27,25 @@ def handle_spx_action(action: SpxAction, broker, spx_notional: float,
         return None
 
     if action.kind == "EXIT":
-        if not _active_spy_occ:
-            logger.info("  [SPX] EXIT signal but no active SPY position tracked")
-            return None
-        pos = broker.get_position(_active_spy_occ)
+        # Source of truth is the broker, not in-memory state (which is lost on
+        # restart). Find any open SPY option position and close it.
+        target_occ = _active_spy_occ
+        pos = broker.get_position(target_occ) if target_occ else None
         if not pos:
-            # Also scan all open option positions
             for p in (broker.get_all_positions() or []):
-                if p.symbol.upper().startswith("SPY") and len(p.symbol) > 6:
-                    _active_spy_occ = p.symbol
+                sym = p.symbol.upper()
+                if sym.startswith("SPY") and len(sym) > 6:   # SPY OCC, not SPY shares
+                    target_occ = p.symbol
                     pos = p
                     break
         if not pos:
-            logger.info(f"  [SPX] EXIT — no open SPY position found")
+            logger.info("  [SPX] EXIT signal but no open SPY option position found")
             _active_spy_occ = None
             return None
         qty = max(1, int(float(pos.qty)))
-        result = broker.sell_option(_active_spy_occ, qty)
+        result = broker.sell_option(target_occ, qty)
         if result.get("status") == "submitted":
-            logger.info(f"  [SPX] Closed SPY position {_active_spy_occ}")
+            logger.info(f"  [SPX] Closed SPY position {target_occ} qty={qty}")
             _active_spy_occ = None
         return result
 

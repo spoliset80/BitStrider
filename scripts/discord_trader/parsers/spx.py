@@ -123,7 +123,10 @@ class SpxStateMachine:
             return SpxAction(kind="UPDATE_STOP", new_stop=new_stop)
 
         # ── Exit ─────────────────────────────────────────────────────────────
-        if _RE_EXIT.search(content) and self.state == SpxState.ACTIVE:
+        # Fire EXIT regardless of in-memory state. After a restart the machine is
+        # IDLE even if a real SPY position is still open, so we must not gate on
+        # ACTIVE here. The strategy layer checks the broker and no-ops if flat.
+        if _RE_EXIT.search(content):
             px_m = _RE_EXIT_PX.search(content)
             exit_price = float(px_m.group(1)) if px_m else None
             direction  = self.active.direction if self.active else None
