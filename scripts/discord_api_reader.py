@@ -11,7 +11,12 @@ from pathlib import Path
 
 import requests
 from dotenv import load_dotenv
-from scripts.discord_parser import parse_trade, Trade
+try:
+    from scripts.discord_parser import parse_trade, Trade
+except ModuleNotFoundError:
+    # Allow direct execution via `python scripts/discord_api_reader.py`.
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    from scripts.discord_parser import parse_trade, Trade
 
 load_dotenv(Path(__file__).parent.parent / ".env")
 
@@ -20,7 +25,7 @@ logger = logging.getLogger(__name__)
 
 # -- Config --------------------------------------------------------------------
 
-_raw = os.getenv("DISCORD_CHANNEL_IDS", "753377655532945558,752750381918060589,769046364738289734")
+_raw = os.getenv("DISCORD_CHANNEL_IDS", "753377655532945558,752750381918060589,769046364738289734,744643208973254726")
 CHANNEL_IDS    = [c.strip() for c in _raw.split(",") if c.strip()]
 USER_TOKEN     = os.getenv("DISCORD_USER_TOKEN", "")
 MODE           = os.getenv("DISCORD_OPTIONS_MODE", "paper")
@@ -164,21 +169,25 @@ def fetch(channel_id: str, after: str = None, limit: int = 50) -> list[dict]:
 
 # -- Main Execution Pipeline ---------------------------------------------------
 
-def run(loop: bool = False, poll_secs: int = 30):
+def run(loop: bool = False, poll_secs: int = 30, history_limit: int = 50):
     if not USER_TOKEN:
         logger.error("DISCORD_USER_TOKEN not set"); sys.exit(1)
 
     logger.info(f"Discord Alert Trader | mode={MODE} | conf>={CONFIDENCE_MIN}% | fallback=${ORDER_NOTIONAL}")
     logger.info(f"  alloc tiers: 70%={_alloc_pct(70)}% | 80%={_alloc_pct(80)}% | 90%={_alloc_pct(90)}%")
+    logger.info(f"  channels: {', '.join(CHANNEL_IDS)}")
+    logger.info(f"  startup: processing last {history_limit} messages per channel, then polling every {poll_secs}s")
     
     last: dict        = {cid: None for cid in CHANNEL_IDS}
-    first             = True
     today             = datetime.now().strftime("%Y%m%d")
     daily_spent       = 0.0  
     bought_today: set = set()  
     log_dir = Path("logs"); log_dir.mkdir(exist_ok=True)
 
     while True:
+        poll_new_messages = 0
+        poll_actionable = 0
+
         if datetime.now().strftime("%Y%m%d") != today:
             today = datetime.now().strftime("%Y%m%d")
             daily_spent = 0.0
@@ -186,20 +195,24 @@ def run(loop: bool = False, poll_secs: int = 30):
             logger.info("New trading day -- daily counters reset")
 
         for cid in CHANNEL_IDS:
-            # SAFETY FIX: On the first loop iteration, gather only the single most recent message 
-            # to set the baseline anchor ID without processing historical trade logs.
-            if first:
-                initial_msgs = fetch(cid, limit=1)
-                if initial_msgs:
-                    last[cid] = initial_msgs[0]["id"]
-                continue
+            # First pass: fetch recent history and process it immediately.
+            # Subsequent passes: fetch only messages newer than last seen.
+            if last[cid] is None:
+                msgs = fetch(cid, limit=history_limit)
+                if not msgs:
+                    logger.info(f"  channel {cid}: no messages found")
+                    continue
+                msgs = list(reversed(msgs))  # oldest first
+                last[cid] = msgs[-1]["id"]
+                logger.info(f"  channel {cid}: processing {len(msgs)} history messages")
+            else:
+                msgs = fetch(cid, after=last[cid])
+                if not msgs:
+                    continue
+                msgs = list(reversed(msgs))
+                last[cid] = msgs[-1]["id"]
 
-            msgs = fetch(cid, after=last[cid]) if last[cid] else []
-            if not msgs: 
-                continue
-            
-            msgs = list(reversed(msgs))
-            last[cid] = msgs[-1]["id"]
+            poll_new_messages += len(msgs)
 
             for msg in msgs:
                 content = msg.get("content", "").strip()
@@ -209,6 +222,7 @@ def run(loop: bool = False, poll_secs: int = 30):
                 trade = parse_trade(content)
                 if not trade or trade.confidence < CONFIDENCE_MIN:
                     continue
+                poll_actionable += 1
 
                 author   = msg.get("author", {}).get("username", "?")
                 ticker   = trade.ticker
@@ -276,9 +290,14 @@ def run(loop: bool = False, poll_secs: int = 30):
                 with open(log_dir / f"discord_trades_{today}.jsonl", "a") as f:
                     f.write(json.dumps(entry) + "\n")
 
-        first = False
-        if not loop: 
+        if not loop:
             break
+        if poll_new_messages == 0:
+            logger.info(f"heartbeat: no new Discord messages across {len(CHANNEL_IDS)} channels; next poll in {poll_secs}s")
+        elif poll_actionable == 0:
+            logger.info(f"heartbeat: {poll_new_messages} new Discord messages, 0 actionable trades; next poll in {poll_secs}s")
+        else:
+            logger.info(f"heartbeat: {poll_new_messages} new Discord messages, {poll_actionable} actionable trades; next poll in {poll_secs}s")
         time.sleep(poll_secs)
 
 
@@ -286,5 +305,7 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--loop", action="store_true")
     ap.add_argument("--poll", type=int, default=30)
+    ap.add_argument("--history", type=int, default=50,
+                    help="Number of recent messages to process on startup (default 50)")
     args = ap.parse_args()
-    run(loop=args.loop, poll_secs=args.poll)
+    run(loop=args.loop, poll_secs=args.poll, history_limit=args.history)
