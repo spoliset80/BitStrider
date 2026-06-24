@@ -29,47 +29,30 @@ $null = Register-EngineEvent -SourceIdentifier PowerShell.Exiting -Action {
 }
 try {
 
-$tz     = [System.TimeZoneInfo]::FindSystemTimeZoneById($TimeZone)
-$open   = [System.TimeSpan]::Parse($MarketOpen)
-$close  = [System.TimeSpan]::Parse($MarketClose)
+# Pass market-hours settings to Python (which owns the loop + gating).
+$env:DISCORD_MARKET_OPEN  = $MarketOpen
+$env:DISCORD_MARKET_CLOSE = $MarketClose
 
-Write-Host "Discord Alert Trader | mode=$Mode | poll=${Poll}s | market $MarketOpen-$MarketClose EST"
+Write-Host "Discord Alert Trader (supervisor) | mode=$Mode | poll=${Poll}s | market $MarketOpen-$MarketClose ($TimeZone)"
+Write-Host "Python owns the poll loop + market-hours gating. Supervisor restarts it on crash."
 
+# ── Supervisor loop: keep Python alive, restart with backoff on crash ─────────
+$restarts = 0
 while ($true) {
-    $nowEst  = [System.TimeZoneInfo]::ConvertTimeFromUtc([System.DateTime]::UtcNow, $tz)
-    $nowTime = $nowEst.TimeOfDay
-    $today   = $nowEst.DayOfWeek
+    $startedAt = Get-Date
+    Write-Host "[$($startedAt.ToString('HH:mm:ss'))] Starting poller (restart #$restarts)..."
 
-    # Skip weekends entirely
-    if ($today -eq "Saturday" -or $today -eq "Sunday") {
-        $waitSec = 3600
-        Write-Host "[$($nowEst.ToString('HH:mm')) EST] Weekend -- sleeping 60m"
-        Start-Sleep -Seconds $waitSec
-        continue
-    }
+    apextrader\Scripts\python.exe -m scripts.discord_api_reader --loop --poll $Poll --history 10
+    $code = $LASTEXITCODE
 
-    if ($nowTime -ge $open -and $nowTime -lt $close) {
-        # Market hours: run one poll cycle and sleep $Poll seconds
-        apextrader\Scripts\python.exe -m scripts.discord_api_reader --loop --poll $Poll --history 10
-        Start-Sleep -Seconds $Poll
-    } else {
-        # Outside market hours: sleep until next open (or 5 min if already past close)
-        if ($nowTime -lt $open) {
-            $secsUntilOpen = [int](($open - $nowTime).TotalSeconds)
-        } else {
-            # Past close -- sleep until next day open (rough: remaining day + open offset)
-            $midnight = [System.TimeSpan]::FromHours(24)
-            $secsUntilOpen = [int](($midnight - $nowTime + $open).TotalSeconds)
-        }
-        $waitMin = [int]($secsUntilOpen / 60)
-        Write-Host "[$($nowEst.ToString('HH:mm')) EST] Outside market hours -- sleeping ${waitMin}m until $MarketOpen open"
-        # Sleep in chunks so Ctrl+C still works
-        $slept = 0
-        while ($slept -lt $secsUntilOpen) {
-            Start-Sleep -Seconds ([Math]::Min(300, $secsUntilOpen - $slept))
-            $slept += 300
-        }
-    }
+    $ranSec = [int]((Get-Date) - $startedAt).TotalSeconds
+    Write-Host "[$(Get-Date -Format 'HH:mm:ss')] Poller exited (code=$code) after ${ranSec}s."
+
+    # If it ran for a while then died, reset backoff. If it crashed instantly, back off.
+    if ($ranSec -gt 60) { $restarts = 0 } else { $restarts++ }
+    $backoff = [Math]::Min(300, 5 * [Math]::Max(1, $restarts))
+    Write-Host "Restarting in ${backoff}s... (Ctrl+C to stop)"
+    Start-Sleep -Seconds $backoff
 }
 } finally {
     Remove-Item $PidFile -ErrorAction SilentlyContinue

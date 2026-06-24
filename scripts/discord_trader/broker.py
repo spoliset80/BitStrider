@@ -16,8 +16,20 @@ class Broker:
         from alpaca.trading.client import TradingClient
         self._paper  = paper
         self._client = TradingClient(key, secret, paper=paper)
+        self.trading_enabled = True   # gated by poller based on market hours
         mode = "PAPER" if paper else "LIVE"
         logger.info(f"Alpaca connected [{mode}]")
+
+    def set_trading_enabled(self, enabled: bool):
+        """Enable/disable actual order submission. Parsing/state still runs when disabled."""
+        self.trading_enabled = enabled
+
+    def _gate(self, label: str) -> Optional[dict]:
+        """Return a skip result if trading is disabled, else None."""
+        if not self.trading_enabled:
+            logger.info(f"  [GATED] market closed — not placing {label}")
+            return {"status": "skip", "reason": "market closed"}
+        return None
 
     # ── Account ───────────────────────────────────────────────────────────────
 
@@ -86,6 +98,9 @@ class Broker:
     def buy_equity(self, ticker: str, notional: float) -> dict:
         from alpaca.trading.requests import MarketOrderRequest
         from alpaca.trading.enums    import OrderSide, TimeInForce
+        gated = self._gate(f"EQUITY BUY {ticker}")
+        if gated:
+            return gated
         try:
             o = self._client.submit_order(MarketOrderRequest(
                 symbol=ticker, notional=notional,
@@ -117,6 +132,9 @@ class Broker:
     def sell_equity(self, ticker: str) -> dict:
         from alpaca.trading.requests import MarketOrderRequest
         from alpaca.trading.enums    import OrderSide, TimeInForce
+        gated = self._gate(f"EQUITY SELL {ticker}")
+        if gated:
+            return gated
         pos = self.get_position(ticker)
         if not pos:
             return {"status": "skip", "reason": f"no position in {ticker}"}
@@ -135,6 +153,9 @@ class Broker:
     def buy_option(self, occ: str, qty: int, limit_price: Optional[float] = None) -> dict:
         from alpaca.trading.requests import MarketOrderRequest, LimitOrderRequest
         from alpaca.trading.enums    import OrderSide, TimeInForce
+        gated = self._gate(f"OPTION BUY {occ}")
+        if gated:
+            return gated
         try:
             if limit_price:
                 req = LimitOrderRequest(symbol=occ, qty=qty, limit_price=limit_price,
@@ -153,6 +174,9 @@ class Broker:
     def sell_option(self, occ: str, qty: int) -> dict:
         from alpaca.trading.requests import MarketOrderRequest
         from alpaca.trading.enums    import OrderSide, TimeInForce
+        gated = self._gate(f"OPTION SELL {occ}")
+        if gated:
+            return gated
         try:
             o = self._client.submit_order(MarketOrderRequest(
                 symbol=occ, qty=qty,

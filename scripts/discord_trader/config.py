@@ -35,6 +35,12 @@ class Config:
     poll_secs:     int = 60
     history_limit: int = 50
 
+    # Market hours (orders only placed inside this window; polling continues 24/7)
+    market_hours_only: bool = True
+    market_open:  str = "09:30"   # ET
+    market_close: str = "16:00"   # ET
+    market_tz:    str = "America/New_York"
+
     # SPX / SPY settings
     spx_notional:  float = 300.0   # $ per SPY 0DTE trade
     spx_stop_pct:  float = 50.0    # stop-loss at 50 % of premium paid
@@ -94,4 +100,8 @@ def load_config() -> Config:
         spx_notional    = float(os.getenv("DISCORD_SPX_NOTIONAL", "300")),
         spx_stop_pct    = float(os.getenv("DISCORD_SPX_STOP_PCT", "50")),
         spx_target_pct  = float(os.getenv("DISCORD_SPX_TARGET_PCT", "100")),
+        market_hours_only = os.getenv("DISCORD_MARKET_HOURS_ONLY", "true").lower() == "true",
+        market_open       = os.getenv("DISCORD_MARKET_OPEN", "09:30"),
+        market_close      = os.getenv("DISCORD_MARKET_CLOSE", "16:00"),
+        market_tz         = os.getenv("DISCORD_MARKET_TZ", "America/New_York"),
     )
