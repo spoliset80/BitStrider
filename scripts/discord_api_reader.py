@@ -220,7 +220,10 @@ def run(loop: bool = False, poll_secs: int = 30, history_limit: int = 50):
                     continue
 
                 trade = parse_trade(content)
-                if not trade or trade.confidence < CONFIDENCE_MIN:
+                if not trade:
+                    continue
+                # Confidence gate applies to BUYs only — always allow closes/sells
+                if trade.action == "BUY" and trade.confidence < CONFIDENCE_MIN:
                     continue
                 poll_actionable += 1
 
@@ -254,14 +257,35 @@ def run(loop: bool = False, poll_secs: int = 30, history_limit: int = 50):
                     # -- Validation check (SELL orders) -----------------------
                     pos = None
                     if _alpaca:
-                        try:
-                            # If it's an option symbol trade, query Alpaca using the full OCC identifier string
-                            lookup_symbol = trade.occ if trade.occ else ticker
-                            pos = _alpaca.get_open_position(lookup_symbol)
-                        except Exception:
-                            pass
+                        # If message said "Closed" with no OCC, check if there's an open
+                        # option position for this underlying ticker and use that OCC instead.
+                        if not trade.occ:
+                            try:
+                                all_positions = _alpaca.get_all_positions()
+                                for p in all_positions:
+                                    sym = p.symbol
+                                    # OCC symbols start with the ticker (left-padded to 6 chars)
+                                    if sym.upper().startswith(ticker.upper()) and len(sym) > 6:
+                                        trade = type(trade)(
+                                            ticker=trade.ticker, action=trade.action,
+                                            option_type=trade.option_type, strike=trade.strike,
+                                            expiry_str=trade.expiry_str, expiry_date=trade.expiry_date,
+                                            occ=sym, entry_price=trade.entry_price,
+                                            confidence=trade.confidence, notes=trade.notes,
+                                        )
+                                        pos = p
+                                        logger.info(f"  [CLOSE] Resolved {ticker} close to OCC {sym}")
+                                        break
+                            except Exception as e:
+                                logger.warning(f"  [SELL] Position scan failed: {e}")
+                        if not pos:
+                            try:
+                                lookup_symbol = trade.occ if trade.occ else ticker
+                                pos = _alpaca.get_open_position(lookup_symbol)
+                            except Exception:
+                                pass
                     if not pos:
-                        logger.info(f"  [SKIP SELL] No asset position found in {trade.occ or ticker}")
+                        logger.info(f"  [SKIP SELL] No open position found for {trade.occ or ticker}")
                         continue
 
                 # -- Order routing execution engine ---------------------------
