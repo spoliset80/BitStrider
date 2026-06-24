@@ -14,6 +14,7 @@ class Broker:
 
     def __init__(self, key: str, secret: str, paper: bool = True):
         from alpaca.trading.client import TradingClient
+        self._paper  = paper
         self._client = TradingClient(key, secret, paper=paper)
         mode = "PAPER" if paper else "LIVE"
         logger.info(f"Alpaca connected [{mode}]")
@@ -183,7 +184,7 @@ class Broker:
             "APCA-API-KEY-ID":     c._api_key,     # type: ignore
             "APCA-API-SECRET-KEY": c._secret_key,  # type: ignore
         }
-        base = "https://paper-api.alpaca.markets" if c._base_url and "paper" in str(c._base_url) else "https://api.alpaca.markets"  # type: ignore
+        base = "https://paper-api.alpaca.markets" if self._paper else "https://api.alpaca.markets"
         try:
             r = req_lib.get(
                 f"{base}/v2/options/contracts",

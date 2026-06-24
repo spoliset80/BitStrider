@@ -12,7 +12,7 @@ _active_spy_occ: Optional[str] = None
 
 
 def handle_spx_action(action: SpxAction, broker, spx_notional: float,
-                       stop_pct: float = 50.0) -> Optional[dict]:
+                       stop_pct: float = 50.0, use_limit: bool = False) -> Optional[dict]:
     """
     Execute a SPY 0DTE order based on an SpxAction from the state machine.
 
@@ -62,7 +62,27 @@ def handle_spx_action(action: SpxAction, broker, spx_notional: float,
         # Calculate qty from notional (need ask price — use $2 estimate if unavailable)
         qty = max(1, int(spx_notional // 200))  # default $2/contract estimate
 
-        result = broker.buy_option(occ, qty, limit_price=None)
+        # Get current ask price for limit order
+        limit_px = None
+        if use_limit:
+            try:
+                import requests as req_lib
+                c = broker._client
+                headers = {
+                    "APCA-API-KEY-ID":     c._api_key,
+                    "APCA-API-SECRET-KEY": c._secret_key,
+                }
+                base = "https://paper-api.alpaca.markets" if broker._paper else "https://api.alpaca.markets"
+                r = req_lib.get(f"{base}/v2/options/contracts/{occ}", headers=headers, timeout=5)
+                if r.ok:
+                    close_px = r.json().get("close_price")
+                    if close_px:
+                        limit_px = float(close_px)
+                        logger.info(f"  [SPX] Using last close price as limit: ${limit_px}")
+            except Exception as e:
+                logger.warning(f"  [SPX] Could not get limit price: {e}")
+
+        result = broker.buy_option(occ, qty, limit_price=limit_px)
         if result.get("status") == "submitted":
             _active_spy_occ = occ
             tgt = signal.target if signal else "?"
