@@ -188,6 +188,39 @@ class Broker:
             logger.error(f"  ORDER FAILED SELL {occ}: {e}")
             return {"status": "error", "occ": occ, "error": str(e)}
 
+    def place_option_trailing_stop(self, occ: str, qty: int,
+                                   trail_pct: float = 40.0) -> dict:
+        """
+        Place a GTC trailing-stop SELL on an option position.
+
+        `trail_pct` is the % drawdown from the option's intra-day high before
+        the stop fires (e.g. 40 → sell if premium drops 40 % from its high).
+
+        Returns a result dict identical to buy_option / sell_option.
+        """
+        from alpaca.trading.requests import TrailingStopOrderRequest
+        from alpaca.trading.enums    import OrderSide, TimeInForce
+        gated = self._gate(f"TRAILING STOP {occ}")
+        if gated:
+            return gated
+        try:
+            req = TrailingStopOrderRequest(
+                symbol          = occ,
+                qty             = qty,
+                side            = OrderSide.SELL,
+                time_in_force   = TimeInForce.GTC,
+                trail_percent   = trail_pct,
+            )
+            o = self._client.submit_order(req)
+            logger.info(f"  TRAILING STOP placed {trail_pct}% GTC {qty}x {occ} id={o.id}")
+            return {"status": "submitted", "type": "trailing_stop", "id": str(o.id),
+                    "occ": occ, "qty": qty, "trail_pct": trail_pct}
+        except Exception as e:
+            # Trailing stops may not be supported for options in some account types
+            logger.warning(f"  [STOP] Trailing stop failed for {occ} ({e}) — "
+                           "position is UNPROTECTED, close manually or check account permissions")
+            return {"status": "error", "occ": occ, "error": str(e)}
+
     def find_spy_0dte_contract(self, direction: str) -> Optional[str]:
         """Find ATM SPY 0DTE option symbol for today."""
         import requests as req_lib

@@ -63,4 +63,14 @@ def handle_breakout(signal, broker, risk, config) -> Optional[dict]:
     result = broker.buy_option(occ, qty, limit_price=limit_px)
     if result.get("status") == "submitted":
         risk.record_buy(ticker, notional)
+        # Immediately place a GTC trailing stop to protect the position
+        stop_result = broker.place_option_trailing_stop(
+            occ, qty, trail_pct=config.breakout_trail_pct
+        )
+        if stop_result.get("status") == "submitted":
+            logger.info(f"  [BREAKOUT] Trailing stop {config.breakout_trail_pct}% GTC "
+                        f"placed for {occ}")
+        else:
+            logger.warning(f"  [BREAKOUT] *** NO STOP on {occ}: {stop_result.get('error','?')} "
+                           "— close manually ***")
     return result

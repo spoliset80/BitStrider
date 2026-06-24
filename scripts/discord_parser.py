@@ -122,8 +122,11 @@ _RE_COLON_TKR   = re.compile(r"^([A-Z]{1,5})\s*:", re.M)
 
 # Action keywords
 _RE_ACTION = re.compile(
-    r"\b(BUY|SELL|Entered|Exited|Bought|Sold|Closed?|close|added)\b", re.I
+    r"\b(BUY|SELL|Entered|Exited|Bought|Sold|Closed?|close|added|Out)\b", re.I
 )
+
+# Explicit "Out $TICKER calls/puts @ price" exit pattern (e.g. "Out $MSFT calls @ 13.40")
+_RE_OUT_EXIT = re.compile(r"\bOut\s+\$?([A-Z]{1,5})\s+(calls?|puts?)\b", re.I)
 
 # Option type + strike (Stricter matching to prevent overlap with standard numbers)
 _RE_OPT_DOLLAR = re.compile(r"\$(\d{1,4}(?:\.\d+)?)(C|P)\b", re.I)          # $42C
@@ -170,6 +173,21 @@ def parse_trade(raw: str) -> Optional[Trade]:
     # 1. Clean noise
     text = _NOISE.sub(" ", raw).strip()
     text = re.sub(r"\s{2,}", " ", text)
+
+    # 1b. Fast-track "Out $TICKER calls/puts @ price" exit pattern
+    out_m = _RE_OUT_EXIT.search(raw)
+    if out_m:
+        ticker     = out_m.group(1).upper()
+        opt_word   = out_m.group(2).upper()
+        option_type = "PUT" if opt_word.startswith("PUT") else "CALL"
+        price_m    = _RE_PRICE.search(raw)
+        entry_price = float(price_m.group(1)) if price_m else None
+        notes.append(f"fast-path Out exit → SELL {ticker} {option_type}")
+        return Trade(
+            ticker=ticker, action="SELL", option_type=option_type,
+            strike=None, expiry_str=None, expiry_date=None, occ=None,
+            entry_price=entry_price, confidence=90, notes=notes,
+        )
 
     # 2. Extract option details FIRST to prevent ticker collisions
     option_type = None

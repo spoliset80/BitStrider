@@ -34,6 +34,7 @@ DISCORD_SPX_TARGET_PCT=100       # profit target at 2× premium paid
 DISCORD_BREAKOUT_NOTIONAL=400    # $ per swing call
 DISCORD_BREAKOUT_DTE=45          # target days-to-expiry
 DISCORD_BREAKOUT_MIN_DTE=30      # never pick an expiry closer than this
+DISCORD_BREAKOUT_TRAIL_PCT=40    # GTC trailing stop % below option premium high
 
 # ── Market hours ──────────────────────────────────────────────────
 DISCORD_MARKET_HOURS_ONLY=true

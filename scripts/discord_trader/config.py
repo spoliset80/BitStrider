@@ -50,6 +50,7 @@ class Config:
     breakout_notional: float = 400.0   # $ per swing call
     breakout_dte:      int   = 45      # target days-to-expiry for swing calls
     breakout_min_dte:  int   = 30      # never pick an expiry sooner than this
+    breakout_trail_pct: float = 40.0  # trailing stop % below option premium high
 
     @property
     def alpaca_key(self) -> str:
@@ -105,9 +106,10 @@ def load_config() -> Config:
         spx_notional    = float(os.getenv("DISCORD_SPX_NOTIONAL", "300")),
         spx_stop_pct    = float(os.getenv("DISCORD_SPX_STOP_PCT", "50")),
         spx_target_pct  = float(os.getenv("DISCORD_SPX_TARGET_PCT", "100")),
-        breakout_notional = float(os.getenv("DISCORD_BREAKOUT_NOTIONAL", "400")),
-        breakout_dte      = int(os.getenv("DISCORD_BREAKOUT_DTE", "45")),
-        breakout_min_dte  = int(os.getenv("DISCORD_BREAKOUT_MIN_DTE", "30")),
+        breakout_notional  = float(os.getenv("DISCORD_BREAKOUT_NOTIONAL", "400")),
+        breakout_dte       = int(os.getenv("DISCORD_BREAKOUT_DTE", "45")),
+        breakout_min_dte   = int(os.getenv("DISCORD_BREAKOUT_MIN_DTE", "30")),
+        breakout_trail_pct = float(os.getenv("DISCORD_BREAKOUT_TRAIL_PCT", "40")),
         market_hours_only = os.getenv("DISCORD_MARKET_HOURS_ONLY", "true").lower() == "true",
         market_open       = os.getenv("DISCORD_MARKET_OPEN", "09:30"),
         market_close      = os.getenv("DISCORD_MARKET_CLOSE", "16:00"),
