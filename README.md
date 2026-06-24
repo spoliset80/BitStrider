@@ -45,22 +45,73 @@ pip install -r requirements.txt
 
 ### Configure `.env`
 
-Create a `.env` file in the project root (copy from `.env.example` if present):
+Create a `.env` file in the project root:
 
 ```env
+# ── Discord ────────────────────────────────────────────────────────────────────
 DISCORD_USER_TOKEN=your-discord-user-token
+
+# Channel IDs mapped to handler types (options | equity | spx)
+DISCORD_CHANNEL_TYPES=753377655532945558:options,752750381918060589:equity,769046364738289734:options,744643208973254726:options,1119663300909731910:spx
+
 DISCORD_OPTIONS_MODE=paper
 
+# ── Alpaca ─────────────────────────────────────────────────────────────────────
 PAPER_ALPACA_API_KEY=your-paper-key
 PAPER_ALPACA_API_SECRET=your-paper-secret
+LIVE_ALPACA_API_KEY=your-live-key
+LIVE_ALPACA_API_SECRET=your-live-secret
 
-# Optional overrides
-DISCORD_CHANNEL_IDS=753377655532945558,752750381918060589,769046364738289734,744643208973254726
+# ── Risk / tuning (optional) ───────────────────────────────────────────────────
 DISCORD_CONFIDENCE_MIN=70
-DISCORD_MAX_POSITIONS=10
 DISCORD_ORDER_NOTIONAL=500
+DISCORD_MAX_POSITIONS=10
 DISCORD_MAX_DAILY_SPEND=5000
+DISCORD_SPX_NOTIONAL=300
 ```
+
+---
+
+## Finding Your Credentials
+
+### Discord User Token
+
+> **Warning:** your user token gives full access to your Discord account. Keep it in `.env` and never commit it.
+
+1. Open Discord in a browser (chrome/edge — **not** the desktop app)
+2. Open DevTools → **Network** tab → filter by `messages`
+3. Click any channel to trigger a request
+4. In the request headers find `Authorization` — that value is your token
+5. Copy it into `DISCORD_USER_TOKEN=...`
+
+Alternatively on the desktop app:
+1. Press `Ctrl+Shift+I` to open DevTools
+2. Go to **Application → Local Storage → https://discord.com**
+3. Find the key `token` — the quoted string is your user token
+
+Tokens do not expire unless you change your password or log out of all sessions.
+
+### Discord Channel IDs
+
+1. In Discord settings enable **Developer Mode**: User Settings → Advanced → Developer Mode ✓
+2. Right-click any channel → **Copy Channel ID**
+3. Add it to `DISCORD_CHANNEL_TYPES` with its type:
+   - `<id>:options` — options alert channel (parses strike/expiry/OCC)
+   - `<id>:equity` — stock alert channel (buys/sells shares)
+   - `<id>:spx` — SPX level channel (drives SPY 0DTE state machine)
+
+### Alpaca API Keys
+
+**Paper (for testing):**
+1. Go to [app.alpaca.markets](https://app.alpaca.markets)
+2. Switch to the **Paper** environment (toggle top-left)
+3. Click your account → **API Keys** → Generate New Key
+4. Copy key + secret into `PAPER_ALPACA_API_KEY` / `PAPER_ALPACA_API_SECRET`
+
+**Live:**
+1. Same steps but with the **Live** environment selected
+2. Copy into `LIVE_ALPACA_API_KEY` / `LIVE_ALPACA_API_SECRET`
+3. Set `DISCORD_OPTIONS_MODE=live` in `.env` or run `.\run.ps1 -Mode live`
 
 ### Start the bot
 
@@ -88,24 +139,23 @@ The script:
 - Writes a `discord_bot.pid` lock file — a second `.\run.ps1` will exit immediately to prevent duplicate orders
 - Removes the PID file on exit (Ctrl+C or normal stop)
 
-### Analyze a channel before adding it
-
-```powershell
-# Show last 10 raw messages
-apextrader\Scripts\python.exe scripts\_probe_channel.py <channel_id>
-
-# Full 7-day parse + simulated orders
-apextrader\Scripts\python.exe scripts\_fetch_channel_history.py
-# (edit CID = "..." at the top of that file)
-```
-
 ### Add a channel
 
-Either set it in `.env`:
+In `.env`, add the new ID and its type to `DISCORD_CHANNEL_TYPES`:
 ```env
-DISCORD_CHANNEL_IDS=753377655532945558,752750381918060589,769046364738289734,744643208973254726,<new_id>
+DISCORD_CHANNEL_TYPES=...,<new_channel_id>:options
 ```
-Or edit the default list in [scripts/discord_api_reader.py](scripts/discord_api_reader.py#L28).
+Types: `options` · `equity` · `spx`
+
+### End-to-end test
+
+Place real paper orders across all channel types without waiting for live Discord messages:
+```powershell
+apextrader\Scripts\python.exe scripts\test_e2e_discord.py
+
+# Parse only — no orders placed
+apextrader\Scripts\python.exe scripts\test_e2e_discord.py --dry-run
+```
 
 ### Trade log
 
@@ -129,26 +179,29 @@ Every executed trade is appended to `logs/discord_trades_YYYYMMDD.jsonl`:
 ### Credentials
 | Key | Description |
 |-----|-------------|
-| `DISCORD_USER_TOKEN` | Your Discord user token |
+| `DISCORD_USER_TOKEN` | Your Discord user token (see [Finding Your Credentials](#finding-your-credentials)) |
 | `PAPER_ALPACA_API_KEY` / `PAPER_ALPACA_API_SECRET` | Alpaca paper keys |
 | `LIVE_ALPACA_API_KEY` / `LIVE_ALPACA_API_SECRET` | Alpaca live keys |
 
 ### Channels
 | Key | Default | Description |
 |-----|---------|-------------|
-| `DISCORD_CHANNEL_IDS` | 3 hardcoded IDs | Comma-separated channel IDs to poll |
+| `DISCORD_CHANNEL_TYPES` | — | `id:type` pairs, comma-separated. Types: `options` `equity` `spx` |
 
 ### Risk / Allocation
 | Key | Default | Description |
 |-----|---------|-------------|
-| `DISCORD_ORDER_NOTIONAL` | `500` | Base $ per trade |
-| `DISCORD_TIER_LOW_MULT` | `0.5` | Multiplier for conf 70–79% → $250 |
-| `DISCORD_TIER_MED_MULT` | `1.0` | Multiplier for conf 80–89% → $500 |
-| `DISCORD_TIER_HIGH_MULT` | `1.5` | Multiplier for conf 90%+ → $750 |
-| `DISCORD_CONFIDENCE_MIN` | `70` | Minimum confidence score to place a trade |
-| `DISCORD_MAX_POSITIONS` | `10` | Max open positions at once |
+| `DISCORD_OPTIONS_MODE` | `paper` | `paper` or `live` |
+| `DISCORD_ORDER_NOTIONAL` | `500` | Base $ per equity/options trade |
+| `DISCORD_CONFIDENCE_MIN` | `70` | Min confidence to place options BUYs (equity bypasses this) |
+| `DISCORD_ALLOC_LOW_PCT` | `1.0` | % of buying power for conf 70–79% |
+| `DISCORD_ALLOC_MED_PCT` | `2.0` | % of buying power for conf 80–89% |
+| `DISCORD_ALLOC_HIGH_PCT` | `3.0` | % of buying power for conf 90%+ |
+| `DISCORD_MAX_POSITIONS` | `70` | Max open positions at once |
 | `DISCORD_MAX_DAILY_SPEND` | `5000` | Hard daily $ cap |
 | `DISCORD_DEDUPE_TICKER` | `true` | Skip repeat buys of same ticker same day |
+| `DISCORD_SPX_NOTIONAL` | `300` | $ per SPY 0DTE trade on SPX signals |
+| `DISCORD_SPX_STOP_PCT` | `50` | Stop-loss at X% of premium paid |
 
 ---
 
