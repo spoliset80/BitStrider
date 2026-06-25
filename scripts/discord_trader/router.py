@@ -92,9 +92,7 @@ class ChannelRouter:
             action = sm.on_message(content)
             if action:
                 result = handle_spx_action(
-                    action, self.broker,
-                    spx_notional=self.config.spx_notional,
-                    stop_pct=self.config.spx_stop_pct,
+                    action, self.broker, self.config,
                 )
                 if result:
                     self._log(channel_id, author, content, f"SPX:{action.kind}", result)

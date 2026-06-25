@@ -42,9 +42,10 @@ class Config:
     market_tz:    str = "America/New_York"
 
     # SPX / SPY settings
-    spx_notional:  float = 300.0   # $ per SPY 0DTE trade
+    spx_notional:  float = 300.0   # $ per SPY 0DTE trade (fallback when BP unavailable)
     spx_stop_pct:  float = 50.0    # stop-loss at 50 % of premium paid
     spx_target_pct: float = 100.0  # profit target at 2x premium paid
+    spx_bp_pct:    float = 80.0    # % of available options BP to use per SPX trade
 
     # Breakout swing-option settings
     breakout_notional: float = 400.0   # $ per swing call
@@ -106,6 +107,7 @@ def load_config() -> Config:
         spx_notional    = float(os.getenv("DISCORD_SPX_NOTIONAL", "300")),
         spx_stop_pct    = float(os.getenv("DISCORD_SPX_STOP_PCT", "50")),
         spx_target_pct  = float(os.getenv("DISCORD_SPX_TARGET_PCT", "100")),
+        spx_bp_pct      = float(os.getenv("DISCORD_SPX_BP_PCT", "80")),
         breakout_notional  = float(os.getenv("DISCORD_BREAKOUT_NOTIONAL", "400")),
         breakout_dte       = int(os.getenv("DISCORD_BREAKOUT_DTE", "45")),
         breakout_min_dte   = int(os.getenv("DISCORD_BREAKOUT_MIN_DTE", "30")),
