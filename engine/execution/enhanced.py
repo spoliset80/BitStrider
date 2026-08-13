@@ -41,6 +41,10 @@ from engine.config import (
     TAKE_PROFIT_NORMAL, TAKE_PROFIT_HIGH, STOP_LOSS_PCT,
     ATR_TP_RATIO, MAX_SHORT_FLOAT_PCT, HIGH_SHORT_FLOAT_STOCKS, is_high_short_float,
     EOD_CLOSE_ENABLED, EOD_CLOSE_TIME, EOD_CLOSE_STRATEGIES,
+    SWING_STALE_EXIT_ENABLED, SWING_STALE_DAYS, SWING_STALE_MIN_GAIN_PCT,
+    NO_GAIN_EXIT_ENABLED, NO_GAIN_EXIT_HOURS, NO_GAIN_EXIT_MIN_PCT,
+    AFTERHOURS_STOP_CHECK_ENABLED, AFTERHOURS_CHASE_STALE_SECONDS, AFTERHOURS_STOP_COOLDOWN_MIN,
+    MAX_POSITION_CONCENTRATION_PCT, CORRELATION_GROUPS,
     LONG_ONLY_MODE,
     STALE_ORDER_MINUTES, STALE_ORDER_MINUTES_INTRADAY,
     KILL_MODE_TRAIL_PCT,
@@ -52,6 +56,7 @@ from engine.config import (
 )
 from engine.equity.strategies import Signal
 from engine.utils import MarketState, calculate_risk_adjusted_size, check_vix_roc_filter, get_dynamic_tier
+from engine.never_trade import is_never_trade
 from engine.notifications.notifications import send_email
 
 log = logging.getLogger("ApexTrader")
@@ -134,9 +139,13 @@ class EnhancedExecutor:
         self._tp_targets: Dict[str, float] = {} # {symbol: take-profit price} for ATR-based TP tracking
         self.shorting_blocked: bool = False  # set true when broker rejects all short attempts for account
         self._pdt_stop_blocked: Dict[str, float] = {}  # {symbol: stop_price} — broker-rejected stops; monitored in software
+        self._afterhours_stop_cooldown: Dict[str, float] = {}  # {symbol: monotonic expiry} — blocks re-entry after an after-hours stop-loss exit
+        self._afterhours_chase_count: Dict[str, int] = {}  # {symbol: consecutive re-chase attempts} — widens slip each retry so a fast-falling after-hours book actually fills
+        self._no_gain_chase_count: Dict[str, int] = {}  # same, for close_no_gain_positions's re-chase
         self._pdt_overnight_forced: set = set()  # symbols where PDT also blocks close — forced overnight, no retries
         self._pdt_violation_alerted: bool = False  # tracks whether the PDT violation email has been sent this session
         self._eod_close_done: object = None  # date of last completed EOD close (prevents duplicate runs)
+        self._stale_exit_done: object = None  # date of last completed swing stale-exit check
         self.market_state: Optional[MarketState] = None
         self._rebuild_entry_log_from_orders()
 
@@ -222,6 +231,41 @@ class EnhancedExecutor:
             log.warning(f"_find_weakest_position error: {e}")
             return None
 
+    def _find_stalest_position(self, min_hours: float = NO_GAIN_EXIT_HOURS) -> Optional[str]:
+        """Return the symbol of the oldest closable long position held >= min_hours
+        (default: same 24h bar as NO_GAIN_EXIT_HOURS), for swap-out when a new
+        high-confidence signal arrives and the book is full. Age takes priority
+        over P&L here — a day-old idea makes room for a stronger new one whether
+        it's currently green or red. This is on top of (not instead of)
+        close_no_gain_positions, which separately force-exits anything stale
+        AND non-positive every cycle regardless of new signals."""
+        try:
+            now_utc = datetime.datetime.now(datetime.timezone.utc)
+            positions = self.client.get_all_positions()
+            candidates = []
+            for p in positions:
+                sym = p.symbol
+                if re.match(r'^[A-Z]+\d{6}[CP]\d{8}$', sym):
+                    continue  # options legs — managed separately
+                if float(p.qty) <= 0 or float(getattr(p, "qty_available", p.qty)) <= 0:
+                    continue
+                if sym in self._swap_cycle_closed:
+                    continue
+                entry_dt = self._get_entry_datetime(sym)
+                if entry_dt is None:
+                    continue
+                held_hours = (now_utc - entry_dt).total_seconds() / 3600
+                if held_hours < min_hours:
+                    continue
+                candidates.append((held_hours, sym))
+            if not candidates:
+                return None
+            candidates.sort(reverse=True)  # oldest first
+            return candidates[0][1]
+        except Exception as e:
+            log.warning(f"_find_stalest_position error: {e}")
+            return None
+
     def _find_least_confident_position(self, min_new_conf: float = 0.0) -> tuple:
         """Return (symbol, entry_confidence) of the held long position with the lowest
         entry confidence that is strictly below min_new_conf.
@@ -277,11 +321,104 @@ class EnhancedExecutor:
             self._account_cache = AccountSnapshot(
                 equity=float(raw.equity),
                 buying_power=float(raw.buying_power),
-                daytrade_count=int(raw.daytrade_count),
+                daytrade_count=int(raw.daytrade_count or 0),
                 pattern_day_trader=str(getattr(raw, "pattern_day_trader", False)).lower() in ("1", "true", "yes"),
                 timestamp=now,
             )
         return self._account_cache
+
+    # -- Swap -----------------------------------------------------------
+    def _attempt_swap(self, signal: Signal, swap_only: bool) -> Tuple[bool, Optional[str]]:
+        """Try to close the stalest (24h+, falling back to weakest P&L) position
+        to make room / free cash for *signal*. Shared by the buying-power gate
+        (cash-starved even below max positions) and the max-positions gate.
+
+        Returns (closed, block_reason):
+          closed=True        a position was closed — caller should refresh
+                              account/position state before re-checking gates.
+          block_reason=str   the close attempt itself failed and entry should
+                              be denied (position may be left unprotected).
+          Otherwise (False, None): no candidate to swap — caller proceeds
+          without a swap (matches the pre-existing "allow entry anyway" path).
+        """
+        label = "SWAP (bear)" if swap_only else "SWAP"
+        stale_candidate = self._find_stalest_position()
+        if stale_candidate:
+            weakest, swap_reason = stale_candidate, "stale 24h+"
+        else:
+            weakest, swap_reason = self._find_weakest_position(), "weakest"
+        if not weakest:
+            log.debug(f"No swappable position found for {signal.symbol}")
+            return False, None
+
+        log.info(
+            f"{label}: closing {weakest} ({swap_reason}) to make room for "
+            f"{signal.symbol} (conf={signal.confidence:.0%})"
+        )
+        # Any resting order for this symbol — the GTC trailing stop, or a
+        # leftover DAY close from a prior NO-GAIN/stale-exit attempt — reserves
+        # qty and makes Alpaca reject close_position() as a wash trade (confirmed
+        # in production: 40310000, "opposite side market/stop order exists").
+        # Cancel ALL of them first, not just the GTC, so the swap-close actually
+        # goes through (GTC-only cancel here previously had a 0% success rate).
+        weakest_gtc_id = None
+        try:
+            for o in (self.client.get_orders() or []):
+                if o.symbol != weakest:
+                    continue
+                if str(getattr(o, "time_in_force", "")).upper() == "GTC":
+                    weakest_gtc_id = o.id
+                self.client.cancel_order_by_id(str(o.id))
+                time.sleep(0.4)
+        except Exception as cancel_err:
+            log.warning(f"SWAP {weakest}: order cancel failed, close may reject: {cancel_err}")
+
+        try:
+            self.client.close_position(weakest)
+            self._swap_cycle_closed.add(weakest)
+            # Closing a prior-day position is NOT a day trade — do not count against PDT
+            return True, None
+        except Exception as e:
+            err_str = str(e)
+            if "40310100" in err_str:
+                # Alpaca PDT protection: position was entered today — can't close same day.
+                # Mark as today's entry so it's never selected as swap candidate again.
+                self._entry_log[weakest] = {
+                    "strategy": "restored",
+                    "date": datetime.date.today(),
+                    "confidence": 0.0,
+                }
+                log.warning(
+                    f"SWAP skip {weakest}: PDT same-day protection (40310100) — "
+                    f"marked as today entry, will not retry this session"
+                )
+                # Don't block the new signal — allow entry without the swap
+                return False, None
+            log.warning(f"SWAP close failed for {weakest}: {e}")
+            if weakest_gtc_id:
+                # We cancelled its GTC stop to attempt the close, and the
+                # close itself failed — re-arm protection immediately
+                # rather than leave the position naked.
+                try:
+                    weakest_pos = next(
+                        (p for p in self.client.get_all_positions() if p.symbol == weakest), None
+                    )
+                    if weakest_pos is not None:
+                        w_qty     = int(float(weakest_pos.qty))
+                        w_current = float(weakest_pos.current_price)
+                        w_trail   = get_dynamic_tier(weakest, w_current)["ts"]
+                        self.client.submit_order(TrailingStopOrderRequest(
+                            symbol        = weakest,
+                            qty           = abs(w_qty),
+                            side          = OrderSide.SELL if w_qty > 0 else OrderSide.BUY,
+                            type          = AlpacaOrderType.TRAILING_STOP,
+                            time_in_force = TimeInForce.GTC,
+                            trail_percent = w_trail,
+                        ))
+                        log.warning(f"SWAP {weakest}: re-armed GTC trailing stop after failed close")
+                except Exception as rearm_err:
+                    log.error(f"SWAP {weakest}: close failed AND GTC re-arm failed — position may be UNPROTECTED: {rearm_err}")
+            return False, f"Swap close failed: {e}"
 
     # -- Validation --------------------------------------------------------
     def _validate_trade(self, signal: Signal, acct: AccountSnapshot, order_type: OrderType, swap_only: bool = False) -> Tuple[bool, Optional[str]]:
@@ -365,17 +502,29 @@ class EnhancedExecutor:
         # Check if sufficient buying power for this trade (primary constraint).
         # This allows entry even when at max positions if capital is available.
         margin = 2.0 if order_type == OrderType.SHORT else 1.0
-        min_usable = (SMALL_ACCOUNT_MIN_POSITION_DOLLARS 
-                      if acct.equity < SMALL_ACCOUNT_EQUITY_THRESHOLD 
+        min_usable = (SMALL_ACCOUNT_MIN_POSITION_DOLLARS
+                      if acct.equity < SMALL_ACCOUNT_EQUITY_THRESHOLD
                       else MIN_POSITION_DOLLARS)
         min_bp_needed = min_usable * margin
-        
+
         if acct.buying_power < min_bp_needed:
-            return False, (
-                f"Insufficient buying power: ${acct.buying_power:,.0f} "
-                f"(need ${min_bp_needed:,.0f} for minimum position)"
-            )
-        
+            # Cash-starved even below max positions (e.g. margin tied up by
+            # leveraged/inverse ETFs) — a high-confidence signal should still
+            # be able to bump a stale/weak position for the cash rather than
+            # just being skipped every cycle until something exits on its own.
+            if SWAP_ON_FULL and signal.confidence >= SWAP_MIN_CONFIDENCE and positions.total_count > 0:
+                closed, block_reason = self._attempt_swap(signal, swap_only)
+                if block_reason:
+                    return False, block_reason
+                if closed:
+                    acct = self._get_account(force_refresh=True)
+                    positions = self._get_positions(force_refresh=True)
+            if acct.buying_power < min_bp_needed:
+                return False, (
+                    f"Insufficient buying power: ${acct.buying_power:,.0f} "
+                    f"(need ${min_bp_needed:,.0f} for minimum position)"
+                )
+
         # ── Max positions gate (secondary; optional swap if at limit) ─────
         if positions.total_count >= effective_max:
             if not (SWAP_ON_FULL and signal.confidence >= SWAP_MIN_CONFIDENCE):
@@ -385,42 +534,12 @@ class EnhancedExecutor:
                     f"due to available BP ${acct.buying_power:,.0f}"
                 )
             else:
-                # Strong confidence signal + at max: prefer swap to maintain position count
-                label = "SWAP (bear)" if swap_only else "SWAP"
-                weakest = self._find_weakest_position()
-                if weakest:
-                    log.info(
-                        f"{label}: closing {weakest} (weakest) to make room for "
-                        f"{signal.symbol} (conf={signal.confidence:.0%})"
-                    )
-                    try:
-                        self.client.close_position(weakest)
-                        self._swap_cycle_closed.add(weakest)
-                        # Closing a prior-day position is NOT a day trade — do not count against PDT
-                        positions = self._get_positions(force_refresh=True)
-                    except Exception as e:
-                        err_str = str(e)
-                        if "40310100" in err_str:
-                            # Alpaca PDT protection: position was entered today — can't close same day.
-                            # Mark as today's entry so it's never selected as swap candidate again.
-                            self._entry_log[weakest] = {
-                                "strategy": "restored",
-                                "date": datetime.date.today(),
-                                "confidence": 0.0,
-                            }
-                            log.warning(
-                                f"SWAP skip {weakest}: PDT same-day protection (40310100) — "
-                                f"marked as today entry, will not retry this session"
-                            )
-                            # Don't block the new signal — allow entry without the swap
-                        else:
-                            log.warning(f"SWAP close failed for {weakest}: {e}")
-                            return False, f"Swap close failed: {e}"
-                else:
-                    # No position to swap, but BP available — allow entry anyway
-                    log.debug(
-                        f"No swappable position found, but allowing entry due to available BP ${acct.buying_power:,.0f}"
-                    )
+                # Strong confidence signal + at max: prefer swap to maintain position count.
+                closed, block_reason = self._attempt_swap(signal, swap_only)
+                if block_reason:
+                    return False, block_reason
+                if closed:
+                    positions = self._get_positions(force_refresh=True)
 
         if positions.has_position(signal.symbol):
             if order_type == OrderType.LONG  and positions.is_long(signal.symbol):
@@ -440,9 +559,11 @@ class EnhancedExecutor:
         usable  = buying_power * (1.0 - MIN_BUYING_POWER_PCT / 100.0)
         desired = int(risk_info["dollar_amount"] / signal.price)
         max_bp  = int(usable / (signal.price * margin))
-        shares  = min(desired, max_bp)
 
         account_snapshot = self._account_cache or self._get_account()  # use cached if available
+        max_concentration = int(account_snapshot.equity * MAX_POSITION_CONCENTRATION_PCT / 100.0 / signal.price)
+        shares  = min(desired, max_bp, max_concentration)
+
         min_position = SMALL_ACCOUNT_MIN_POSITION_DOLLARS if account_snapshot.equity < SMALL_ACCOUNT_EQUITY_THRESHOLD else MIN_POSITION_DOLLARS
 
         if shares < 1:
@@ -710,7 +831,7 @@ class EnhancedExecutor:
         if self.use_bracket_orders and self._current_market_state().is_regular_hours:
             if self._create_bracket_order(signal, shares, risk_info, order_type):
                 self.pdt.add(datetime.date.today())
-                self._entry_log[signal.symbol] = {"strategy": signal.strategy, "date": datetime.date.today(), "confidence": signal.confidence}
+                self._entry_log[signal.symbol] = {"strategy": signal.strategy, "date": datetime.date.today(), "filled_at": datetime.datetime.now(datetime.timezone.utc), "confidence": signal.confidence}
                 self._swap_cycle_closed.add(signal.symbol)  # protect from same-cycle swap-out
                 self._get_positions(force_refresh=True)
                 self._get_account(force_refresh=True)
@@ -728,6 +849,9 @@ class EnhancedExecutor:
 
     # -- Public: Execute ---------------------------------------------------
     def execute(self, signal: Signal, swap_only: bool = False) -> bool:
+        if is_never_trade(signal.symbol):
+            log.info(f"Skipping {signal.symbol}: listed in data/never_trade.txt")
+            return False
         try:
             acct      = self._get_account()
             positions = self._get_positions()
@@ -795,11 +919,13 @@ class EnhancedExecutor:
 
         qty = abs(int(float(positions.positions_dict[signal.symbol].qty)))
         try:
-            req = MarketOrderRequest(
-                symbol=signal.symbol, qty=qty,
-                side=OrderSide.SELL, time_in_force=TimeInForce.DAY,
-            )
-            self.client.submit_order(req)
+            # A plain MarketOrderRequest gets rejected outside regular hours — this
+            # path (a strategy-driven "sell" signal on a held long) is reachable
+            # any time scan_and_trade runs, which spans the full 07:00-20:00
+            # is_market_open window, not just 09:30-16:00. Its sibling
+            # _close_short_position already branches on regular-hours a few lines
+            # above; this one didn't. _submit_closing_order handles both cases.
+            self._submit_closing_order(signal.symbol, qty, OrderSide.SELL, signal.price)
             # NOTE: closing an existing position is NOT a new day trade.
             # Alpaca counts the round-trip (open+close same day) as one trade;
             # pdt.add() is intentionally omitted here — it was already counted at entry.
@@ -916,8 +1042,27 @@ class EnhancedExecutor:
                 else:
                     log.error(f"protect_positions {sym}: {e}")
 
+    def _submit_closing_order(self, symbol: str, qty: int, side: OrderSide, current_price: float, slip_pct: float = 0.5) -> None:
+        """Submit a position-closing order. During regular hours this is a plain
+        market order; outside regular hours (Alpaca rejects market orders then)
+        it's a marketable extended-hours limit instead, crossing the spread by
+        slip_pct so a thin pre/post-market book still fills promptly. Callers
+        that keep missing the fill (fast-moving after-hours book) should widen
+        slip_pct on retry rather than resubmitting at the same price forever."""
+        if MarketState.from_now().is_regular_hours:
+            req = MarketOrderRequest(
+                symbol=symbol, qty=qty, side=side, time_in_force=TimeInForce.DAY,
+            )
+        else:
+            slip = (1.0 - slip_pct / 100.0) if side == OrderSide.SELL else (1.0 + slip_pct / 100.0)
+            req = LimitOrderRequest(
+                symbol=symbol, qty=qty, side=side, time_in_force=TimeInForce.DAY,
+                limit_price=round(current_price * slip, 2), extended_hours=True,
+            )
+        self.client.submit_order(req)
+
     def check_software_stops(self) -> None:
-        """Market-close any position whose broker-rejected PDT stop has been breached.
+        """Close any position whose broker-rejected PDT stop has been breached.
         Called every scan cycle for positions in _pdt_stop_blocked."""
         if not self._pdt_stop_blocked:
             return
@@ -940,16 +1085,11 @@ class EnhancedExecutor:
                 if hit:
                     side = OrderSide.SELL if is_long else OrderSide.BUY
                     try:
-                        self.client.submit_order(MarketOrderRequest(
-                            symbol        = sym,
-                            qty           = abs(qty),
-                            side          = side,
-                            time_in_force = TimeInForce.DAY,
-                        ))
+                        self._submit_closing_order(sym, abs(qty), side, current)
                         self._pdt_stop_blocked.pop(sym, None)
                         log.warning(
                             f"SOFTWARE SL HIT {sym}: price ${current:.2f} crossed stop ${stop_price:.2f} — "
-                            f"market {'SELL' if is_long else 'BUY-TO-COVER'} submitted"
+                            f"{'SELL' if is_long else 'BUY-TO-COVER'} submitted"
                         )
                     except Exception as close_err:
                         if "40310100" in str(close_err):
@@ -967,6 +1107,237 @@ class EnhancedExecutor:
                     log.debug(f"SOFTWARE SL {sym}: current ${current:.2f} | stop ${stop_price:.2f} | margin ${current - stop_price:+.2f}")
             except Exception as e:
                 log.error(f"check_software_stops {sym}: {e}")
+
+    def get_afterhours_cooldown_symbols(self) -> set:
+        """Symbols currently blocked from re-entry after an after-hours stop-loss exit."""
+        now = time.monotonic()
+        expired = [s for s, exp in self._afterhours_stop_cooldown.items() if now >= exp]
+        for s in expired:
+            self._afterhours_stop_cooldown.pop(s, None)
+        return set(self._afterhours_stop_cooldown.keys())
+
+    def check_afterhours_stops(self) -> None:
+        """Actively watch every open position's loss while the market is NOT in
+        regular hours — the broker-side GTC trailing stop from protect_positions()
+        sits inert outside 09:30-16:00 ET, so a position can free-fall pre-market
+        or after-hours with no protection until regular hours resume. Uses a flat
+        stop from avg_entry_price at the same trail % as the resting trailing
+        stop (not a true trailing high-water-mark — good enough for a software
+        backstop). Skips symbols already handled by check_software_stops to
+        avoid double-submitting a close. Meant to be polled frequently (the
+        10s software-stop thread) since after-hours moves can be sharp.
+
+        The resting GTC trailing stop reserves the position's qty, so Alpaca
+        won't accept a replacement close order while it's still open — it's
+        cancelled up front, deterministically, rather than waiting to see if
+        the close gets rejected. If the close then fails for any reason, a
+        fresh GTC trailing stop is immediately re-armed as a fallback so the
+        position is never left with zero protection. If a submitted close
+        sits unfilled past AFTERHOURS_CHASE_STALE_SECONDS, it's cancelled and
+        re-submitted at a fresh marketable price to make sure it actually
+        executes."""
+        if not AFTERHOURS_STOP_CHECK_ENABLED:
+            return
+        if MarketState.from_now().is_regular_hours:
+            return
+
+        now_utc = datetime.datetime.now(datetime.timezone.utc)
+
+        try:
+            positions   = self.client.get_all_positions()
+            open_orders = self.client.get_orders()
+        except Exception as e:
+            log.warning(f"check_afterhours_stops: fetch failed: {e}")
+            return
+
+        # Position closed since the last poll — its re-chase count is stale, drop it
+        # so a future breach of the same symbol starts back at the base slip.
+        _live_syms = {p.symbol for p in positions}
+        for _sym in [s for s in self._afterhours_chase_count if s not in _live_syms]:
+            self._afterhours_chase_count.pop(_sym, None)
+
+        pending_by_sym: Dict[str, object] = {}  # symbol -> resting non-GTC order (a close already in flight)
+        gtc_orders: Dict[str, str] = {}          # symbol -> GTC trailing-stop order id
+        for o in open_orders:
+            if str(getattr(o, "time_in_force", "")).upper() == "GTC":
+                gtc_orders[o.symbol] = o.id
+            else:
+                pending_by_sym[o.symbol] = o
+
+        for pos in positions:
+            sym = pos.symbol
+            if re.match(r'^[A-Z]+\d{6}[CP]\d{8}$', sym):
+                continue  # options legs — managed separately
+            if sym in self._pdt_stop_blocked:
+                continue
+            try:
+                qty = int(float(pos.qty))
+                if qty == 0:
+                    continue
+                is_long = qty > 0
+                current = float(pos.current_price)
+                entry   = float(pos.avg_entry_price)
+                trail_pct  = get_dynamic_tier(sym, current)["ts"]
+                stop_price = entry * (1 - trail_pct / 100) if is_long else entry * (1 + trail_pct / 100)
+                hit = (is_long and current <= stop_price) or (not is_long and current >= stop_price)
+                if not hit:
+                    continue
+                side = OrderSide.SELL if is_long else OrderSide.BUY
+
+                existing = pending_by_sym.get(sym)
+                if existing is not None:
+                    submitted_at = getattr(existing, "submitted_at", None) or getattr(existing, "created_at", None)
+                    age_s = (now_utc - submitted_at).total_seconds() if submitted_at else 0.0
+                    if age_s < AFTERHOURS_CHASE_STALE_SECONDS:
+                        continue  # close already in flight — give it time to fill
+                    try:
+                        self.client.cancel_order_by_id(str(existing.id))
+                        time.sleep(0.4)
+                    except Exception as e:
+                        log.warning(f"check_afterhours_stops {sym}: stale-close cancel failed, will retry next poll: {e}")
+                        continue
+                    log.warning(f"AFTER-HOURS SL {sym}: prior close unfilled after {age_s:.0f}s — re-chasing at fresh price")
+                else:
+                    # First attempt for this breach: the resting GTC trailing
+                    # stop reserves the qty, so it must go before Alpaca will
+                    # accept a replacement close order after-hours.
+                    gtc_id = gtc_orders.get(sym)
+                    if gtc_id:
+                        try:
+                            self.client.cancel_order_by_id(str(gtc_id))
+                            time.sleep(0.4)
+                        except Exception as cancel_err:
+                            log.warning(f"check_afterhours_stops {sym}: GTC cancel failed, will retry next poll: {cancel_err}")
+                            continue
+
+                try:
+                    chase_n  = self._afterhours_chase_count.get(sym, 0)
+                    slip_pct = min(0.5 * (chase_n + 1), 3.0)  # widen 0.5% -> 1.0% -> ... capped at 3% so a fast-falling book still fills
+                    self._submit_closing_order(sym, abs(qty), side, current, slip_pct=slip_pct)
+                    self._afterhours_chase_count[sym] = chase_n + 1
+                    self._afterhours_stop_cooldown[sym] = time.monotonic() + AFTERHOURS_STOP_COOLDOWN_MIN * 60
+                    _strategy = self._entry_log.get(sym, {}).get("strategy", "unknown")
+                    _pnl = (current - entry) * qty
+                    log.warning(
+                        f"AFTER-HOURS SL HIT {sym} [{_strategy}]: price ${current:.2f} crossed stop ${stop_price:.2f} "
+                        f"({trail_pct:.1f}% from entry ${entry:.2f}) | P&L ${_pnl:+,.2f} — extended-hours "
+                        f"{'SELL' if is_long else 'BUY-TO-COVER'} submitted @ {slip_pct:.1f}% slip "
+                        f"(attempt {chase_n + 1}), re-entry blocked {AFTERHOURS_STOP_COOLDOWN_MIN // 60}h"
+                    )
+                except Exception as close_err:
+                    log.error(f"AFTER-HOURS SL {sym}: close order failed after GTC cancel: {close_err}")
+                    # GTC is gone and the replacement didn't go through — without
+                    # a fallback the position would sit fully unprotected until
+                    # the next protect_positions() cycle. Re-arm one now.
+                    try:
+                        self.client.submit_order(TrailingStopOrderRequest(
+                            symbol        = sym,
+                            qty           = abs(qty),
+                            side          = OrderSide.SELL if is_long else OrderSide.BUY,
+                            type          = AlpacaOrderType.TRAILING_STOP,
+                            time_in_force = TimeInForce.GTC,
+                            trail_percent = trail_pct,
+                        ))
+                        log.warning(f"AFTER-HOURS SL {sym}: re-armed GTC trailing stop as fallback after failed close")
+                    except Exception as rearm_err:
+                        log.error(f"AFTER-HOURS SL {sym}: close failed AND GTC re-arm failed — position may be UNPROTECTED: {rearm_err}")
+            except Exception as e:
+                log.error(f"check_afterhours_stops {sym}: {e}")
+
+    # ── Position Concentration Cap ───────────────────────────────────────────
+    def enforce_position_concentration(self) -> None:
+        """Trim any position whose market value exceeds MAX_POSITION_CONCENTRATION_PCT
+        of account equity. Entry sizing already caps new buys at this limit (see
+        _size_with_buying_power), but an existing winner can still drift past it
+        through price appreciation alone — this is the backstop for that case."""
+        try:
+            acct = self._get_account()
+            positions = self.client.get_all_positions()
+        except Exception as e:
+            log.warning(f"enforce_position_concentration: fetch failed: {e}")
+            return
+        if acct.equity <= 0:
+            return
+        cap_value = acct.equity * MAX_POSITION_CONCENTRATION_PCT / 100.0
+        for pos in positions:
+            sym = pos.symbol
+            if re.match(r'^[A-Z]+\d{6}[CP]\d{8}$', sym):
+                continue  # options legs — sized/managed separately
+            qty = int(float(pos.qty))
+            if qty == 0:
+                continue
+            market_value = abs(float(pos.market_value))
+            if market_value <= cap_value:
+                continue
+            current = float(pos.current_price)
+            trim_qty = int((market_value - cap_value) / current)
+            if trim_qty < 1:
+                continue
+            side = OrderSide.SELL if qty > 0 else OrderSide.BUY  # BUY-to-cover trims a short
+            try:
+                self._submit_closing_order(sym, trim_qty, side, current)
+                log.warning(
+                    f"CONCENTRATION TRIM {sym}: {trim_qty} shares — ${market_value:,.0f} was "
+                    f"{market_value / acct.equity:.0%} of equity, cap {MAX_POSITION_CONCENTRATION_PCT:.0f}%"
+                )
+            except Exception as e:
+                log.error(f"enforce_position_concentration {sym}: trim failed: {e}")
+
+    def enforce_correlation_concentration(self) -> None:
+        """Trim a correlated basket (e.g. leveraged inverse-market ETFs) whose
+        COMBINED market value exceeds that group's cap. enforce_position_concentration
+        can't catch this: several different tickers that move together can each
+        stay under MAX_POSITION_CONCENTRATION_PCT individually while adding up to
+        one oversized directional bet combined (confirmed in production:
+        SQQQ+SOXS+TZA+LABD held simultaneously on 2026-07-30)."""
+        if not CORRELATION_GROUPS:
+            return
+        try:
+            acct = self._get_account()
+            positions = self.client.get_all_positions()
+        except Exception as e:
+            log.warning(f"enforce_correlation_concentration: fetch failed: {e}")
+            return
+        if acct.equity <= 0:
+            return
+
+        for group_name, group in CORRELATION_GROUPS.items():
+            members = group["symbols"]
+            group_positions = [
+                p for p in positions
+                if p.symbol in members and int(float(p.qty)) != 0
+            ]
+            if not group_positions:
+                continue
+
+            total_value = sum(abs(float(p.market_value)) for p in group_positions)
+            cap_value = acct.equity * group["max_pct"] / 100.0
+            if total_value <= cap_value:
+                continue
+
+            excess = total_value - cap_value
+            # Trim largest positions first — fewer orders, and it's the biggest
+            # single contributor to the breach.
+            for pos in sorted(group_positions, key=lambda p: abs(float(p.market_value)), reverse=True):
+                if excess <= 0:
+                    break
+                sym = pos.symbol
+                qty = int(float(pos.qty))
+                current = float(pos.current_price)
+                pos_value = abs(float(pos.market_value))
+                trim_qty = int(min(excess, pos_value) / current)
+                if trim_qty < 1:
+                    continue
+                side = OrderSide.SELL if qty > 0 else OrderSide.BUY  # BUY-to-cover trims a short
+                try:
+                    self._submit_closing_order(sym, trim_qty, side, current)
+                    log.warning(
+                        f"CORRELATION TRIM [{group_name}] {sym}: {trim_qty} shares — group was "
+                        f"${total_value:,.0f} ({total_value / acct.equity:.0%} of equity), cap {group['max_pct']:.0f}%"
+                    )
+                    excess -= trim_qty * current
+                except Exception as e:
+                    log.error(f"enforce_correlation_concentration {sym}: trim failed: {e}")
 
     # ── EOD Close ─────────────────────────────────────────────────────────────
     def close_eod_positions(self) -> Optional[dict]:
@@ -1067,6 +1438,309 @@ class EnhancedExecutor:
         }
         return summary
 
+    # ── Stale Swing Exit ─────────────────────────────────────────────────────
+    def _get_entry_date(self, symbol: str) -> Optional[datetime.date]:
+        """Return the date a position was opened.
+
+        Checks the in-memory entry log first, then falls back to the broker's
+        earliest filled BUY order for the symbol — covers positions opened on
+        a prior day whose entry_log record was lost to a bot restart (the
+        startup rebuild in _rebuild_entry_log_from_orders only restores today's
+        orders)."""
+        info = self._entry_log.get(symbol)
+        if info and info.get("date"):
+            return info["date"]
+        try:
+            import pytz
+            from alpaca.common.enums import Sort
+            from alpaca.trading.requests import GetOrdersRequest
+            from alpaca.trading.enums import QueryOrderStatus
+            et  = pytz.timezone("America/New_York")
+            req = GetOrdersRequest(
+                status=QueryOrderStatus.CLOSED, symbols=[symbol],
+                side=OrderSide.BUY, direction=Sort.ASC, limit=50,
+            )
+            orders = self.client.get_orders(filter=req) or []
+            for order in orders:
+                filled_at = getattr(order, "filled_at", None)
+                if filled_at is None:
+                    continue
+                entry_date = filled_at.astimezone(et).date() if hasattr(filled_at, "astimezone") else filled_at
+                self._entry_log.setdefault(symbol, {"strategy": "restored", "confidence": 0.0})["date"] = entry_date
+                return entry_date
+        except Exception as e:
+            log.warning(f"_get_entry_date {symbol}: lookup failed: {e}")
+        return None
+
+    def _get_entry_datetime(self, symbol: str) -> Optional[datetime.datetime]:
+        """Return the UTC fill timestamp a position was opened — hour-precision
+        counterpart to _get_entry_date, needed for the NO_GAIN_EXIT_HOURS check.
+        Same broker fallback for positions opened before a bot restart."""
+        info = self._entry_log.get(symbol)
+        if info and info.get("filled_at"):
+            return info["filled_at"]
+        try:
+            from alpaca.common.enums import Sort
+            from alpaca.trading.requests import GetOrdersRequest
+            from alpaca.trading.enums import QueryOrderStatus
+            req = GetOrdersRequest(
+                status=QueryOrderStatus.CLOSED, symbols=[symbol],
+                side=OrderSide.BUY, direction=Sort.ASC, limit=50,
+            )
+            orders = self.client.get_orders(filter=req) or []
+            for order in orders:
+                filled_at = getattr(order, "filled_at", None)
+                if filled_at is None:
+                    continue
+                self._entry_log.setdefault(symbol, {"strategy": "restored", "confidence": 0.0})["filled_at"] = filled_at
+                return filled_at
+        except Exception as e:
+            log.warning(f"_get_entry_datetime {symbol}: lookup failed: {e}")
+        return None
+
+    def close_stale_swing_positions(self) -> Optional[dict]:
+        """Close swing-strategy positions (i.e. any long NOT opened by a strategy
+        in EOD_CLOSE_STRATEGIES, since those already close same-day) that have
+        been held SWING_STALE_DAYS+ calendar days without reaching
+        SWING_STALE_MIN_GAIN_PCT% unrealized gain. Runs once per calendar day.
+
+        These positions otherwise ride only the GTC trailing stop, which only
+        protects against a reversal from the peak — it never exits a position
+        that just goes nowhere. This is the "cut dead capital loose" check."""
+        if not SWING_STALE_EXIT_ENABLED:
+            return None
+
+        today = datetime.date.today()
+        if getattr(self, "_stale_exit_done", None) == today:
+            return None
+
+        try:
+            positions = self.client.get_all_positions()
+        except Exception as e:
+            log.error(f"close_stale_swing_positions: fetch failed: {e}")
+            return None
+
+        closed_items = []
+        failed_items = []
+
+        for pos in positions:
+            sym = pos.symbol
+            if re.match(r'^[A-Z]+\d{6}[CP]\d{8}$', sym):
+                continue  # options legs — managed separately
+
+            qty = int(float(pos.qty))
+            if qty <= 0:
+                continue  # only long swing positions are subject to this policy
+
+            strategy = self._entry_log.get(sym, {}).get("strategy")
+            if strategy in EOD_CLOSE_STRATEGIES:
+                continue  # already force-closed same-day by close_eod_positions
+
+            entry_date = self._get_entry_date(sym)
+            if entry_date is None:
+                log.warning(f"close_stale_swing_positions {sym}: can't determine entry date, skipping")
+                continue
+
+            held_days = (today - entry_date).days
+            if held_days < SWING_STALE_DAYS:
+                continue
+
+            try:
+                gain_pct = float(pos.unrealized_plpc) * 100
+            except (AttributeError, TypeError, ValueError):
+                continue
+
+            if gain_pct >= SWING_STALE_MIN_GAIN_PCT:
+                continue  # performing fine — leave it to the trailing stop
+
+            try:
+                # Cancel ALL resting orders first, including GTC — this method has no
+                # regular-hours gate (only "once per calendar day"), so it can run
+                # after-hours too, and a resting GTC trailing stop reserves qty and
+                # gets a close rejected as a wash trade regardless of time of day
+                # (same root cause already fixed for check_afterhours_stops,
+                # close_no_gain_positions, the weakest-swap path, and check_tp_targets —
+                # confirmed in production via BHC's repeated "insufficient qty
+                # available" TP-close rejections on 2026-07-31).
+                try:
+                    sym_orders = [o for o in (self.client.get_orders() or []) if o.symbol == sym]
+                    for _o in sym_orders:
+                        try:
+                            self.client.cancel_order_by_id(str(_o.id))
+                        except Exception:
+                            pass
+                    if sym_orders:
+                        time.sleep(0.4)
+                except Exception:
+                    pass
+
+                # _submit_closing_order handles the after-hours case (plain
+                # MarketOrderRequest gets rejected outside regular hours).
+                self._submit_closing_order(sym, abs(qty), OrderSide.SELL, float(pos.current_price))
+                _strategy = self._entry_log.get(sym, {}).get("strategy", "unknown")
+                try:
+                    _pnl = float(pos.unrealized_pl)
+                except (AttributeError, TypeError, ValueError):
+                    _pnl = 0.0
+                self._entry_log.pop(sym, None)
+
+                closed_items.append({
+                    "symbol": sym, "qty": abs(qty),
+                    "held_days": held_days, "gain_pct": round(gain_pct, 2),
+                })
+                log.info(
+                    f"STALE EXIT {sym} [{_strategy}]: {qty} shares | held {held_days}d | "
+                    f"gain {gain_pct:+.1f}% < {SWING_STALE_MIN_GAIN_PCT:.1f}% threshold | P&L ${_pnl:+,.2f}"
+                )
+            except Exception as e:
+                failed_items.append({"symbol": sym, "error": str(e)})
+                log.error(f"STALE EXIT failed {sym}: {e}")
+
+        self._stale_exit_done = today
+
+        return {
+            "date": today.isoformat(),
+            "closed_count": len(closed_items),
+            "failed_count": len(failed_items),
+            "closed_items": closed_items,
+            "failed_items": failed_items,
+        }
+
+    def close_no_gain_positions(self) -> Optional[dict]:
+        """Close any long position that has shown zero positive unrealized gain
+        within NO_GAIN_EXIT_HOURS of entry. Checked every scan cycle (unlike
+        close_stale_swing_positions, which only runs once/day) since the
+        24h mark can land mid-session, not just at EOD."""
+        if not NO_GAIN_EXIT_ENABLED:
+            return None
+
+        now_utc = datetime.datetime.now(datetime.timezone.utc)
+
+        try:
+            positions = self.client.get_all_positions()
+        except Exception as e:
+            log.error(f"close_no_gain_positions: fetch failed: {e}")
+            return None
+
+        _live_syms = {p.symbol for p in positions}
+        for _sym in [s for s in self._no_gain_chase_count if s not in _live_syms]:
+            self._no_gain_chase_count.pop(_sym, None)
+
+        closed_items = []
+        failed_items = []
+
+        for pos in positions:
+            sym = pos.symbol
+            if re.match(r'^[A-Z]+\d{6}[CP]\d{8}$', sym):
+                continue  # options legs — managed separately
+
+            qty = int(float(pos.qty))
+            if qty <= 0:
+                continue  # only long positions are subject to this policy
+
+            strategy = self._entry_log.get(sym, {}).get("strategy")
+            if strategy in EOD_CLOSE_STRATEGIES:
+                continue  # already force-closed same-day by close_eod_positions
+
+            entry_dt = self._get_entry_datetime(sym)
+            if entry_dt is None:
+                log.warning(f"close_no_gain_positions {sym}: can't determine entry time, skipping")
+                continue
+
+            held_hours = (now_utc - entry_dt).total_seconds() / 3600
+            if held_hours < NO_GAIN_EXIT_HOURS:
+                continue
+
+            try:
+                gain_pct = float(pos.unrealized_plpc) * 100
+            except (AttributeError, TypeError, ValueError):
+                continue
+
+            if gain_pct > NO_GAIN_EXIT_MIN_PCT:
+                continue  # showed a positive gain — leave it to the trailing stop
+
+            # A close already in flight for this symbol? Don't blindly cancel-and-resubmit
+            # every cycle (that's what spammed FRMI 186x and NG 38x — the old version
+            # re-issued an identical close order every scan cycle with no fill check).
+            # Give a fresh close AFTERHOURS_CHASE_STALE_SECONDS to fill; only re-chase,
+            # with escalating slip, once it's actually stale.
+            try:
+                sym_orders = self.client.get_orders() or []
+                sym_orders = [o for o in sym_orders if o.symbol == sym]
+            except Exception as e:
+                log.warning(f"close_no_gain_positions {sym}: order fetch failed, will retry next cycle: {e}")
+                continue
+
+            pending = next((o for o in sym_orders if str(getattr(o, "time_in_force", "")).upper() != "GTC"), None)
+            if pending is not None:
+                submitted_at = getattr(pending, "submitted_at", None) or getattr(pending, "created_at", None)
+                age_s = (now_utc - submitted_at).total_seconds() if submitted_at else 0.0
+                if age_s < AFTERHOURS_CHASE_STALE_SECONDS:
+                    continue  # close already in flight — give it time to fill
+                try:
+                    self.client.cancel_order_by_id(str(pending.id))
+                    time.sleep(0.4)
+                except Exception as e:
+                    log.warning(f"close_no_gain_positions {sym}: stale-close cancel failed, will retry next cycle: {e}")
+                    continue
+
+            # The resting GTC trailing stop reserves this position's qty and can cause
+            # the close to be rejected as a wash trade — cancel it first, same fix as
+            # check_afterhours_stops. Re-armed below as a fallback if the close fails.
+            gtc_order = next((o for o in sym_orders if str(getattr(o, "time_in_force", "")).upper() == "GTC"), None)
+            if gtc_order:
+                try:
+                    self.client.cancel_order_by_id(str(gtc_order.id))
+                    time.sleep(0.4)
+                except Exception as e:
+                    log.warning(f"close_no_gain_positions {sym}: GTC cancel failed, will retry next cycle: {e}")
+                    continue
+
+            try:
+                chase_n  = self._no_gain_chase_count.get(sym, 0)
+                slip_pct = min(0.5 * (chase_n + 1), 3.0)
+                self._submit_closing_order(sym, abs(qty), OrderSide.SELL, float(pos.current_price), slip_pct=slip_pct)
+                self._no_gain_chase_count[sym] = chase_n + 1
+                _strategy = self._entry_log.get(sym, {}).get("strategy", "unknown")
+                try:
+                    _pnl = float(pos.unrealized_pl)
+                except (AttributeError, TypeError, ValueError):
+                    _pnl = 0.0
+                self._entry_log.pop(sym, None)
+
+                closed_items.append({
+                    "symbol": sym, "qty": abs(qty),
+                    "held_hours": round(held_hours, 1), "gain_pct": round(gain_pct, 2),
+                })
+                log.info(
+                    f"NO-GAIN EXIT {sym} [{_strategy}]: {qty} shares | held {held_hours:.1f}h | "
+                    f"gain {gain_pct:+.1f}% <= {NO_GAIN_EXIT_MIN_PCT:.1f}% threshold | P&L ${_pnl:+,.2f} "
+                    f"@ {slip_pct:.1f}% slip (attempt {chase_n + 1})"
+                )
+            except Exception as e:
+                failed_items.append({"symbol": sym, "error": str(e)})
+                log.error(f"NO-GAIN EXIT failed {sym}: {e}")
+                if gtc_order:
+                    # GTC is gone and the replacement didn't go through — re-arm one now
+                    # rather than leave the position unprotected until the next cycle.
+                    try:
+                        trail_pct = get_dynamic_tier(sym, float(pos.current_price))["ts"]
+                        self.client.submit_order(TrailingStopOrderRequest(
+                            symbol=sym, qty=abs(qty), side=OrderSide.SELL,
+                            type=AlpacaOrderType.TRAILING_STOP,
+                            time_in_force=TimeInForce.GTC, trail_percent=trail_pct,
+                        ))
+                        log.warning(f"NO-GAIN EXIT {sym}: re-armed GTC trailing stop after failed close")
+                    except Exception as rearm_err:
+                        log.error(f"NO-GAIN EXIT {sym}: close failed AND GTC re-arm failed — position may be UNPROTECTED: {rearm_err}")
+
+        return {
+            "closed_count": len(closed_items),
+            "failed_count": len(failed_items),
+            "closed_items": closed_items,
+            "failed_items": failed_items,
+        }
+
     # ── Kill Mode: Emergency Close All ───────────────────────────────────────
     def emergency_close_all(self, equity: float) -> None:
         """
@@ -1148,12 +1822,14 @@ class EnhancedExecutor:
 
             try:
                 side = OrderSide.SELL if qty > 0 else OrderSide.BUY
-                self.client.submit_order(MarketOrderRequest(
-                    symbol        = sym,
-                    qty           = abs(qty),
-                    side          = side,
-                    time_in_force = TimeInForce.DAY,
-                ))
+                # A plain MarketOrderRequest gets rejected outside regular hours —
+                # kill mode is only reachable while is_market_open (07:00-20:00 ET),
+                # not just regular hours, and every crash this account has actually
+                # hit (BIOA, FIRY, SQQQ) happened after-hours. This is the emergency
+                # exit; it can't be the one path that silently no-ops exactly when
+                # it's needed most. _submit_closing_order handles the extended-hours
+                # limit-order fallback the same as every other close path.
+                self._submit_closing_order(sym, abs(qty), side, float(pos.current_price or 0))
                 pnl = float(pos.unrealized_pl or 0)
                 log.warning(
                     f"KILL MODE CLOSE {sym}: {abs(qty)} shares "
@@ -1310,17 +1986,34 @@ class EnhancedExecutor:
             hit = (is_long and cur_price >= tp_price) or (not is_long and cur_price <= tp_price)
             if hit:
                 try:
+                    # Cancel ALL resting orders for this symbol first — a GTC trailing
+                    # stop (or leftover DAY order) reserves qty and gets this rejected
+                    # as "insufficient qty available" (confirmed in production: BHC
+                    # rejected 13+ times over an hour on 2026-07-31, same root cause
+                    # already fixed for check_afterhours_stops/close_no_gain_positions/
+                    # the weakest-swap path — this one just never got it).
+                    try:
+                        for o in (self.client.get_orders() or []):
+                            if o.symbol == sym:
+                                self.client.cancel_order_by_id(str(o.id))
+                                time.sleep(0.4)
+                    except Exception as cancel_err:
+                        log.warning(f"TP close {sym}: order cancel failed, close may reject: {cancel_err}")
+
                     side = OrderSide.SELL if is_long else OrderSide.BUY
-                    req  = MarketOrderRequest(
-                        symbol        = sym,
-                        qty           = abs(qty),
-                        side          = side,
-                        time_in_force = TimeInForce.DAY,
-                    )
-                    self.client.submit_order(req)
+                    # A plain MarketOrderRequest also gets rejected outside regular
+                    # hours (07:00-20:00 is_market_open spans well past 09:30-16:00,
+                    # and this method runs on every cycle in that whole window) —
+                    # _submit_closing_order already handles the extended-hours case.
+                    self._submit_closing_order(sym, abs(qty), side, cur_price)
+                    _strategy = self._entry_log.get(sym, {}).get("strategy", "unknown")
+                    try:
+                        _pnl = float(getattr(pos, "unrealized_pl", 0) or 0)
+                    except (TypeError, ValueError):
+                        _pnl = 0.0
                     log.info(
-                        f"TP HIT {sym}: ${cur_price:.2f} {'>=  ' if is_long else '<= '}"
-                        f"${tp_price:.2f} → market {'sell' if is_long else 'buy-to-cover'}"
+                        f"TP HIT {sym} [{_strategy}]: ${cur_price:.2f} {'>=  ' if is_long else '<= '}"
+                        f"${tp_price:.2f} | P&L ${_pnl:+,.2f} → {'sell' if is_long else 'buy-to-cover'} submitted"
                     )
                     triggered.append(sym)
                 except Exception as e:

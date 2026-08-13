@@ -177,10 +177,6 @@ API_SECRET = os.getenv(f"{_MODE}_ALPACA_API_SECRET", "")
 # SDK picks the correct endpoint automatically via paper=True/False — no URL override needed
 ALPACA_BASE_URL = "https://paper-api.alpaca.markets" if PAPER else "https://api.alpaca.markets"
 
-# Convenience for switching: override per branch by env var if needed.
-MIN_POSITION_DOLLARS = float(os.getenv("MIN_POSITION_DOLLARS", "500"))
-MIN_BUYING_POWER_PCT = float(os.getenv("MIN_BUYING_POWER_PCT", "10.0"))
-
 # ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 # E*TRADE API Configuration
 # ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
@@ -241,11 +237,12 @@ PRIORITY_2_ESTABLISHED = [s for s in PRIORITY_2_ESTABLISHED if s not in DELISTED
 # get_dynamic_universe() is called live each scan cycle so newly scraped TI
 # tickers are picked up without restarting the bot.
 from engine.equity.universe import get_tier as _get_tier, merge_live as _merge_live
+from engine.never_trade import load_never_trade as _load_never_trade
 
 
 def get_dynamic_universe() -> tuple:
     """Return (p1, p2, p3) merged lists, re-reading universe.json on every call."""
-    _ex = set(DELISTED_STOCKS)
+    _ex = set(DELISTED_STOCKS) | _load_never_trade()
     p1 = _merge_live(_get_tier(1), PRIORITY_1_MOMENTUM,    _ex)
     p2 = _merge_live(_get_tier(2), PRIORITY_2_ESTABLISHED, _ex)
     p3 = _merge_live(_get_tier(3), [],                     _ex)
@@ -276,6 +273,22 @@ MAX_POSITIONS        = 12     # 7.5% × 12 = 90% of usable equity (within 10% BP
 SWAP_ON_FULL         = True   # enabled — close weakest position for a better signal when full
 SWAP_MIN_CONFIDENCE  = 0.75   # Swap out weakest when new signal >= this confidence (was 0.85)
 POSITION_SIZE_PCT    = 7.5    # 7.5% per position → up to 12 positions within 90% BP utilization
+MAX_POSITION_CONCENTRATION_PCT = 20.0  # Hard cap: no single symbol's market value may exceed this % of equity,
+                                        # enforced both at entry sizing and by trimming winners that ran past it
+
+# Correlated-exposure cap: several DIFFERENT symbols that move together (e.g. the
+# leveraged inverse-market ETF basket) can each stay under MAX_POSITION_CONCENTRATION_PCT
+# individually while still adding up to one oversized directional bet combined —
+# confirmed in production: SQQQ+SOXS+TZA+LABD held simultaneously on 2026-07-30.
+# Symbol list mirrors engine.utils.market.INVERSE_ETFS (duplicated intentionally —
+# config.py stays dependency-free; engine.equity.strategies._INVERSE_ETFS already
+# duplicates the same list for the same reason).
+CORRELATION_GROUPS = {
+    "leveraged_inverse": {
+        "symbols": {"SQQQ", "SPXU", "UVXY", "TZA", "FAZ", "SOXS", "LABD", "DUST"},
+        "max_pct": 25.0,   # combined cap — above the single-symbol 20%, since it's a basket
+    },
+}
 USE_RISK_EQUALIZED_SIZING = False  # use fixed position sizing instead of risk-scaled
 RISK_PER_TRADE_PCT   = 0.8    # Risk 0.8% of account per trade (unused with fixed sizing)
 
@@ -454,6 +467,44 @@ EOD_CLOSE_STRATEGIES = {         # Strategy names that must be closed same day
     "EarlySqueeze",
 }
 
+# ─────────────────────────────────────────────────────────────────
+# Swing Position Staleness Exit
+# Positions held by strategies NOT in EOD_CLOSE_STRATEGIES (Momentum,
+# Technical, etc.) are meant to ride a trend via the GTC trailing stop rather
+# than close same-day. But a position that just grinds sideways/down for days
+# without reaching SWING_STALE_MIN_GAIN_PCT% is dead capital — close it out.
+# ─────────────────────────────────────────────────────────────────
+SWING_STALE_EXIT_ENABLED  = True
+SWING_STALE_DAYS          = 5     # calendar days held before the check applies
+SWING_STALE_MIN_GAIN_PCT  = 3.0   # required unrealized gain % by SWING_STALE_DAYS
+
+# ─────────────────────────────────────────────────────────────────
+# No-Gain 24h Exit
+# If a position hasn't shown ANY positive unrealized gain within N hours of
+# entry, cut it loose rather than waiting on SWING_STALE_DAYS. Checked every
+# scan cycle (not once/day) since the 24h mark can fall mid-session.
+# ─────────────────────────────────────────────────────────────────
+NO_GAIN_EXIT_ENABLED = True
+NO_GAIN_EXIT_HOURS   = 24    # hours held before the check applies
+NO_GAIN_EXIT_MIN_PCT = 0.0   # must exceed this unrealized gain % to survive
+
+# ─────────────────────────────────────────────────────────────────
+# After-Hours Software Stop-Loss
+# Alpaca's broker-side GTC trailing stop is only evaluated during regular
+# hours (09:30-16:00 ET) — a position can free-fall pre-market/after-hours
+# with the resting stop order sitting inert. This actively checks every open
+# position's loss against its stop % (same tier as the trailing stop) while
+# the market isn't in regular hours, and force-closes via an extended-hours
+# marketable limit order (plain market orders are rejected outside regular
+# hours too).
+# ─────────────────────────────────────────────────────────────────
+AFTERHOURS_STOP_CHECK_ENABLED = True
+AFTERHOURS_CHASE_STALE_SECONDS = 45  # re-chase (cancel + resubmit at fresh price) if the close sits unfilled this long
+AFTERHOURS_STOP_COOLDOWN_MIN = 720  # Block re-entry into a symbol for 12h after an after-hours stop-loss exit.
+                                     # After-hours momentum signals are often computed off a frozen daily bar (see
+                                     # BIOA 2026-07-31: same stale "buy" signal re-fired every cycle overnight,
+                                     # re-entering right after each stop-out into the next leg down).
+
 # Stale order upgrade: unfilled orders older than this get re-submitted as market/limit
 STALE_ORDER_MINUTES          = 360  # minutes before an unfilled order is considered stale
 STALE_ORDER_MINUTES_INTRADAY =  30  # intraday strategies (ORB, surge, etc.) — cancel if unfilled after 30 min
@@ -496,6 +547,12 @@ MIN_SHORT_CONFIDENCE_BEAR = 0.65  # In bear regime, allow Technical short setups
 SHORT_FAIL_COOLDOWN_MIN = 5    # Re-try failed short symbols immediately
 MAX_SIGNALS_PER_CYCLE = 3      # Execute at most this many signals per scan cycle
 
+# Per-symbol HMM regime alignment: confidence bonus (not a gate) when a
+# signal's direction agrees with the symbol's own 2-state Gaussian HMM regime,
+# fit on 1-min bars over the trailing lookback window.
+HMM_REGIME_LOOKBACK_DAYS        = 2     # days of 1-min bars used to fit the HMM
+HMM_REGIME_CONFIDENCE_BOOST     = 0.03  # added to confidence when aligned
+
 # Parallel Scanning
 SCAN_WORKERS        = 8    # Threads scanning symbols concurrently (kept below Alpaca pool defaults)
 SCAN_SYMBOL_TIMEOUT = 15   # Max seconds per symbol before it is skipped
@@ -505,19 +562,6 @@ BEAR_SHORT_TARGET_RESERVE = 30  # In bear regime, reserve more scan slots for sh
 # ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 # Strategy Parameters
 # ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
-SWEEPEA = {
-    "timeframe":        15,
-    "pinbar_threshold": 80.0,
-    "sweep_bars":       1,
-    "min_sweep":        0.10,
-    "use_ma":           True,
-    "ma_fast":          20,
-    "ma_slow":          50,
-    "use_bb":           True,
-    "bb_period":        20,
-    "bb_std":           2.0,
-}
-
 TECHNICAL = {
     "rsi_oversold":   30,
     "rsi_overbought": 70,
@@ -562,6 +606,33 @@ ORB = {
 VWAP_RECLAIM = {
     "volume_surge": 2.0,   # Volume in last 3 bars vs session avg
     "rsi_max":      72,    # Don't enter if already overbought
+}
+
+# ─────────────────────────────────────────────────────────────────
+# VWAP Fade Strategy (mean reversion — counter-play to VWAP Reclaim's
+# continuation bet, for range/chop days where continuation entries just
+# grind into stops)
+# ─────────────────────────────────────────────────────────────────
+VWAP_FADE = {
+    "zscore_threshold": 1.5,   # price must be this many session std-devs from VWAP
+    "min_stretch_pct":  1.5,   # ...and at least this far away in raw % terms
+    "reversal_bars":    5,     # bars looked back for a "already turning" tick
+}
+
+# ─────────────────────────────────────────────────────────────────
+# Liquidity Sweep Continuation Strategy ("stop hunt" reversal)
+# A recent swing high/low gets briefly violated (the stops resting there get
+# taken out), price closes back on the original side, then confirms with a
+# Break of Structure back in the original trend direction. Distinct from
+# ORB/TrendBreaker (which trade the breakout itself) — this trades the
+# fakeout-then-reversal.
+# ─────────────────────────────────────────────────────────────────
+LIQUIDITY_SWEEP = {
+    "swing_lookback_bars": 30,    # bars used to establish the prior swing high/low ("liquidity pool")
+    "swing_exclude_bars":  5,     # most-recent bars excluded from swing calc, then searched for the sweep + BOS
+    "sweep_buffer_pct":    0.05,  # min % beyond the swing level to count as a genuine sweep, not noise
+    "bos_buffer_pct":      0.05,  # min % beyond the confirming level to count as a genuine break of structure
+    "volume_surge":        1.5,  # the BOS move needs above-average volume — real participation, not drift
 }
 
 # ─────────────────────────────────────────────────────────────────
@@ -623,8 +694,16 @@ RVOL_MIN                 = 1.5         # Require relative volume ≥ 1.5x before
 MIN_STOCK_PRICE          = 2.0         # Skip penny stocks below $2 (poor fill quality, high spread)
 ALPACA_MOVER_SCAN_INTERVAL_MIN = 10   # Re-poll Alpaca screener every 10 min (resets at market open)
 MIN_DOLLAR_VOLUME        = 1_000_000   # Skip illiquid setups: price × day_vol < $1M
+MIN_FLOAT_SHARES         = 200_000_000 # Skip low-float names — prone to violent, illiquid after-hours moves
+MIN_AVG_DAILY_VOLUME     = 1_000_000   # Skip illiquid names: avg daily share volume < 1M
+MIN_MARKET_CAP           = 300_000_000 # Skip micro-caps below $300M
 MAX_GAP_CHASE_PCT        = 15.0       # Skip if already up >15% without consolidation
 GAP_CHASE_CONSOL_BARS    = 5          # Number of 1-min bars to check for tight base
+# ponytail: suppressed 2026-08-03 to observe a month of live impact (log data showed
+# it never logged a single block, and the 21 float blocks / 0 mcap blocks this past
+# month suggest it's costing more legit movers than it's protecting). Flip to True
+# to reactivate if the no-guard month looks worse.
+GAP_CHASE_GUARD_ENABLED  = False
 USE_MARKET_REGIME_FILTER = True       # SPY below 200-day MA → cut signals to 1
 MARKET_REGIME_SIGNALS_CAP  = 5        # Max LONG entries per cycle in bear regime (swap-only); tries until one succeeds
 BEAR_SHORT_SIGNALS_CAP     = 3        # Max SHORT entries per cycle in bear regime

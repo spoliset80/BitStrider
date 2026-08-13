@@ -41,7 +41,7 @@ _REPO_ROOT   = Path(__file__).resolve().parents[2]
 DATA_DIR     = _REPO_ROOT / "data"
 UNIVERSE_FILE = DATA_DIR / "universe.json"
 TI_PRIMARY_FILE = DATA_DIR / "ti_primary.json"
-TI_PRIMARY_TTL_MINUTES = int(os.getenv("TI_PRIMARY_TTL_MINUTES", "15"))
+TI_PRIMARY_TTL_MINUTES = int(os.getenv("TI_PRIMARY_TTL_MINUTES", "25"))  # scraper now runs every 20 min — leave a 5 min buffer
 
 # ── TTL per tier (minutes) ────────────────────────────────────────────────────
 # The primary dynamic universe should refresh frequently; default TTL is 15 min.

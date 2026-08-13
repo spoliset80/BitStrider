@@ -6,12 +6,16 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
-$venvActivate = Join-Path $PSScriptRoot 'apextrader\Scripts\Activate.ps1'
+# Machine-local venv, not the repo's old OneDrive-synced apextrader/ folder:
+# a synced venv gets its pyvenv.cfg "home" clobbered by whichever machine
+# wrote it last, breaking python.exe on every other machine. Run autobot.py
+# (or main.py once) first to create/bootstrap it here if it doesn't exist yet.
+$venvActivate = Join-Path $env:LOCALAPPDATA 'ApexTrader\venv\Scripts\Activate.ps1'
 if (Test-Path $venvActivate) {
     Write-Host "Activating venv: $venvActivate"
     . $venvActivate
 } else {
-    Write-Warning "Virtualenv activation script not found at $venvActivate"
+    Write-Warning "Virtualenv activation script not found at $venvActivate. Run autobot.py once to create it."
 }
 
 $env:TRADE_MODE = $Mode

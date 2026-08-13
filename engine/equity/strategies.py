@@ -1,12 +1,13 @@
 ﻿"""
 ApexTrader - Strategies
 Trading strategy implementations:
-  - SweepeaStrategy      : Liquidity Sweep + Pinbar (Donchian Channel)
   - TechnicalStrategy    : Multi-indicator technical analysis
   - MomentumStrategy     : Pure momentum with volume confirmation
   - GapBreakoutStrategy  : Gap-up from prior close with volume confirmation
   - ORBStrategy          : Opening Range Breakout (first 15-min high)
   - VWAPReclaimStrategy  : Price reclaims VWAP from below with volume
+  - VWAPFadeStrategy     : Mean-reversion fade back toward VWAP once stretched
+  - LiquiditySweepStrategy: Fade a swing-high/low sweep, confirmed by a Break of Structure
   - FloatRotationStrategy: High volume relative to float (low-float runners)
 """
 
@@ -21,7 +22,7 @@ from typing import Optional
 
 from engine.utils import get_bars, calc_rsi, calc_macd, get_premarket_bars
 from engine.config import (
-    SWEEPEA, TECHNICAL, MOMENTUM, GAP_BREAKOUT, ORB, VWAP_RECLAIM, FLOAT_ROTATION, LONG_ONLY_MODE,
+    TECHNICAL, MOMENTUM, GAP_BREAKOUT, ORB, VWAP_RECLAIM, VWAP_FADE, LIQUIDITY_SWEEP, FLOAT_ROTATION, LONG_ONLY_MODE,
     ATR_STOP_MULTIPLIER, ATR_TP_RATIO, HIGH_SHORT_FLOAT_STOCKS, is_high_short_float,
     PRE_MARKET_MOMENTUM, OPENING_BELL_SURGE, PM_HIGH_BREAKOUT, EARLY_SQUEEZE, BEAR_BREAKDOWN,
     SENTIMENT_STRATEGY,
@@ -63,167 +64,6 @@ def _calc_atr14(bars: pd.DataFrame, period: int = 14) -> float:
 # Canonical implementation lives in engine.utils.market.
 # Imported here so existing strategy code continues to call _is_bull_regime() directly.
 from engine.utils.market import _is_bull_regime  # canonical regime function — shared across all strategy modules
-
-
-# ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
-# Sweepea Strategy
-# ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
-class SweepeaStrategy:
-    """Liquidity Sweep + Pinbar with Donchian Channel swing detection.
-    Also fires on daily 8/20-EMA pullback after an initial squeeze (secondary move)."""
-
-    def scan(self, symbol: str) -> Optional[Signal]:
-        # ── Path A: daily 8/20-EMA pullback (post-squeeze secondary entry) ──────
-        try:
-            # Daily bar only meaningful after 10 AM ET — skip pre-market noise
-            if datetime.datetime.now(ET).hour >= 10:
-              daily = get_bars(symbol, "90d", "1d")
-            else:
-              daily = pd.DataFrame()
-            if not daily.empty and len(daily) >= 25:
-                daily = daily.copy()
-                daily["ema8"]  = daily["close"].ewm(span=8,  adjust=False).mean()
-                daily["ema20"] = daily["close"].ewm(span=20, adjust=False).mean()
-                cur  = daily.iloc[-1]
-                prev = daily.iloc[-2]
-                # Price touched or slightly undercut EMA and recovered above it
-                pb8  = (cur["low"] <= float(cur["ema8"])  * 1.005
-                        and cur["close"] >= float(cur["ema8"]) * 0.995)
-                pb20 = (cur["low"] <= float(cur["ema20"]) * 1.005
-                        and cur["close"] >= float(cur["ema20"]) * 0.995)
-                # Prior trend must be up (close > 8-bar lookback mean)
-                uptrend = float(prev["close"]) > float(daily["close"].iloc[-10:-2].mean())
-                is_inverse = symbol in _INVERSE_ETFS
-                # Inverse ETFs are valid LONG buys in bear regime
-                regime_ok = is_inverse or _is_bull_regime()
-                if (pb8 or pb20) and uptrend and regime_ok:
-                    atr14   = _calc_atr14(daily)
-                    ema_lbl = "8-EMA" if pb8 else "20-EMA"
-                    # High-Tight Flag: up ≥50% in last 4 weeks + tight 5-day consolidation
-                    is_htf   = False
-                    htf_note = ""
-                    if len(daily) >= 22:
-                        price_4w    = float(daily["close"].iloc[-22])
-                        gain_4w_pct = ((float(cur["close"]) - price_4w) / price_4w * 100
-                                       if price_4w > 0 else 0.0)
-                        last5_hi = float(daily["high"].iloc[-6:-1].max())
-                        last5_lo = float(daily["low"].iloc[-6:-1].min())
-                        tight    = (last5_hi - last5_lo) < float(cur["close"]) * 0.10
-                        if gain_4w_pct >= 50.0 and tight:
-                            is_htf   = True
-                            htf_note = f" | HTF +{gain_4w_pct:.0f}% / 4w"
-                    conf = 0.88 if is_htf else 0.82
-                    return Signal(
-                        symbol, "buy", float(cur["close"]), conf,
-                        f"Daily Sweepea pullback to {ema_lbl}{htf_note} | ATR ${atr14:.2f}",
-                        "Sweepea",
-                        atr_stop=atr14 * ATR_STOP_MULTIPLIER if atr14 > 0 else None,
-                    )
-        except Exception:
-            pass
-
-        # ── Path B: intraday liquidity sweep + pinbar ────────────────────────────
-        bars = get_bars(symbol, "10d", f"{SWEEPEA['timeframe']}m")
-        if bars.empty or len(bars) < 30:
-            return None
-        bars = bars.copy()
-
-        # Moving averages
-        bars["ma_fast"] = bars["close"].rolling(SWEEPEA["ma_fast"]).mean()
-        bars["ma_slow"] = bars["close"].rolling(SWEEPEA["ma_slow"]).mean()
-
-        # Bollinger Bands
-        sma = bars["close"].rolling(SWEEPEA["bb_period"]).mean()
-        std = bars["close"].rolling(SWEEPEA["bb_period"]).std()
-        bars["bb_up"] = sma + SWEEPEA["bb_std"] * std
-        bars["bb_lo"] = sma - SWEEPEA["bb_std"] * std
-
-        # Donchian Channel (20-period, shift to avoid lookahead bias)
-        lookback = 20
-        bars["swing_low"]  = bars["low"].shift(1).rolling(lookback).min()
-        bars["swing_high"] = bars["high"].shift(1).rolling(lookback).max()
-
-        # Volume MA
-        bars["vol_ma"] = bars["volume"].rolling(20).mean()
-
-        cur = bars.iloc[-2]  # Last closed candle
-        range_val = cur["high"] - cur["low"]
-        if range_val == 0:
-            return None
-
-        # Liquidity sweep detection with volatility-aware threshold.
-        # Absolute min_sweep alone is too small for high-priced names and too large
-        # for microcaps, so blend it with a small % of price and 15m ATR proxy.
-        tr = (bars["high"] - bars["low"]).rolling(14).mean()
-        atr14_i = float(tr.iloc[-2]) if not pd.isna(tr.iloc[-2]) else 0.0
-        sweep_threshold = max(
-            float(SWEEPEA["min_sweep"]),
-            float(cur["close"]) * 0.0015,   # 0.15% of price
-            atr14_i * 0.20,                  # 20% of local ATR
-        )
-
-        # Use configurable sweep_bars window (>=1).
-        sweep_bars = max(1, int(SWEEPEA.get("sweep_bars", 1)))
-        recent = bars.iloc[-(sweep_bars + 1):-1]
-        if recent.empty:
-            recent = bars.iloc[-2:-1]
-
-        swept_below = float(recent["low"].min())  < (float(cur["swing_low"])  - sweep_threshold)
-        swept_above = float(recent["high"].max()) > (float(cur["swing_high"]) + sweep_threshold)
-
-        # Pinbar wick ratios
-        lower_wick       = min(cur["open"], cur["close"]) - cur["low"]
-        lower_wick_ratio = (lower_wick / range_val) * 100
-        upper_wick       = cur["high"] - max(cur["open"], cur["close"])
-        upper_wick_ratio = (upper_wick / range_val) * 100
-
-        # Volume confirmation
-        high_volume = cur["volume"] >= (cur["vol_ma"] * 1.05)
-
-        bull_pin = swept_below and lower_wick_ratio >= SWEEPEA["pinbar_threshold"] and high_volume
-        bear_pin = swept_above and upper_wick_ratio >= SWEEPEA["pinbar_threshold"] and high_volume
-
-        # Optional Bollinger touch filter (configured but previously unused).
-        if SWEEPEA.get("use_bb", False):
-            if bull_pin and not pd.isna(cur["bb_lo"]):
-                if float(cur["low"]) > float(cur["bb_lo"]) * 1.01:
-                    bull_pin = False
-            if bear_pin and not pd.isna(cur["bb_up"]):
-                if float(cur["high"]) < float(cur["bb_up"]) * 0.99:
-                    bear_pin = False
-
-        # MA Filter
-        if SWEEPEA["use_ma"]:
-            if pd.isna(cur["ma_fast"]) or pd.isna(cur["ma_slow"]):
-                return None
-
-            if bull_pin:
-                ma_touch       = cur["low"]   <= cur["ma_fast"]
-                close_recovery = cur["close"] >= cur["ma_fast"] * 0.98
-                if not (ma_touch and close_recovery):
-                    return None
-
-            if bear_pin:
-                ma_touch        = cur["high"]  >= cur["ma_fast"]
-                close_rejection = cur["close"] <= cur["ma_fast"] * 1.02
-                if not (ma_touch and close_rejection):
-                    return None
-
-        # Confidence scales with wick quality and volume expansion.
-        vol_ratio = float(cur["volume"] / cur["vol_ma"]) if cur["vol_ma"] and cur["vol_ma"] > 0 else 1.0
-        bull_conf = min(0.72 + max(lower_wick_ratio - SWEEPEA["pinbar_threshold"], 0) / 200 + max(vol_ratio - 1.0, 0) * 0.05, 0.88)
-        bear_conf = min(0.72 + max(upper_wick_ratio - SWEEPEA["pinbar_threshold"], 0) / 200 + max(vol_ratio - 1.0, 0) * 0.05, 0.88)
-
-        _is_inv = symbol in _INVERSE_ETFS
-        if bull_pin and (_is_bull_regime() or _is_inv):
-            return Signal(symbol, "buy",  float(cur["close"]), bull_conf,
-                          f"Liquidity sweep + bullish pinbar | wick {lower_wick_ratio:.0f}% | vol x{vol_ratio:.1f}", "Sweepea")
-        # Shorts are globally disabled
-        # elif bear_pin and not LONG_ONLY_MODE:
-        #     return Signal(symbol, "sell", float(cur["close"]), bear_conf,
-        #                   f"Liquidity sweep + bearish pinbar | wick {upper_wick_ratio:.0f}% | vol x{vol_ratio:.1f}", "Sweepea")
-
-        return None
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -707,6 +547,163 @@ class VWAPReclaimStrategy:
 
 
 # ──────────────────────────────────────────────────────────────
+# VWAP Fade Strategy
+# ──────────────────────────────────────────────────────────────
+class VWAPFadeStrategy:
+    """Mean-reversion counter-play to VWAPReclaimStrategy: that one bets on
+    continuation through VWAP, this one bets on a snap-back once price is
+    stretched unusually far from it. Meant for range/chop days where
+    continuation entries just grind into stops.
+
+    Logic:
+      - Calculate intraday VWAP and today's std-dev of (price - VWAP)
+      - Signal: price stretched >= VWAP_FADE['zscore_threshold'] std-devs AND
+        >= VWAP_FADE['min_stretch_pct'] away from VWAP (z-score alone isn't
+        enough on a very quiet session where any wobble looks "extreme")
+      - Recent volume must be cooling off vs the session average — the move
+        that created the stretch is already losing steam, not a fresh
+        breakdown/breakout worth respecting
+      - Price must already show a small reversal tick off the recent
+        extreme, i.e. catching the turn, not the falling knife
+    """
+
+    def scan(self, symbol: str) -> Optional[Signal]:
+        bars = get_bars(symbol, "1d", "1m")
+        if bars.empty or len(bars) < 30:
+            return None
+
+        bars = bars.copy()
+        bars["tp"]         = (bars["high"] + bars["low"] + bars["close"]) / 3
+        bars["cum_vol"]    = bars["volume"].cumsum()
+        bars["cum_tp_vol"] = (bars["tp"] * bars["volume"]).cumsum()
+        bars["vwap"]       = bars["cum_tp_vol"] / bars["cum_vol"].replace(0, float("nan"))
+
+        cur_close = float(bars["close"].iloc[-1])
+        cur_vwap  = float(bars["vwap"].iloc[-1])
+        if pd.isna(cur_vwap) or cur_vwap <= 0:
+            return None
+
+        deviation = bars["close"] - bars["vwap"]
+        std = float(deviation.std())
+        if not std or pd.isna(std):
+            return None
+        zscore      = float(deviation.iloc[-1]) / std
+        stretch_pct = (cur_close - cur_vwap) / cur_vwap * 100
+
+        vol_recent  = float(bars["volume"].iloc[-3:].mean())
+        vol_session = float(bars["volume"].mean())
+        if vol_session == 0:
+            return None
+        cooling = vol_recent < vol_session
+
+        n = VWAP_FADE["reversal_bars"]
+
+        # Stretched below VWAP + cooling volume + already ticking back up
+        if (zscore <= -VWAP_FADE["zscore_threshold"]
+                and stretch_pct <= -VWAP_FADE["min_stretch_pct"]
+                and cooling):
+            recent_low = float(bars["low"].iloc[-n:].min())
+            if cur_close > recent_low * 1.002:
+                confidence = min(0.70 + abs(zscore) * 0.05, 0.90)
+                return Signal(
+                    symbol, "buy", cur_close, confidence,
+                    f"VWAP fade: {stretch_pct:.1f}% below VWAP (z={zscore:.1f}), volume cooling, turning up",
+                    "VWAPFade",
+                )
+
+        # Symmetric short: stretched above VWAP + cooling volume + already turning down
+        if (not LONG_ONLY_MODE
+                and zscore >= VWAP_FADE["zscore_threshold"]
+                and stretch_pct >= VWAP_FADE["min_stretch_pct"]
+                and cooling):
+            recent_high = float(bars["high"].iloc[-n:].max())
+            if cur_close < recent_high * 0.998:
+                confidence = min(0.70 + abs(zscore) * 0.05, 0.90)
+                return Signal(
+                    symbol, "short", cur_close, confidence,
+                    f"VWAP fade short: {stretch_pct:.1f}% above VWAP (z={zscore:.1f}), volume cooling, turning down",
+                    "VWAPFade",
+                )
+
+        return None
+
+
+# ──────────────────────────────────────────────────────────────
+# Liquidity Sweep Continuation Strategy
+# ──────────────────────────────────────────────────────────────
+class LiquiditySweepStrategy:
+    """'Stop hunt' reversal: a recent swing high/low gets briefly violated
+    (the stops resting there get taken out), price closes back on the
+    original side, then a Break of Structure (BOS) confirms the original
+    trend is resuming. Distinct from ORB/TrendBreaker, which trade the
+    breakout itself — this trades the fakeout-then-reversal.
+
+    Logic (bullish case, mirrored for bearish):
+      - Establish a prior swing low from an earlier window of bars (the
+        "liquidity pool" resting below it)
+      - Sweep: a more recent bar's low pierces that swing low by
+        >= sweep_buffer_pct, but the current close is back above it
+        (the breakdown didn't hold)
+      - BOS: current close breaks back above the most recent local high
+        by >= bos_buffer_pct — confirms continuation, not just a bounce
+      - Volume on the BOS move must be elevated vs session average
+    """
+
+    def scan(self, symbol: str) -> Optional[Signal]:
+        lookback = LIQUIDITY_SWEEP["swing_lookback_bars"]
+        recent_n = LIQUIDITY_SWEEP["swing_exclude_bars"]
+
+        bars = get_bars(symbol, "1d", "1m")
+        if bars.empty or len(bars) < lookback + recent_n:
+            return None
+
+        swing_window = bars.iloc[-(lookback + recent_n):-recent_n]
+        recent       = bars.iloc[-recent_n:]
+
+        swing_low  = float(swing_window["low"].min())
+        swing_high = float(swing_window["high"].max())
+        cur_close  = float(bars["close"].iloc[-1])
+
+        vol_avg = float(bars["volume"].mean())
+        if vol_avg == 0:
+            return None
+        vol_ratio = float(bars["volume"].iloc[-2:].mean()) / vol_avg
+
+        sweep_buf = LIQUIDITY_SWEEP["sweep_buffer_pct"] / 100
+        bos_buf   = LIQUIDITY_SWEEP["bos_buffer_pct"] / 100
+        prior_bars = recent.iloc[:-1]  # everything in the recent window except the current bar
+
+        # Bullish: sell-side sweep below swing_low, held, then BOS above a recent local high
+        if (float(recent["low"].min()) < swing_low * (1 - sweep_buf)
+                and cur_close > swing_low
+                and vol_ratio >= LIQUIDITY_SWEEP["volume_surge"]):
+            bos_level = float(prior_bars["high"].max()) if not prior_bars.empty else swing_high
+            if cur_close > bos_level * (1 + bos_buf):
+                confidence = min(0.72 + vol_ratio * 0.03, 0.92)
+                return Signal(
+                    symbol, "buy", cur_close, confidence,
+                    f"Liquidity sweep: swept low ${swing_low:.2f}, BOS above ${bos_level:.2f}, vol x{vol_ratio:.1f}",
+                    "LiquiditySweep",
+                )
+
+        # Bearish: buy-side sweep above swing_high, held, then BOS below a recent local low
+        if not LONG_ONLY_MODE:
+            if (float(recent["high"].max()) > swing_high * (1 + sweep_buf)
+                    and cur_close < swing_high
+                    and vol_ratio >= LIQUIDITY_SWEEP["volume_surge"]):
+                bos_level = float(prior_bars["low"].min()) if not prior_bars.empty else swing_low
+                if cur_close < bos_level * (1 - bos_buf):
+                    confidence = min(0.72 + vol_ratio * 0.03, 0.92)
+                    return Signal(
+                        symbol, "short", cur_close, confidence,
+                        f"Liquidity sweep short: swept high ${swing_high:.2f}, BOS below ${bos_level:.2f}, vol x{vol_ratio:.1f}",
+                        "LiquiditySweep",
+                    )
+
+        return None
+
+
+# ──────────────────────────────────────────────────────────────
 # Float Rotation Strategy
 # ──────────────────────────────────────────────────────────────
 # Module-level caches — persist across scan cycles and strategy instances
@@ -734,6 +731,25 @@ def _get_float_shares(symbol: str) -> Optional[float]:
     except Exception:
         pass
     _float_info_cache[symbol] = 0.0   # cache miss so we don't re-fetch this session
+    return None
+
+
+def _get_market_cap(symbol: str) -> Optional[float]:
+    """Cached market cap sourced from yfinance. Returns None when unavailable.
+    Same cache/miss semantics as _get_float_shares — see there for details."""
+    if symbol in _mcap_cache:
+        v = _mcap_cache[symbol]
+        return v if v > 0 else None
+    try:
+        import yfinance as _yf
+        info = _yf.Ticker(symbol).info
+        mcap = info.get("marketCap")
+        if mcap and float(mcap) > 0:
+            _mcap_cache[symbol] = float(mcap)
+            return float(mcap)
+    except Exception:
+        pass
+    _mcap_cache[symbol] = 0.0
     return None
 
 
@@ -1224,10 +1240,11 @@ def get_strategy_instances(bull_regime: bool = True):
         GapBreakoutStrategy(),
         ORBStrategy(),
         VWAPReclaimStrategy(),
+        VWAPFadeStrategy(),
+        LiquiditySweepStrategy(),
         FloatRotationStrategy(),
         MomentumStrategy(),
         TechnicalStrategy(),
-        SweepeaStrategy(),
         TrendBreakerStrategy(),
         SentimentStrategy(),
         PreMarketMomentumStrategy(),

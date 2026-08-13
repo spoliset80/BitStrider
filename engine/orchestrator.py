@@ -98,9 +98,18 @@ def _build_context() -> AppContext:
 # ── Discovery wrappers ────────────────────────────────────────────────────────
 # Thin wrappers that forward config into discovery — keeps scan_and_trade lean.
 
+def _timed(label: str, fn, *args, **kwargs) -> None:
+    """Call fn(*args, **kwargs) and log its wall time under [TIMING] <label>."""
+    t0 = time.monotonic()
+    try:
+        fn(*args, **kwargs)
+    finally:
+        log.info(f"[TIMING]   {label}: {time.monotonic() - t0:.1f}s")
+
+
 def _run_discovery(ctx: AppContext, market_state: MarketState) -> None:
     """Fire all configured universe refresh sources (each throttled internally)."""
-    _discovery.scan_trending_stocks(
+    _timed("trending_stocks", _discovery.scan_trending_stocks,
         use_live_trending=cfg.USE_LIVE_TRENDING,
         use_finnhub=cfg.USE_FINNHUB_DISCOVERY,
         use_sentiment_gate=cfg.USE_SENTIMENT_GATE,
@@ -109,7 +118,7 @@ def _run_discovery(ctx: AppContext, market_state: MarketState) -> None:
         trending_min_momentum=cfg.TRENDING_MIN_MOMENTUM,
         priority_1=cfg.PRIORITY_1_MOMENTUM,
     )
-    _discovery.scan_tradeideas_universe(
+    _timed("tradeideas_universe", _discovery.scan_tradeideas_universe,
         enabled=cfg.USE_TRADEIDEAS_DISCOVERY,
         scan_interval_min=cfg.TRADEIDEAS_SCAN_INTERVAL_MIN,
         headless=cfg.TRADEIDEAS_HEADLESS,
@@ -120,7 +129,7 @@ def _run_discovery(ctx: AppContext, market_state: MarketState) -> None:
         browser=cfg.TRADEIDEAS_BROWSER,
         remote_debug_port=9222,
     )
-    _discovery.scan_tradeideas_unusual_options(
+    _timed("tradeideas_unusual_options", _discovery.scan_tradeideas_unusual_options,
         enabled=cfg.USE_TRADEIDEAS_UNUSUAL_OPTIONS_DISCOVERY,
         scan_interval_min=cfg.TRADEIDEAS_UNUSUAL_OPTIONS_SCAN_INTERVAL_MIN,
         headless=cfg.TRADEIDEAS_HEADLESS,
@@ -131,7 +140,7 @@ def _run_discovery(ctx: AppContext, market_state: MarketState) -> None:
         browser=cfg.TRADEIDEAS_BROWSER,
         remote_debug_port=9222,
     )
-    _discovery.scan_tradeideas_toplists(
+    _timed("tradeideas_toplists", _discovery.scan_tradeideas_toplists,
         enabled=cfg.USE_TRADEIDEAS_TOPLISTS_DISCOVERY,
         scan_interval_min=cfg.TRADEIDEAS_TOPLISTS_SCAN_INTERVAL_MIN,
         headless=cfg.TRADEIDEAS_HEADLESS,
@@ -142,7 +151,7 @@ def _run_discovery(ctx: AppContext, market_state: MarketState) -> None:
         browser=cfg.TRADEIDEAS_BROWSER,
         remote_debug_port=9222,
     )
-    _discovery.scan_sympathy_and_edgar(
+    _timed("sympathy_and_edgar", _discovery.scan_sympathy_and_edgar,
         sympathy_enabled=cfg.USE_SECTOR_SYMPATHY,
         edgar_enabled=cfg.USE_EDGAR_SCANNER,
         sympathy_interval_min=cfg.SECTOR_SYMPATHY_INTERVAL_MIN,
@@ -150,11 +159,11 @@ def _run_discovery(ctx: AppContext, market_state: MarketState) -> None:
         priority_1=cfg.PRIORITY_1_MOMENTUM,
         priority_2=cfg.PRIORITY_2_ESTABLISHED,
     )
-    _discovery.scan_alpaca_movers(
+    _timed("alpaca_movers", _discovery.scan_alpaca_movers,
         interval_min=cfg.ALPACA_MOVER_SCAN_INTERVAL_MIN,
         market_state=market_state,
     )
-    _discovery.scan_preopen_intelligence(
+    _timed("preopen_intelligence", _discovery.scan_preopen_intelligence,
         enabled=cfg.USE_PREOPEN_INTELLIGENCE,
         interval_min=cfg.PREOPEN_INTELLIGENCE_SCAN_INTERVAL_MIN,
         market_state=market_state,
@@ -234,6 +243,7 @@ def _resolve_market_regime(ctx: AppContext, market_state: MarketState) -> Tuple[
 def _build_scan_targets(ctx: AppContext) -> Tuple[List[str], set]:
     """Return (scan_targets, excluded) after universe assembly and position filtering."""
     _, _, excluded = get_live_holdings(ctx.client)
+    excluded = excluded | ctx.executor.get_afterhours_cooldown_symbols()
     targets = filter_universe_by_positions(get_scan_targets(), excluded)
     log.info(
         f"[SCAN] {len(targets)} symbols (filtered, {cfg.SCAN_WORKERS} workers): "
@@ -459,6 +469,7 @@ def scan_and_trade(ctx: AppContext) -> None:
       7. Signal filtering
       8. Execution (bear or bull plan)
     """
+    _cycle_start = time.monotonic()
     _session.reset_daily(ctx.client)
 
     ctx.market_state = MarketState.from_now()
@@ -495,8 +506,24 @@ def scan_and_trade(ctx: AppContext) -> None:
 
     ctx.executor.update_stale_orders()
     ctx.executor.check_tp_targets()
+    ctx.executor.enforce_position_concentration()
+    ctx.executor.enforce_correlation_concentration()
 
+    acct = ctx.executor._get_account()
+    min_needed = (
+        cfg.SMALL_ACCOUNT_MIN_POSITION_DOLLARS if acct.equity < cfg.SMALL_ACCOUNT_EQUITY_THRESHOLD
+        else cfg.MIN_POSITION_DOLLARS
+    )
+    if acct.buying_power < min_needed:
+        log.info(
+            f"[SYSTEM] Buying power ${acct.buying_power:,.0f} < minimum position ${min_needed:,.0f} "
+            f"— skipping discovery/scan this cycle (existing stops/TP/concentration checks still ran above)"
+        )
+        return
+
+    _t_discovery = time.monotonic()
     _run_discovery(ctx, market_state)
+    log.info(f"[TIMING] discovery: {time.monotonic() - _t_discovery:.1f}s")
 
     scan_targets, excluded = _build_scan_targets(ctx)
     if not scan_targets:
@@ -506,7 +533,10 @@ def scan_and_trade(ctx: AppContext) -> None:
     ctx.executor._swap_cycle_closed.clear()
     regime, signals_cap = _resolve_market_regime(ctx, market_state)
 
+    _t_scan = time.monotonic()
     signals, hit_counts, scan_errors = scan_universe(scan_targets, sentiment, market_state)
+    _scan_elapsed = time.monotonic() - _t_scan
+    log.info(f"[TIMING] scan_universe: {_scan_elapsed:.1f}s for {len(scan_targets)} symbols ({_scan_elapsed/max(len(scan_targets),1):.2f}s/symbol)")
 
     if cfg.LONG_ONLY_MODE:
         pre = len(signals)
@@ -545,10 +575,15 @@ def scan_and_trade(ctx: AppContext) -> None:
         log.info("[SCAN] No eligible signals after filtering")
         return
 
+    _t_exec = time.monotonic()
     if regime == "bear":
         _execute_bear_plan(ctx, eligible, daily_loss_limit, loss_pct)
     else:
         _execute_bull_plan(ctx, eligible, signals_cap, regime, daily_loss_limit, loss_pct)
+    log.info(
+        f"[TIMING] signal→order: {time.monotonic() - _t_exec:.1f}s | "
+        f"total cycle: {time.monotonic() - _cycle_start:.1f}s"
+    )
 
 
 # ── Status + interval helpers ─────────────────────────────────────────────────
@@ -642,7 +677,7 @@ def _prune_universe_job() -> None:
 def scan_top3_only(ctx: AppContext) -> None:
     market_state = ctx.market_state or MarketState.from_now()
     ctx.market_state = market_state
-    sentiment = get_market_sentiment()
+    sentiment = market_state.resolve_sentiment()
     log.info(f"Market sentiment: {sentiment}")
     _run_discovery(ctx, market_state)
     _, _, excluded = get_live_holdings(ctx.client)
@@ -674,7 +709,8 @@ def scan_top3_only(ctx: AppContext) -> None:
 # makes a broker call when _pdt_stop_blocked is non-empty.
 
 def _start_software_stop_thread(ctx: AppContext) -> None:
-    """Spawn a daemon thread that polls check_software_stops() every 10 seconds."""
+    """Spawn a daemon thread that polls check_software_stops() and
+    check_afterhours_stops() every 10 seconds."""
     import threading
 
     def _loop() -> None:
@@ -684,6 +720,10 @@ def _start_software_stop_thread(ctx: AppContext) -> None:
                     ctx.executor.check_software_stops()
             except Exception as e:
                 log.error(f"[STOP-THREAD] check_software_stops error: {e}", exc_info=True)
+            try:
+                ctx.executor.check_afterhours_stops()
+            except Exception as e:
+                log.error(f"[STOP-THREAD] check_afterhours_stops error: {e}", exc_info=True)
             time.sleep(10)
 
     t = threading.Thread(target=_loop, name="SoftwareStopPoller", daemon=True)
@@ -805,12 +845,31 @@ def start() -> None:
                             log.error(f"EOD notify error: {e}", exc_info=True)
 
                     try:
+                        ctx.executor.close_stale_swing_positions()
+                    except Exception as e:
+                        log.error(f"close_stale_swing_positions error: {e}", exc_info=True)
+
+                    try:
+                        ctx.executor.close_no_gain_positions()
+                    except Exception as e:
+                        log.error(f"close_no_gain_positions error: {e}", exc_info=True)
+
+                    try:
                         scan_and_trade(ctx)
                     except Exception as e:
                         log.error(f"Scan cycle error: {e}", exc_info=True)
 
                     last_scan = time.time()
                     log.info(f"Heartbeat: {datetime.datetime.now().isoformat()}")
+                    try:
+                        # Plain-text, UTC ISO timestamp — read by engine/watchdog.py's
+                        # stall monitor, which runs on the supervising process (no
+                        # heavy deps available there, so it can't just tail this log).
+                        (REPO_ROOT / "heartbeat.txt").write_text(
+                            datetime.datetime.now(datetime.timezone.utc).isoformat(), encoding="utf-8"
+                        )
+                    except Exception as e:
+                        log.warning(f"heartbeat.txt write failed: {e}")
 
                 schedule.run_pending()
                 time.sleep(5)

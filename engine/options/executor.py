@@ -50,6 +50,7 @@ from engine.config import (
     API_KEY, API_SECRET, PAPER,
 )
 from engine.utils import MarketState
+from engine.never_trade import is_never_trade
 from .strategies import OptionSignal, CONTRACT_SIZE, record_stop_cooldown
 
 log = logging.getLogger("ApexTrader.Options")
@@ -681,6 +682,9 @@ class OptionsExecutor:
             return True  # allow attempt; the order itself will catch any restriction
 
     def place_option_order(self, signal: OptionSignal, market_state: MarketState) -> bool:
+        if is_never_trade(signal.symbol):
+            log.info(f"Skipping {signal.symbol}: listed in data/never_trade.txt")
+            return False
         # 0. Gross Notional Check (LIVE accounts only)
         if not PAPER:
             # Prepare legs for the pending order
@@ -1090,7 +1094,7 @@ class OptionsExecutor:
             
             # If under 25k and flagged, we are restricted
             is_small = equity < PDT_ACCOUNT_MIN and pdt_flagged
-            trades_used = int(getattr(acct, "daytrade_count", 0))
+            trades_used = int(getattr(acct, "daytrade_count", 0) or 0)
             remaining = max(0, PDT_MAX_TRADES - trades_used)
             
             return is_small, remaining

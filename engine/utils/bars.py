@@ -41,6 +41,23 @@ _bar_cache_lock = threading.Lock()
 _ALPACA_MIN_INTERVAL = 0.35   # per-symbol throttle to reduce 429s
 _last_alpaca_bar_ts: float = 0.0
 
+# Interval-aware staleness thresholds. Previously only minute bars were checked
+# (`interval.endswith("m")`) — daily-bar fetches (RVOL, dollar-volume, the
+# avg-daily-volume guardrail) and the batch snapshot path returned data no
+# matter how old it was. A trading decision built on a genuinely dead feed
+# for a symbol should never look identical to one built on fresh data.
+_STALE_THRESHOLD_SECONDS = {
+    "m": 120,               # minute bars: >2 min old means the feed isn't live
+    "h": 2 * 3600,          # hour bars
+    "d": 4 * 24 * 3600,     # daily bars: generous enough for a weekend/holiday gap,
+                            # still catches a feed that's been dead for days
+}
+
+
+def _staleness_threshold(interval: str) -> float:
+    suffix = interval[-1] if interval else "d"
+    return _STALE_THRESHOLD_SECONDS.get(suffix, _STALE_THRESHOLD_SECONDS["d"])
+
 _data_client = None
 _option_data_client = None
 
@@ -151,15 +168,16 @@ def _get_bars_alpaca(symbol: str, period: str, interval: str, log) -> pd.DataFra
         feed="iex",
     ))
     _last_alpaca_bar_ts = time.time()
-    if symbol in bars:
-        data = _normalize_df(bars[symbol].df.reset_index())
+    if symbol in bars.data:
+        data = _normalize_df(bars.df.reset_index())
         if "time" in data.columns:
             latest    = pd.to_datetime(data["time"].iloc[-1])
             if latest.tzinfo is None:
                 latest = ET.localize(latest)
             staleness = (datetime.datetime.now(ET) - latest).total_seconds()
-            if interval.endswith("m") and staleness > 120:
-                log.warning(f"{symbol}: Alpaca data stale ({staleness:.0f}s) — skipping")
+            threshold = _staleness_threshold(interval)
+            if staleness > threshold:
+                log.warning(f"{symbol}: Alpaca data stale ({staleness:.0f}s > {threshold:.0f}s for {interval}) — skipping")
             else:
                 _record_ok_bars(symbol)
                 with _bar_cache_lock:
@@ -167,7 +185,7 @@ def _get_bars_alpaca(symbol: str, period: str, interval: str, log) -> pd.DataFra
                 return data
     return pd.DataFrame()
 
-@retry(wait=wait_exponential(multiplier=1, min=2, max=10), stop=stop_after_attempt(3),
+@retry(wait=wait_exponential(multiplier=1, min=1, max=3), stop=stop_after_attempt(2),
        retry=retry_if_exception_type(Exception))
 def _get_bars_yfinance(symbol: str, period: str, interval: str, log) -> pd.DataFrame:
     import yfinance as yf
@@ -284,17 +302,22 @@ def get_bars_batch(symbols, period: str = "5d", interval: str = "15m") -> Dict[s
                     bars = {}
 
                 for s in batch:
-                    if s not in bars:
+                    if isinstance(bars, dict) or s not in bars.data:
                         log.debug(f"{s}: Alpaca missing/stale [batch]")
                         continue
-                    data = _normalize_df(bars[s].df.reset_index())
+                    sym_df = bars.df[bars.df.index.get_level_values("symbol") == s]
+                    if sym_df.empty:
+                        log.debug(f"{s}: Alpaca missing/stale [batch]")
+                        continue
+                    data = _normalize_df(sym_df.reset_index())
                     if "time" in data.columns and not data.empty:
                         latest    = pd.to_datetime(data["time"].iloc[-1])
                         if latest.tzinfo is None:
                             latest = ET.localize(latest)
                         staleness = (datetime.datetime.now(ET) - latest).total_seconds()
-                        if interval.endswith("m") and staleness > 120:
-                            log.warning(f"{s}: Alpaca data stale ({staleness:.0f}s) [batch]")
+                        threshold = _staleness_threshold(interval)
+                        if staleness > threshold:
+                            log.warning(f"{s}: Alpaca data stale ({staleness:.0f}s > {threshold:.0f}s for {interval}) [batch]")
                             continue
                     _record_ok_bars(s)
                     results[s] = data
@@ -343,8 +366,8 @@ def get_premarket_bars(symbol: str) -> pd.DataFrame:
                 timeframe=TimeFrame(1, TimeFrameUnit.Minute),
                 start=start,
             ))
-            if symbol in bars:
-                result = _normalize_df(bars[symbol].df.reset_index())
+            if symbol in bars.data:
+                result = _normalize_df(bars.df.reset_index())
                 log.debug(f"get_premarket_bars({symbol}): {len(result)} bars")
         except Exception as e:
             log.debug(f"get_premarket_bars({symbol}): failed: {e}")

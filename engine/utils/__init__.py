@@ -46,6 +46,8 @@ from engine.utils.market import (
     get_live_holdings,
 )
 
+from engine.utils.hmm_regime import get_hmm_regime
+
 from engine.utils.risk import (
     get_dynamic_tier,
     calculate_risk_adjusted_size,
@@ -72,7 +74,7 @@ __all__ = [
     "MarketState", "is_market_open", "is_regular_hours", "is_options_lull_hours", "is_open_window",
     "get_vix", "check_vix_roc_filter",
     "get_vix_interval", "get_market_hours_interval", "get_position_tuning_interval",
-    "get_market_sentiment", "get_live_holdings",
+    "get_market_sentiment", "get_live_holdings", "get_hmm_regime",
     "is_bull_regime", "_is_bull_regime", "INVERSE_ETFS", "_INVERSE_ETFS",
     "get_dynamic_tier", "calculate_risk_adjusted_size",
     "bool_env", "get_env", "format_currency",

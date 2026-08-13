@@ -47,6 +47,9 @@ from engine.config import (
     SCAN_WORKERS,
     SCAN_SYMBOL_TIMEOUT,
     MIN_DOLLAR_VOLUME,
+    MIN_FLOAT_SHARES,
+    MIN_AVG_DAILY_VOLUME,
+    MIN_MARKET_CAP,
     MIN_STOCK_PRICE,
     LONG_ONLY_MODE,
     MIN_SIGNAL_CONFIDENCE,
@@ -54,9 +57,12 @@ from engine.config import (
     RVOL_MIN,
     MAX_GAP_CHASE_PCT,
     GAP_CHASE_CONSOL_BARS,
+    GAP_CHASE_GUARD_ENABLED,
     BEAR_SHORT_UNIVERSE,
+    HMM_REGIME_LOOKBACK_DAYS,
+    HMM_REGIME_CONFIDENCE_BOOST,
 )
-from engine.utils import MarketState, clear_bar_cache, get_bars, is_dead_ticker
+from engine.utils import MarketState, clear_bar_cache, get_bars, is_dead_ticker, get_hmm_regime
 from engine.utils.bars import get_data_client as _get_data_client
 from alpaca.data import StockSnapshotRequest as _StockSnapshotRequest
 from .universe import get_tier as _get_tier_live, get_latest_batch as _get_latest_batch, get_ti_primary as _get_ti_primary
@@ -76,7 +82,7 @@ _ADAPTIVE_MIN_RVOL = 1.2
 _ADAPTIVE_MIN_CONF = 0.60
 _ADAPTIVE_STEP_RVOL = 0.2
 _ADAPTIVE_STEP_CONF = 0.03
-from .strategies import get_strategy_instances, MomentumStrategy, TechnicalStrategy, SentimentStrategy
+from .strategies import get_strategy_instances, MomentumStrategy, TechnicalStrategy, SentimentStrategy, _get_float_shares, _get_market_cap
 from engine.utils.market import _is_bull_regime, _INVERSE_ETFS
 
 # Rotating scan offset — advances by SCAN_MAX_SYMBOLS each call so different
@@ -88,6 +94,7 @@ _scan_offset: int = 0
 # batch request.  _passes_guardrails() reads from this cache to avoid
 # per-symbol 1-minute bars requests (390 bars × N symbols = dominant I/O cost).
 _snapshot_cache: Dict = {}
+_SNAPSHOT_STALE_SECONDS = 300  # snapshot's latest_trade older than this -> fall back to fresh intraday bars
 
 
 def _prefetch_snapshots(symbols: List[str]) -> None:
@@ -126,15 +133,32 @@ def _passes_guardrails(symbol: str, bull_regime: bool = None, market_state: Opti
     # return_reason is now an explicit argument
     try:
         # ── Fast path: use batch-prefetched snapshot (no per-symbol HTTP call) ─
+        # Only trusted if latest_trade itself is recent — an unbounded-age snapshot
+        # (thin after-hours book, dead feed for this symbol) previously fed straight
+        # into every guardrail with no check at all.
         _snap = _snapshot_cache.get(symbol)
+        _snap_fresh = False
         if (
             _snap is not None
             and _snap.daily_bar is not None
             and _snap.latest_trade is not None
         ):
+            _trade_ts = getattr(_snap.latest_trade, "timestamp", None)
+            if _trade_ts is None:
+                _snap_fresh = True  # no timestamp to check — trust it, same as before
+            else:
+                if _trade_ts.tzinfo is None:
+                    _trade_ts = _trade_ts.replace(tzinfo=datetime.timezone.utc)
+                _snap_age = (datetime.datetime.now(datetime.timezone.utc) - _trade_ts).total_seconds()
+                _snap_fresh = _snap_age <= _SNAPSHOT_STALE_SECONDS
+                if not _snap_fresh:
+                    _log.debug(f"[GUARDRAIL] {symbol}: snapshot stale ({_snap_age:.0f}s) — falling back to fresh intraday bars")
+
+        if _snap_fresh:
             price   = float(_snap.latest_trade.price)
             day_vol = float(_snap.daily_bar.volume)
             open_px = float(_snap.daily_bar.open)
+            prev_close = float(_snap.previous_daily_bar.close) if _snap.previous_daily_bar else 0.0
             intraday = None
         else:
             # ── Fallback: fetch 1-min intraday bars ───────────────────────────
@@ -146,6 +170,7 @@ def _passes_guardrails(symbol: str, bull_regime: bool = None, market_state: Opti
             price   = float(intraday["close"].iloc[-1])
             day_vol = float(intraday["volume"].sum())
             open_px = float(intraday["open"].iloc[0])
+            prev_close = 0.0  # not available without an extra daily-bars call
 
         # Resolve regime and VIX before adaptive gates
         vix = None
@@ -219,6 +244,33 @@ def _passes_guardrails(symbol: str, bull_regime: bool = None, market_state: Opti
                 return False, 'dollar_vol'
             return False
 
+        # Liquidity / quality floor — skip thin, low-float, micro-cap names prone to
+        # violent, illiquid moves after hours (see BIOA 2026-07-31: repeated overnight
+        # buy-then-stop cycles on a low-float, thinly traded ticker). Applies at all
+        # times, not just regular hours — that's exactly when the risk shows up.
+        daily = get_bars(symbol, "5d", "1d")
+        if not daily.empty and len(daily) >= 2:
+            avg_daily_vol = float(daily["volume"].iloc[:-1].mean())
+            if avg_daily_vol < MIN_AVG_DAILY_VOLUME:
+                _log.warning(f"[GUARDRAIL] {symbol} blocked: avg daily volume {avg_daily_vol:.0f} < {MIN_AVG_DAILY_VOLUME:.0f}")
+                if return_reason:
+                    return False, 'avg_volume'
+                return False
+
+        shares_float = _get_float_shares(symbol)
+        if shares_float is not None and shares_float < MIN_FLOAT_SHARES:
+            _log.warning(f"[GUARDRAIL] {symbol} blocked: float {shares_float/1e6:.1f}M < {MIN_FLOAT_SHARES/1e6:.0f}M")
+            if return_reason:
+                return False, 'low_float'
+            return False
+
+        market_cap = _get_market_cap(symbol)
+        if market_cap is not None and market_cap < MIN_MARKET_CAP:
+            _log.warning(f"[GUARDRAIL] {symbol} blocked: market cap ${market_cap/1e6:.0f}M < ${MIN_MARKET_CAP/1e6:.0f}M")
+            if return_reason:
+                return False, 'low_mcap'
+            return False
+
         # RVOL gate (adaptive)
         if market_state.is_market_open and bull:
             daily = get_bars(symbol, "5d", "1d")
@@ -255,24 +307,30 @@ def _passes_guardrails(symbol: str, bull_regime: bool = None, market_state: Opti
             else:
                 adaptive_gap = max(12.0, base_gap - 3.0)
 
-        # Gap-chase guard: skip if up >adaptive_gap% without a tight consolidation base
-        if open_px > 0:
-            day_gain = ((price - open_px) / open_px) * 100
-            if day_gain > adaptive_gap:
-                # When 1-min bars are available, require tight recent consolidation.
-                # With snapshot-only data, skip the consolidation check (conservative:
-                # allows the signal — strategy-level filters apply next).
-                _snap_fast_path = _snapshot_cache.get(symbol) is not None and \
-                    _snapshot_cache[symbol].daily_bar is not None and \
-                    _snapshot_cache[symbol].latest_trade is not None
-                if not _snap_fast_path:
-                    last_n    = intraday.iloc[-GAP_CHASE_CONSOL_BARS:]
-                    bar_range = float(last_n["high"].max() - last_n["low"].min())
-                    if bar_range > price * 0.02:  # range > 2% = no consolidation
-                        _log.debug(f"[GUARDRAIL] {symbol} blocked: gap chase, bar range {bar_range:.2f} > 2% of price {price:.2f}")
-                        if return_reason:
-                            return False, 'gap_chase'
-                        return False
+        # Gap-chase guard: skip if up >adaptive_gap% without a tight consolidation base.
+        # Checked against BOTH today's tracked open (intraday chase) and the prior
+        # close (overnight/pre-market gap) — a stock that already gapped huge before
+        # its first tracked bar of the day would show ~0% day_gain and slip through
+        # the open_px check alone, since that check resets its baseline to the
+        # already-elevated open.
+        gap_vs_open  = ((price - open_px) / open_px) * 100 if open_px > 0 else 0.0
+        gap_vs_prev  = ((price - prev_close) / prev_close) * 100 if prev_close > 0 else 0.0
+        if GAP_CHASE_GUARD_ENABLED and max(gap_vs_open, gap_vs_prev) > adaptive_gap:
+            # Always check for consolidation on gapped-up stocks, even on snapshot path.
+            # This is a critical risk-management gate to avoid chasing.
+            # If intraday bars weren't fetched before, get them now.
+            if intraday is None:
+                intraday = get_bars(symbol, "1d", "1m")
+
+            if intraday is not None and not intraday.empty and len(intraday) >= GAP_CHASE_CONSOL_BARS:
+                last_n = intraday.iloc[-GAP_CHASE_CONSOL_BARS:]
+                bar_range = float(last_n["high"].max() - last_n["low"].min())
+                # If the range of the last few bars is > 2% of the price, it's not consolidating.
+                if bar_range > price * 0.02:
+                    _log.debug(f"[GUARDRAIL] {symbol} blocked: gap chase, bar range {bar_range:.2f} > 2% of price {price:.2f}")
+                    if return_reason:
+                        return False, 'gap_chase'
+                    return False
 
         if return_reason:
             return True, None
@@ -299,10 +357,11 @@ def get_scan_targets(excluded: Set[str] = None) -> List[str]:
 
     # Universe health check
     _MIN_TI = 5
-    if len(ti_primary) == 0:
-        _log.error("[UNIVERSE HEALTH] ti_primary.json is empty! No tickers to scan. Check data pipeline.")
-    elif len(ti_primary) < _MIN_TI:
-        _log.warning(f"[UNIVERSE HEALTH] ti_primary.json too small ({len(ti_primary)}). Falling back to static config lists.")
+    if len(ti_primary) < _MIN_TI:
+        if len(ti_primary) == 0:
+            _log.error("[UNIVERSE HEALTH] ti_primary.json is empty! No tickers to scan. Check data pipeline.")
+        else:
+            _log.warning(f"[UNIVERSE HEALTH] ti_primary.json too small ({len(ti_primary)}). Falling back to static config lists.")
         p1, p2, _ = _cfg.get_dynamic_universe()
         # Alert if static lists are also empty
         if len(p1) + len(p2) == 0:
@@ -310,33 +369,20 @@ def get_scan_targets(excluded: Set[str] = None) -> List[str]:
     else:
         p1, p2 = ti_primary, []
 
-    # live_p1/p2 = same as p1/p2 (TI-primary); kept for TI_FRONT push below.
-    live_p1 = p1
-    live_p2 = p2
-
     # Limit how many fresh TI primary tickers are guaranteed into each cycle.
     # This keeps the scan set tight and avoids scanning excessively large TI batches.
     max_fresh = min(_cfg.TI_PRIMARY_SCAN_BATCH_LIMIT, SCAN_MAX_SYMBOLS)
-    latest_batch = ti_primary[:max_fresh] if ti_primary else [
-        s for s in _get_latest_batch(window_minutes=5)
-        if s not in delisted
-    ]
-    latest_batch = list(dict.fromkeys(latest_batch))[:max_fresh]
+    latest_batch = list(dict.fromkeys(ti_primary))[:max_fresh]
 
     # Rotate through the combined universe so every cycle scans a different slice.
     # TI-promoted tickers sit at the front and always make it in regardless of offset.
-    combined_base = p2 + p1   # tier-2 first in bear, then tier-1
-    slice_size = max(SCAN_MAX_SYMBOLS * 2, len(combined_base))   # rotation window
+    combined_base = list(dict.fromkeys(p2 + p1))   # tier-2 first in bear, then tier-1
     if len(combined_base) > 0:
         off = _scan_offset % len(combined_base)
         rotated_base = combined_base[off:] + combined_base[:off]
+        _scan_offset = (_scan_offset + SCAN_MAX_SYMBOLS) % len(combined_base)
     else:
-        rotated_base = combined_base
-    _scan_offset = (_scan_offset + SCAN_MAX_SYMBOLS) % max(len(combined_base), 1)
-
-    # Default slice: top 50% from each list (marketscope360 + highshortfloat)
-    p1_slice = p1[:max(1, len(p1) // 2)]
-    p2_slice = p2[:max(1, len(p2) // 2)]
+        rotated_base = []
 
     in_bear = not _is_bull_regime()
     targets = []
@@ -356,15 +402,6 @@ def get_scan_targets(excluded: Set[str] = None) -> List[str]:
             seen.add(s)
             targets.append(s)
 
-    # TI-latest-batch guarantee: push a capped slice of TI primary tickers so
-    # they appear in every cycle regardless of universe size.
-    # NOTE: do NOT override the max_fresh cap here — the original assignment above
-    # already limits to TI_PRIMARY_SCAN_BATCH_LIMIT so BEAR_SHORT_UNIVERSE has room.
-    if not latest_batch:
-        # Fallback: guarantee top-N newest from each tier
-        TI_FRONT = 10
-        latest_batch = list(dict.fromkeys(live_p1[:TI_FRONT] + live_p2[:TI_FRONT]))
-
     if in_bear:
         # Always seed with inverse ETFs first — they are valid longs in bear regime
         _push(_INVERSE_ETFS)
@@ -383,8 +420,6 @@ def get_scan_targets(excluded: Set[str] = None) -> List[str]:
         _push(_get_priority_scan_queue())
         _push(latest_batch)
         _push(rotated_base, limit=SCAN_MAX_SYMBOLS)
-        if len(targets) < SCAN_MAX_SYMBOLS:
-            _push(p1_slice + p2_slice, limit=SCAN_MAX_SYMBOLS)
 
     return targets
 
@@ -413,6 +448,9 @@ def scan_universe(scan_targets: List[str], sentiment: str, market_state: MarketS
         'rvol': 0,
         'gap_chase': 0,
         'min_price': 0,
+        'avg_volume': 0,
+        'low_float': 0,
+        'low_mcap': 0,
         'other': 0
     }
 
@@ -446,7 +484,18 @@ def scan_universe(scan_targets: List[str], sentiment: str, market_state: MarketS
 
         if not candidates:
             return None
-        return max(candidates, key=lambda s: s.confidence)
+        best = max(candidates, key=lambda s: s.confidence)
+
+        # Per-symbol HMM regime alignment: confidence bonus only, never a gate.
+        # Buys get a boost when the symbol's own 2-state HMM regime is bullish;
+        # shorts/sells get it when that regime is bearish.
+        hmm_bull = get_hmm_regime(symbol, HMM_REGIME_LOOKBACK_DAYS)
+        if hmm_bull is not None:
+            aligned = (best.action == "buy" and hmm_bull) or (best.action in ("sell", "short") and not hmm_bull)
+            if aligned:
+                best.confidence = round(min(best.confidence + HMM_REGIME_CONFIDENCE_BOOST, 0.97), 3)
+
+        return best
 
 
 
@@ -466,7 +515,13 @@ def scan_universe(scan_targets: List[str], sentiment: str, market_state: MarketS
     # Log guardrail rejection summary
     total_rejected = sum(guardrail_rejections.values())
     if total_rejected > 0:
-        _log.info(f"[GUARDRAIL SUMMARY] Rejected: {total_rejected} | DollarVol: {guardrail_rejections['dollar_vol']} | RVOL: {guardrail_rejections['rvol']} | GapChase: {guardrail_rejections['gap_chase']} | MinPrice: {guardrail_rejections['min_price']} | Other: {guardrail_rejections['other']}")
+        _log.info(
+            f"[GUARDRAIL SUMMARY] Rejected: {total_rejected} | DollarVol: {guardrail_rejections['dollar_vol']} | "
+            f"RVOL: {guardrail_rejections['rvol']} | GapChase: {guardrail_rejections['gap_chase']} | "
+            f"MinPrice: {guardrail_rejections['min_price']} | AvgVolume: {guardrail_rejections['avg_volume']} | "
+            f"LowFloat: {guardrail_rejections['low_float']} | LowMcap: {guardrail_rejections['low_mcap']} | "
+            f"Other: {guardrail_rejections['other']}"
+        )
 
     signals.sort(key=lambda x: x.confidence, reverse=True)
     # Adaptive confidence filter using pre-intelligence (market regime, VIX)

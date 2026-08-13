@@ -129,7 +129,6 @@ def build_top5_report(signals, report_date: date, sentiment: str = "neutral",
     # Strategy insight blurbs
     _strat_insight = {
         "TrendBreaker":    "Shorts trapped above key MA — squeeze in progress",
-        "Sweepea":         "Liquidity swept below support, pinbar reversal forming",
         "GapBreakout":     "Gap-up continuation — momentum carrying overnight move",
         "ORB":             "Opening range cleared — intraday breakout confirmed",
         "VWAPReclaim":     "VWAP reclaimed with volume — institutional buying",

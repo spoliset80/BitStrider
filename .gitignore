@@ -10,8 +10,8 @@ env/
 
 # Logs and runtime files
 *.log
-autobot.log
-apextrader.log
+autobot.log*
+apextrader.log*
 *.pid
 *.lock
 
@@ -49,3 +49,14 @@ dist/
 *.egg-info/
 *.egg
 /apextrader
+
+# Backup files
+*.bak
+
+# Bundled third-party driver docs (not project source)
+/.drivers/
+
+# graphify: regenerable/machine-local artifacts
+/graphify-out/cache/
+/graphify-out/.graphify_python
+/graphify-out/.graphify_root

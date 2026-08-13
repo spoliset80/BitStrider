@@ -152,6 +152,9 @@ def _is_valid_ti_ticker(sym: str) -> bool:
         return False
     if s in _IGNORE or s in _TI_SCRAPE_GARBAGE:
         return False
+    from engine.never_trade import is_never_trade  # noqa: E402
+    if is_never_trade(s):
+        return False
     return True
 
 
@@ -891,7 +894,10 @@ def scrape_tradeideas(
 
     # Persist the latest captured TI universe as the primary scan source.
     all_tickers: list[str] = []
-    for tickers in results.values():
+    for scan_key, tickers in results.items():
+        # Exclude unusual options tickers from the primary equity scan universe
+        if scan_key == "unusualoptionsvolume":
+            continue
         all_tickers.extend(tickers)
     clean_primary = [t for t in dict.fromkeys(all_tickers) if _is_valid_ti_ticker(t)]
     if len(clean_primary) >= _MIN_SCRAPE_TICKERS:
@@ -979,13 +985,22 @@ def main() -> None:
     if args.loop > 0:
         print(f"[INFO ] Loop mode — capturing every {args.loop}s. Ctrl+C to stop.")
         while True:
-            scrape_tradeideas(
-                update_config=args.update_config,
-                chrome_profile=args.chrome_profile,
-                select_minutes=select_minutes,
-                include_toplists=args.include_toplists,
-                remote_debug_port=args.remote_debug_port,
-            )
+            try:
+                scrape_tradeideas(
+                    update_config=args.update_config,
+                    chrome_profile=args.chrome_profile,
+                    select_minutes=select_minutes,
+                    include_toplists=args.include_toplists,
+                    remote_debug_port=args.remote_debug_port,
+                )
+            except Exception as exc:
+                # An uncaught exception here used to kill the whole scheduled task —
+                # e.g. a locked Edge profile crashed the loop for 30+ hours until the
+                # next 08:00/logon trigger (2026-08-03). Log and retry next interval
+                # instead; drop the driver singleton so the retry opens fresh.
+                global _edge_driver
+                print(f"[ERROR] Scrape cycle failed: {exc} — retrying in {args.loop}s")
+                _edge_driver = None
             print(f"[INFO ] Sleeping {args.loop}s …")
             time.sleep(args.loop)
     else:
@@ -1000,4 +1015,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
