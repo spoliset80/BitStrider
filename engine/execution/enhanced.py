@@ -210,8 +210,8 @@ class EnhancedExecutor:
     # -- Position Cache ----------------------------------------------------
     def _find_weakest_position(self) -> Optional[str]:
         """Return the symbol of the open long position with the worst unrealized P&L %.
-        Only considers longs with no shares held for pending orders (closable immediately).
-        Skips positions entered today (protected for full day) and those already closed this cycle.
+        Only considers active longs (price > 0) with no shares held for pending orders.
+        Skips positions entered today and those already closed this cycle.
         Returns None if no closable position found."""
         try:
             today = datetime.date.today()
@@ -219,9 +219,10 @@ class EnhancedExecutor:
                 sym for sym, info in self._entry_log.items()
                 if info.get("date") == today
             }
-            positions = self.client.get_all_positions()
+            # Use _get_positions() so inactive/dead positions are already excluded
+            active = self._get_positions().positions_dict.values()
             longs = [
-                p for p in positions
+                p for p in active
                 if float(p.qty) > 0
                 and float(getattr(p, "qty_available", p.qty)) > 0
                 and p.symbol not in self._swap_cycle_closed
@@ -427,8 +428,7 @@ class EnhancedExecutor:
                     except Exception as e:
                         err_str = str(e)
                         if "40310100" in err_str:
-                            # Alpaca PDT protection: position was entered today — can't close same day.
-                            # Mark as today's entry so it's never selected as swap candidate again.
+                            # Alpaca PDT protection: position was entered today.
                             self._entry_log[weakest] = {
                                 "strategy": "restored",
                                 "date": datetime.date.today(),
@@ -437,6 +437,18 @@ class EnhancedExecutor:
                             log.warning(
                                 f"SWAP skip {weakest}: PDT same-day protection (40310100) — "
                                 f"marked as today entry, will not retry this session"
+                            )
+                            # Don't block the new signal — allow entry without the swap
+                        elif "40010001" in err_str or "not active" in err_str.lower():
+                            # Asset is inactive/delisted — add to entry_log so _find_weakest skips it
+                            self._entry_log[weakest] = {
+                                "strategy": "inactive",
+                                "date": datetime.date.today(),
+                                "confidence": 0.0,
+                            }
+                            log.warning(
+                                f"SWAP skip {weakest}: asset not active (40010001) — "
+                                f"excluded from future swaps, allowing entry for {signal.symbol}"
                             )
                             # Don't block the new signal — allow entry without the swap
                         else:
