@@ -42,6 +42,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
+log = logging.getLogger("ApexTrader")
+
 # ── optional PIL for timestamp overlay ──────────────────────────
 try:
     from PIL import Image, ImageDraw
@@ -75,12 +77,12 @@ TI_PRIMARY_FILE = REPO_ROOT / "data" / "ti_primary.json"
 # ── Trade Ideas scan URLs ────────────────────────────────────────
 SCANS: dict[str, dict] = {
     "highshortfloat": {
-        "url":    "https://www.trade-ideas.com/TIPro/highshortfloat/",
+        "url":    "https://www.trade-ideas.com/stock-market-dashboard/",
         "label":  "high_short_float",
         "target": "PRIORITY_2_ESTABLISHED",   # squeeze / short-float candidates
     },
     "marketscope360": {
-        "url":    "https://www.trade-ideas.com/TIPro/marketscope360/",
+        "url":    "https://www.trade-ideas.com/stock-market-dashboard/",
         "label":  "market_scope_360",
         "target": "PRIORITY_1_MOMENTUM",      # momentum leaders
     },
@@ -244,9 +246,10 @@ def _create_edge_driver(chrome_profile: Optional[str] = None, remote_debug_port:
 
     opts = EdgeOptions()
     opts.add_argument("--start-maximized")
-    opts.add_argument("--no-sandbox")
+    # NOTE: --no-sandbox and --disable-blink-features=AutomationControlled crash Edge v151+
+    # on Windows (GetHandleVerifier fault). Do NOT add them back.
     opts.add_argument("--disable-dev-shm-usage")
-    opts.add_argument("--disable-blink-features=AutomationControlled")
+    opts.add_argument("--disable-gpu")
     opts.add_argument("--log-level=3")
     opts.add_argument("--disable-logging")
     opts.add_argument("--silent")
@@ -261,10 +264,16 @@ def _create_edge_driver(chrome_profile: Optional[str] = None, remote_debug_port:
     if remote_debug_port > 0:
         opts.add_argument(f"--remote-debugging-port={remote_debug_port}")
 
-    if chrome_profile:
-        user_data = os.path.expandvars(r"%LOCALAPPDATA%\Microsoft\Edge\User Data")
-        opts.add_argument(f"--user-data-dir={user_data}")
-        opts.add_argument(f"--profile-directory={chrome_profile}")
+    # Always use a dedicated temp profile dir — avoids locking the main Edge
+    # installation (Profile 3 / User Data) which causes DevToolsActivePort crashes.
+    # Login state is preserved across bot restarts via the re-attach mechanism
+    # (remote-debugging-port=9222 + _try_attach_edge).
+    import tempfile as _tf
+    _edge_user_data = os.path.join(os.environ.get("TEMP", _tf.gettempdir()), "edge_ti_scraper")
+    os.makedirs(_edge_user_data, exist_ok=True)
+    opts.add_argument(f"--user-data-dir={_edge_user_data}")
+    # Note: --profile-directory is intentionally omitted — combining it with a
+    # custom user-data-dir causes Edge to crash on Windows (DevToolsActivePort fault).
 
     existing = _find_existing_edgedriver()
     if existing:
@@ -279,11 +288,30 @@ def _create_edge_driver(chrome_profile: Optional[str] = None, remote_debug_port:
     try:
         driver = webdriver.Edge(service=service, options=opts)
     except SessionNotCreatedException as e:
-        if chrome_profile:
-            raise RuntimeError(
-                f"Edge profile '{chrome_profile}' is locked/busy — close Edge first."
-            ) from e
-        raise e
+        if chrome_profile and "locked" in str(e).lower():
+            # Profile is locked by a running Edge instance that wasn't started with
+            # --remote-debugging-port.  Re-try without a profile so the bot can still
+            # open a fresh Edge window.  User will need to log in to Trade Ideas manually.
+            log.warning(
+                f"Edge profile '{chrome_profile}' is locked — opening a fresh Edge window instead. "
+                "Log in to trade-ideas.com in the new window to enable TI scraping."
+            )
+            opts_fresh = EdgeOptions()
+            for arg in opts.arguments:
+                if "--user-data-dir" not in arg and "--profile-directory" not in arg:
+                    opts_fresh.add_argument(arg)
+            for k, v in (opts.experimental_options or {}).items():
+                opts_fresh.add_experimental_option(k, v)
+            driver = webdriver.Edge(service=service, options=opts_fresh)
+        # Cached driver version doesn't match the installed Edge — download the correct one
+        elif existing and "only supports Microsoft Edge version" in str(e):
+            log.warning(f"Cached msedgedriver version mismatch — downloading correct driver. ({e})")
+            service = EdgeService(EdgeChromiumDriverManager().install())
+            if _sys.platform == "win32":
+                service.creation_flags = _sp.CREATE_NO_WINDOW
+            driver = webdriver.Edge(service=service, options=opts)
+        else:
+            raise e
 
     driver.set_page_load_timeout(45)
     driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")

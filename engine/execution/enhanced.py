@@ -42,7 +42,7 @@ from engine.config import (
     MIN_BUYING_POWER_PCT, MIN_POSITION_DOLLARS, PDT_WARN_AT_REMAINING,
     TAKE_PROFIT_NORMAL, TAKE_PROFIT_HIGH, STOP_LOSS_PCT,
     ATR_TP_RATIO, MAX_SHORT_FLOAT_PCT, HIGH_SHORT_FLOAT_STOCKS, is_high_short_float,
-    EOD_CLOSE_ENABLED, EOD_CLOSE_TIME, EOD_CLOSE_STRATEGIES,
+    EOD_CLOSE_ENABLED, EOD_CLOSE_ALL, EOD_CLOSE_TIME, EOD_CLOSE_STRATEGIES,
     LONG_ONLY_MODE,
     STALE_ORDER_MINUTES, STALE_ORDER_MINUTES_INTRADAY,
     KILL_MODE_TRAIL_PCT,
@@ -50,6 +50,7 @@ from engine.config import (
     SMALL_ACCOUNT_MIN_POSITION_DOLLARS,
     POSITION_SIZE_PCT, SMALL_ACCOUNT_POSITION_SIZE_PCT,
     CONF_SCALE_MIN_MULT, CONF_SCALE_FULL_CONF,
+    MARGIN_LEVERAGE,
     LIVE,
 )
 from engine.equity.strategies import Signal
@@ -526,11 +527,12 @@ class EnhancedExecutor:
             order = self.client.submit_order(entry_req)
             self.order_cache[signal.symbol] = order.id
 
-            # Store ATR-based TP target — checked each scan cycle by check_tp_targets()
-            if signal.atr_stop and signal.atr_stop > 0:
-                _sl, _tp = self._calculate_bracket_prices(signal, risk_info, order_type)
-                self._tp_targets[signal.symbol] = _tp
-                log.info(f"TP target set {signal.symbol}: ${_tp:.2f} (ATR R:R {ATR_TP_RATIO}:1)")
+            # Always set a TP target — checked each cycle by check_tp_targets()
+            from engine.config import TAKE_PROFIT_PCT as _TP_PCT
+            _tp = round(signal.price * (1 + _TP_PCT / 100), 2) if order_type == OrderType.LONG \
+                else round(signal.price * (1 - _TP_PCT / 100), 2)
+            self._tp_targets[signal.symbol] = _tp
+            log.info(f"TP target set {signal.symbol}: ${_tp:.2f} (+{_TP_PCT:.0f}% {'long' if order_type == OrderType.LONG else 'short'})")
 
         except Exception as e:
             err = str(e).lower()
@@ -555,33 +557,25 @@ class EnhancedExecutor:
                 log.error(f"Bracket order failed {signal.symbol}: {e}")
             return False
 
-        # ── Step 2: Trailing stop — best-effort; entry already filled ────────
-        # On live accounts, skip the same-day trailing stop — PDT rules block GTC
-        # SELL legs on shares entered today.  protect_positions() re-places it next
-        # session when the position is no longer same-day restricted.
-        # Inverse ETFs (SOXS, DUST, UVXY …) may also reject a GTC trailing stop
-        # with 40310000.  This must NOT cancel the entry or disable shorting.
-        if LIVE:
-            log.info(
-                f"Trailing stop deferred {signal.symbol} (live same-day entry) — "
-                "protect_positions() will place it next session"
+        # ── Step 2: Trailing stop — placed immediately on all accounts ─────────
+        # PDT is disabled (PDT_ACCOUNT_MIN=0) so same-day GTC stops are allowed.
+        # Inverse ETFs may reject with 40310000 — that is non-fatal; TP target
+        # set above will still trigger a market close when price is reached.
+        try:
+            ts_req = TrailingStopOrderRequest(
+                symbol        = signal.symbol,
+                qty           = shares,
+                side          = stop_side,
+                type          = AlpacaOrderType.TRAILING_STOP,
+                time_in_force = TimeInForce.GTC,
+                trail_percent = trail_pct,
             )
-        else:
-            try:
-                ts_req = TrailingStopOrderRequest(
-                    symbol        = signal.symbol,
-                    qty           = shares,
-                    side          = stop_side,
-                    type          = AlpacaOrderType.TRAILING_STOP,
-                    time_in_force = TimeInForce.GTC,
-                    trail_percent = trail_pct,
-                )
-                self.client.submit_order(ts_req)
-            except Exception as e:
-                log.warning(
-                    f"Trailing stop skipped {signal.symbol} (entry filled): {e} — "
-                    "protect_positions() will re-place next cycle"
-                )
+            self.client.submit_order(ts_req)
+        except Exception as e:
+            log.warning(
+                f"Trailing stop skipped {signal.symbol} (entry filled): {e} — "
+                "TP target and EOD close will handle the exit"
+            )
 
         self._log_bracket(signal, shares, risk_info, trail_pct, None, order_type)
         return True
@@ -732,16 +726,29 @@ class EnhancedExecutor:
 
         risk_info = calculate_risk_adjusted_size(acct.equity, signal.symbol, market_price if market_price > 0 else signal.price)
 
-        # Scale dollar_amount by confidence: 0.50× at floor (MIN_SIGNAL_CONFIDENCE) → 1.0× at 0.85+
+        # 4× margin gate: verify the stock is marginable before applying leverage
+        if MARGIN_LEVERAGE > 1.0:
+            try:
+                asset = self.client.get_asset(signal.symbol)
+                if not getattr(asset, "marginable", True):
+                    log.info(
+                        f"Skip {signal.symbol}: not marginable — "
+                        f"{MARGIN_LEVERAGE:.0f}× leverage requires a marginable stock (price ≥ $5, major exchange)"
+                    )
+                    return False
+            except Exception as _e:
+                log.debug(f"Marginable check failed for {signal.symbol}: {_e} — proceeding without leverage guard")
         from engine.config import MIN_SIGNAL_CONFIDENCE
         _conf_floor = MIN_SIGNAL_CONFIDENCE
         _conf_mult = CONF_SCALE_MIN_MULT + (1.0 - CONF_SCALE_MIN_MULT) * min(
             1.0, max(0.0, (signal.confidence - _conf_floor) / (CONF_SCALE_FULL_CONF - _conf_floor))
         )
         risk_info = dict(risk_info, dollar_amount=round(risk_info["dollar_amount"] * _conf_mult, 2))
+        if MARGIN_LEVERAGE > 1.0:
+            risk_info = dict(risk_info, dollar_amount=round(risk_info["dollar_amount"] * MARGIN_LEVERAGE, 2))
         log.debug(
-            f"[SIZE] {signal.symbol} conf={signal.confidence:.0%} → "
-            f"scale={_conf_mult:.2f}× → ${risk_info['dollar_amount']:,.0f}"
+            f"[SIZE] {signal.symbol} conf={signal.confidence:.0%} "
+            f"scale={_conf_mult:.2f}× leverage={MARGIN_LEVERAGE:.0f}× → ${risk_info['dollar_amount']:,.0f}"
         )
 
         shares, skip_reason = self._size_with_buying_power(acct.buying_power, signal, risk_info, order_type)
@@ -796,7 +803,7 @@ class EnhancedExecutor:
             if self._create_bracket_order(market_signal, shares, risk_info, order_type):
                 self.pdt.add(datetime.date.today())
                 self._entry_log[signal.symbol] = {"strategy": signal.strategy, "date": datetime.date.today(), "confidence": signal.confidence}
-                self._swap_cycle_closed.add(signal.symbol)  # protect from same-cycle swap-out
+                # No swap protection — position can be re-evaluated immediately
                 self._get_positions(force_refresh=True)
                 self._get_account(force_refresh=True)
                 return True
@@ -804,7 +811,7 @@ class EnhancedExecutor:
         if self._create_simple_order(market_signal, shares, order_type):
             self.pdt.add(datetime.date.today())
             self._entry_log[signal.symbol] = {"strategy": signal.strategy, "date": datetime.date.today(), "confidence": signal.confidence}
-            self._swap_cycle_closed.add(signal.symbol)  # protect from same-cycle swap-out
+            # No swap protection — position can be re-evaluated immediately
             self._get_positions(force_refresh=True)
             self._get_account(force_refresh=True)
             return True
@@ -958,6 +965,10 @@ class EnhancedExecutor:
             if qty_available <= 0:
                 continue
 
+            if pos.qty is None or pos.current_price is None:
+                log.warning(f"protect_positions {sym}: missing market data (price={pos.current_price}, qty={pos.qty}), skipping")
+                continue
+
             try:
                 qty         = int(float(pos.qty))
                 avail       = abs(qty_available)
@@ -1070,8 +1081,8 @@ class EnhancedExecutor:
         close_h, close_m = map(int, EOD_CLOSE_TIME.split(":"))
         if now_et.hour < close_h or (now_et.hour == close_h and now_et.minute < close_m):
             return None  # Not yet EOD close time
-        if now_et.hour >= 16:
-            return None  # Market already closed
+        if now_et.hour >= 20:
+            return None  # Extended hours ended
 
         today = datetime.date.today()
         if getattr(self, "_eod_close_done", None) == today:
@@ -1093,12 +1104,13 @@ class EnhancedExecutor:
                 continue
 
             entry_info = self._entry_log.get(sym)
-            if not entry_info:
-                continue
-            if entry_info.get("date") != today:
-                continue
-            if entry_info.get("strategy") not in EOD_CLOSE_STRATEGIES:
-                continue
+            if not EOD_CLOSE_ALL:
+                if not entry_info:
+                    continue
+                if entry_info.get("date") != today:
+                    continue
+                if entry_info.get("strategy") not in EOD_CLOSE_STRATEGIES:
+                    continue
 
             try:
                 # Cancel only DAY-TIF orders holding shares for this symbol before

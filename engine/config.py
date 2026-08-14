@@ -315,11 +315,14 @@ STOCKS = {
 # ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 # Trading Parameters ΓÇö Swing Trading Optimized
 # ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
-MAX_POSITIONS        = 12     # was 10 — 6.0% × 12 = 72% equity ceiling; options takes 35% → total 95%+ (aggressive)
+MAX_POSITIONS        = int(os.getenv("MAX_POSITIONS", "12"))  # max open stock positions; override via .env
 # When full, close the weakest position to make room if new signal conf > this threshold
 SWAP_ON_FULL         = True   # enabled — close weakest position for a better signal when full
 SWAP_MIN_CONFIDENCE  = 0.68   # was 0.75 — lower threshold → more aggressive swaps
-POSITION_SIZE_PCT    = 6.0    # was 5.0% → 6.0% per position = larger positions (aggressive no-PDT)
+POSITION_SIZE_PCT    = float(os.getenv("POSITION_SIZE_PCT", "6.0"))  # % of equity per position; override via .env
+# Margin leverage multiplier: 1.0 = no leverage, 4.0 = 4× intraday margin (requires margin account + marginable stock)
+# Only stocks flagged marginable=True by Alpaca are eligible when MARGIN_LEVERAGE > 1.0
+MARGIN_LEVERAGE      = float(os.getenv("MARGIN_LEVERAGE", "1.0"))
 USE_RISK_EQUALIZED_SIZING = False  # use fixed position sizing instead of risk-scaled
 RISK_PER_TRADE_PCT   = 0.8    # Risk 0.8% of account per trade (unused with fixed sizing)
 
@@ -334,11 +337,11 @@ SMALL_ACCOUNT_POSITION_SIZE_PCT = 5.0   # same 5.0% allocation for small account
 SMALL_ACCOUNT_RISK_PER_TRADE_PCT = 0.5 # lower risk per trade for small accounts
 SMALL_ACCOUNT_MIN_POSITION_DOLLARS = 5.0  # lowered to allow ~$5 entry for cheap tickers
 
-# Tiered Profit Targets — aggressive no-PDT: book profits at 25% quickly
-TAKE_PROFIT_EXTREME  = 25.0   # was 35% — same as HIGH (no distinction needed)
-TAKE_PROFIT_HIGH     = 25.0   # was 25% — PRIMARY TARGET: 25% profit
-TAKE_PROFIT_MEDIUM   = 20.0   # was 18% — scaled down from higher tiers
-TAKE_PROFIT_NORMAL   = 15.0   # was 12% — catch smaller moves
+# Tiered Profit Targets — all tiers overridable via .env (e.g. TAKE_PROFIT_NORMAL=15)
+TAKE_PROFIT_EXTREME  = float(os.getenv("TAKE_PROFIT_EXTREME", "25.0"))
+TAKE_PROFIT_HIGH     = float(os.getenv("TAKE_PROFIT_HIGH",    "25.0"))
+TAKE_PROFIT_MEDIUM   = float(os.getenv("TAKE_PROFIT_MEDIUM",  "20.0"))
+TAKE_PROFIT_NORMAL   = float(os.getenv("TAKE_PROFIT_NORMAL",  "15.0"))
 
 # Tiered Trailing Stops — much tighter: lock in gains faster, no PDT concern
 TRAILING_STOP_EXTREME = 8.0   # was 12% — tighter on extreme volatility
@@ -348,7 +351,7 @@ TRAILING_STOP_NORMAL  = 5.0   # was 8% — 5% trailing drawdown = quick exit
 
 # Legacy (backward compat)
 STOP_LOSS_PCT   = 3.0
-TAKE_PROFIT_PCT = 25.0  # aligned with aggressive 25% target
+TAKE_PROFIT_PCT = float(os.getenv("TAKE_PROFIT_PCT", "25.0"))  # legacy alias; override via .env
 
 # ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 # Dynamic ATR-Based Tier Assignment
@@ -544,7 +547,8 @@ FORCE_SCAN = os.getenv("FORCE_SCAN", "false").lower() in ("1", "true", "yes")
 # Intraday strategies should never be held overnight — close by EOD_CLOSE_TIME
 # ─────────────────────────────────────────────────────────────────
 EOD_CLOSE_ENABLED    = True
-EOD_CLOSE_TIME       = "15:50"   # Close intraday positions 10 min before market close
+EOD_CLOSE_ALL        = os.getenv("EOD_CLOSE_ALL", "false").lower() in ("1", "true", "yes")  # close ALL positions at EOD regardless of strategy
+EOD_CLOSE_TIME       = os.getenv("EOD_CLOSE_TIME", "15:50")  # override via .env; default = 10 min before regular close
 EOD_CLOSE_STRATEGIES = {         # Strategy names that must be closed same day
     "FloatRotation",
     "GapBreakout",
@@ -563,7 +567,7 @@ STALE_ORDER_MINUTES_INTRADAY =  30  # intraday strategies (ORB, surge, etc.) —
 # ─────────────────────────────────────────────────────────────────
 # PDT Rules
 # ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
-PDT_ACCOUNT_MIN = 25000.0
+PDT_ACCOUNT_MIN = float(os.getenv("PDT_ACCOUNT_MIN", "25000.0"))  # set to 0 in .env to treat account as always PDT-exempt
 PDT_MAX_TRADES  = 3
 PDT_OPTIONS_DAY_TRADE_RESERVE = int(os.getenv("PDT_OPTIONS_DAY_TRADE_RESERVE", "1"))  # keep at least N day trades free for stock exits
 
@@ -590,13 +594,12 @@ PDT_WARN_AT_REMAINING = int(os.getenv("PDT_WARN_AT_REMAINING", "1"))      # Warn
 SMALL_ACCOUNT_EQUITY_THRESHOLD = float(os.getenv("SMALL_ACCOUNT_EQUITY_THRESHOLD", "5000"))
 SMALL_ACCOUNT_MAX_POSITIONS     = int(os.getenv("SMALL_ACCOUNT_MAX_POSITIONS", "24"))
 
-# Sniper Mode Controls
-# Set to False to allow both long and short (recommended for non-restricted paper trading).
-LONG_ONLY_MODE        = False  # False = allow shorts (paper); True = long-only (live restricted accounts)
-MIN_SIGNAL_CONFIDENCE = 0.72   # Execute signals with confidence >= this (lowered from 0.78 for bear regime coverage)
-MIN_SHORT_CONFIDENCE_BEAR = 0.65  # In bear regime, allow Technical short setups at current confidence scale
-SHORT_FAIL_COOLDOWN_MIN = 5    # Re-try failed short symbols immediately
-MAX_SIGNALS_PER_CYCLE = 3      # Execute at most this many signals per scan cycle
+# Sniper Mode Controls — all overridable via .env
+LONG_ONLY_MODE            = os.getenv("LONG_ONLY_MODE", "false").lower() in ("1", "true", "yes")  # false = long AND short allowed
+MIN_SIGNAL_CONFIDENCE     = float(os.getenv("MIN_SIGNAL_CONFIDENCE",     "0.72"))
+MIN_SHORT_CONFIDENCE_BEAR = float(os.getenv("MIN_SHORT_CONFIDENCE_BEAR", "0.65"))
+SHORT_FAIL_COOLDOWN_MIN   = 5    # Re-try failed short symbols immediately
+MAX_SIGNALS_PER_CYCLE     = int(os.getenv("MAX_SIGNALS_PER_CYCLE", "3"))
 
 # Parallel Scanning
 SCAN_WORKERS        = 8    # Threads scanning symbols concurrently (kept below Alpaca pool defaults)
@@ -722,7 +725,7 @@ BEAR_BREAKDOWN = {
 # Golden Ratio Scanner Guardrails
 # ─────────────────────────────────────────────────────────────────
 RVOL_MIN                 = 1.0         # Require relative volume ≥ 1.0x before entering (adaptive can reduce to 0.4–0.8)
-MIN_STOCK_PRICE          = 1.0         # Skip penny stocks below $1 (poor fill quality, high spread)
+MIN_STOCK_PRICE          = float(os.getenv("MIN_STOCK_PRICE", "0.5"))  # override via .env
 ALPACA_MOVER_SCAN_INTERVAL_MIN = 10   # Re-poll Alpaca screener every 10 min (resets at market open)
 MIN_DOLLAR_VOLUME        = 1_000_000   # Skip illiquid setups: price × day_vol < $1M
 MAX_GAP_CHASE_PCT        = 15.0       # Skip if already up >15% without consolidation
