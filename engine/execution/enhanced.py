@@ -529,6 +529,13 @@ class EnhancedExecutor:
             order = self.client.submit_order(entry_req)
             self.order_cache[signal.symbol] = order.id
 
+            # Set TP target — check_tp_targets() closes full position at +15%
+            from engine.config import TAKE_PROFIT_PCT as _TP_PCT
+            _tp = round(signal.price * (1 + _TP_PCT / 100), 2) if order_type == OrderType.LONG \
+                else round(signal.price * (1 - _TP_PCT / 100), 2)
+            self._tp_targets[signal.symbol] = _tp
+            log.info(f"TP target set {signal.symbol}: ${_tp:.2f} ({_TP_PCT:.0f}% {'long' if order_type == OrderType.LONG else 'short'})")
+
             # Always set a TP target — checked each cycle by check_tp_targets()
             from engine.config import TAKE_PROFIT_PCT as _TP_PCT
             _tp = round(signal.price * (1 + _TP_PCT / 100), 2) if order_type == OrderType.LONG \
@@ -1380,7 +1387,8 @@ class EnhancedExecutor:
 
     # ── ATR Take-Profit Checker ────────────────────────────────────────────────
     def check_tp_targets(self) -> None:
-        """Scale-out at TP: sell 50% at profit target, then trail the remaining 50%.
+        """Close full position at TP (+15%). Trailing stop handles the stop-loss side.
+        Whichever fires first (TP or trailing stop) wins — no scale-out complexity.
         Called once per scan cycle.
         """
         if not self._tp_targets:
@@ -1409,68 +1417,23 @@ class EnhancedExecutor:
             if not hit:
                 continue
 
-            # Already scaled out — trailing stop is active, TP target no longer needed
-            if sym in self._scaled_out:
-                triggered.append(sym)
-                continue
-
-            # Scale-out: sell 50% (ceil so we always close at least 1 share)
-            import math as _math
-            half_qty = max(1, _math.ceil(abs(qty) / 2))
-            side = OrderSide.SELL if is_long else OrderSide.BUY
+            # Close the full position at market — guaranteed profit booking at +15%
             try:
-                req = MarketOrderRequest(
-                    symbol=sym, qty=half_qty,
-                    side=side, time_in_force=TimeInForce.DAY,
+                side = OrderSide.SELL if is_long else OrderSide.BUY
+                req  = MarketOrderRequest(
+                    symbol        = sym,
+                    qty           = abs(qty),
+                    side          = side,
+                    time_in_force = TimeInForce.DAY,
                 )
                 self.client.submit_order(req)
                 log.info(
-                    f"TP SCALEOUT {sym}: ${cur_price:.2f} hit target ${tp_price:.2f} — "
-                    f"selling {half_qty}/{abs(qty)} shares (50%)"
+                    f"TP HIT {sym}: ${cur_price:.2f} {'>=  ' if is_long else '<= '}"
+                    f"${tp_price:.2f} → market {'sell' if is_long else 'buy-to-cover'} (full position)"
                 )
+                triggered.append(sym)
             except Exception as e:
-                log.warning(f"TP scaleout sell failed {sym}: {e}")
-                continue
-
-            # Cancel the entry trailing stop before placing the tighter scale-out stop
-            # (avoids two GTC stops competing for the same shares)
-            # Place tight trailing stop on the remaining half
-            remaining = abs(qty) - half_qty
-            if remaining > 0:
-                stop_side = OrderSide.SELL if is_long else OrderSide.BUY
-                try:
-                    # Cancel any active trailing stop on this symbol first
-                    open_orders = self.client.get_orders() or []
-                    for o in open_orders:
-                        if (o.symbol == sym
-                                and str(getattr(o, "type", "")).lower() == "trailing_stop"
-                                and str(getattr(o, "time_in_force", "")).upper() == "GTC"):
-                            try:
-                                self.client.cancel_order_by_id(str(o.id))
-                                log.info(f"TP TRAIL {sym}: cancelled entry trailing stop (id={o.id})")
-                            except Exception:
-                                pass
-                except Exception:
-                    pass
-                try:
-                    trail_req = TrailingStopOrderRequest(
-                        symbol=sym,
-                        qty=remaining,
-                        side=stop_side,
-                        type=AlpacaOrderType.TRAILING_STOP,
-                        time_in_force=TimeInForce.GTC,
-                        trail_percent=SCALEOUT_TRAIL_PCT,
-                    )
-                    self.client.submit_order(trail_req)
-                    log.info(
-                        f"TP TRAIL {sym}: {SCALEOUT_TRAIL_PCT:.1f}% trailing stop on remaining "
-                        f"{remaining} shares (letting winners run)"
-                    )
-                except Exception as e:
-                    log.warning(f"TP trail order failed {sym}: {e}")
-
-            self._scaled_out.add(sym)
-            triggered.append(sym)
+                log.warning(f"TP close failed {sym}: {e}")
 
         for sym in triggered:
             self._tp_targets.pop(sym, None)
