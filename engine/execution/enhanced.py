@@ -230,7 +230,7 @@ class EnhancedExecutor:
             ]
             if not longs:
                 return None
-            worst = min(longs, key=lambda p: float(p.unrealized_plpc))
+            worst = min(longs, key=lambda p: float(p.unrealized_plpc or 0))
             return worst.symbol
         except Exception as e:
             log.warning(f"_find_weakest_position error: {e}")
