@@ -559,10 +559,27 @@ class EnhancedExecutor:
                 log.error(f"Bracket order failed {signal.symbol}: {e}")
             return False
 
-        # ── Step 2: Trailing stop — skipped at entry; placed after scale-out at TP ──
-        # protect_positions is disabled (PROTECT_POSITIONS_ENABLED=false).
-        # The scale-out in check_tp_targets() places a tight trailing stop on the
-        # remaining 50% once the 15% profit target is hit.
+        # ── Step 2: Trailing stop — placed immediately at entry ──────────────
+        # High-volatile stocks need protection from the start.
+        # trail_pct comes from the ATR-based tier (NORMAL=5%, HIGH=6%, EXTREME=8%).
+        # After TP scale-out, check_tp_targets() replaces this with a fresh
+        # SCALEOUT_TRAIL_PCT stop on the remaining 50%.
+        try:
+            ts_req = TrailingStopOrderRequest(
+                symbol        = signal.symbol,
+                qty           = shares,
+                side          = stop_side,
+                type          = AlpacaOrderType.TRAILING_STOP,
+                time_in_force = TimeInForce.GTC,
+                trail_percent = trail_pct,
+            )
+            self.client.submit_order(ts_req)
+            log.info(f"Trailing stop placed {signal.symbol}: {trail_pct:.1f}% GTC ({shares} shares)")
+        except Exception as e:
+            log.warning(
+                f"Trailing stop skipped {signal.symbol}: {e} — "
+                "TP scale-out and EOD close will handle the exit"
+            )
 
         self._log_bracket(signal, shares, risk_info, trail_pct, None, order_type)
         return True
@@ -1415,10 +1432,26 @@ class EnhancedExecutor:
                 log.warning(f"TP scaleout sell failed {sym}: {e}")
                 continue
 
+            # Cancel the entry trailing stop before placing the tighter scale-out stop
+            # (avoids two GTC stops competing for the same shares)
             # Place tight trailing stop on the remaining half
             remaining = abs(qty) - half_qty
             if remaining > 0:
                 stop_side = OrderSide.SELL if is_long else OrderSide.BUY
+                try:
+                    # Cancel any active trailing stop on this symbol first
+                    open_orders = self.client.get_orders() or []
+                    for o in open_orders:
+                        if (o.symbol == sym
+                                and str(getattr(o, "type", "")).lower() == "trailing_stop"
+                                and str(getattr(o, "time_in_force", "")).upper() == "GTC"):
+                            try:
+                                self.client.cancel_order_by_id(str(o.id))
+                                log.info(f"TP TRAIL {sym}: cancelled entry trailing stop (id={o.id})")
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
                 try:
                     trail_req = TrailingStopOrderRequest(
                         symbol=sym,
