@@ -276,9 +276,17 @@ class EnhancedExecutor:
         now = time.time()
         if force_refresh or self._position_cache is None or (now - self._cache_timestamp) > self._cache_ttl:
             raw = self.client.get_all_positions()
+            # Filter out inactive positions: no current price (expired options,
+            # delisted stocks) or zero qty. These are stuck/dead positions that
+            # have no market value and should not count toward MAX_POSITIONS.
+            active = [
+                p for p in raw
+                if float(getattr(p, "current_price", None) or 0) > 0
+                and float(getattr(p, "qty", 0) or 0) != 0
+            ]
             self._position_cache = PositionInfo(
-                positions_dict={p.symbol: p for p in raw},
-                total_count=len(raw),
+                positions_dict={p.symbol: p for p in active},
+                total_count=len(active),
             )
             self._cache_timestamp = now
         return self._position_cache
