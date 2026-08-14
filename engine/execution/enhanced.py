@@ -51,6 +51,7 @@ from engine.config import (
     POSITION_SIZE_PCT, SMALL_ACCOUNT_POSITION_SIZE_PCT,
     CONF_SCALE_MIN_MULT, CONF_SCALE_FULL_CONF,
     MARGIN_LEVERAGE,
+    SCALEOUT_TRAIL_PCT, PROTECT_POSITIONS_ENABLED,
     LIVE,
 )
 from engine.equity.strategies import Signal
@@ -134,7 +135,8 @@ class EnhancedExecutor:
         self._htb_cache:      set   = set()   # hard-to-borrow symbols — skip shorts this session
         self._entry_log:   Dict[str, dict] = {}  # {symbol: {"strategy": str, "date": date}}
         self._swap_cycle_closed: set = set()     # positions already swapped this scan cycle
-        self._tp_targets: Dict[str, float] = {} # {symbol: take-profit price} for ATR-based TP tracking
+        self._tp_targets:       Dict[str, float] = {} # {symbol: take-profit price} for TP tracking
+        self._scaled_out:        set  = set()          # symbols where 50% was sold at TP; trailing stop active
         self.shorting_blocked: bool = False  # set true when broker rejects all short attempts for account
         self._pdt_stop_blocked: Dict[str, float] = {}  # {symbol: stop_price} — broker-rejected stops; monitored in software
         self._pdt_overnight_forced: set = set()  # symbols where PDT also blocks close — forced overnight, no retries
@@ -557,25 +559,10 @@ class EnhancedExecutor:
                 log.error(f"Bracket order failed {signal.symbol}: {e}")
             return False
 
-        # ── Step 2: Trailing stop — placed immediately on all accounts ─────────
-        # PDT is disabled (PDT_ACCOUNT_MIN=0) so same-day GTC stops are allowed.
-        # Inverse ETFs may reject with 40310000 — that is non-fatal; TP target
-        # set above will still trigger a market close when price is reached.
-        try:
-            ts_req = TrailingStopOrderRequest(
-                symbol        = signal.symbol,
-                qty           = shares,
-                side          = stop_side,
-                type          = AlpacaOrderType.TRAILING_STOP,
-                time_in_force = TimeInForce.GTC,
-                trail_percent = trail_pct,
-            )
-            self.client.submit_order(ts_req)
-        except Exception as e:
-            log.warning(
-                f"Trailing stop skipped {signal.symbol} (entry filled): {e} — "
-                "TP target and EOD close will handle the exit"
-            )
+        # ── Step 2: Trailing stop — skipped at entry; placed after scale-out at TP ──
+        # protect_positions is disabled (PROTECT_POSITIONS_ENABLED=false).
+        # The scale-out in check_tp_targets() places a tight trailing stop on the
+        # remaining 50% once the 15% profit target is hit.
 
         self._log_bracket(signal, shares, risk_info, trail_pct, None, order_type)
         return True
@@ -904,17 +891,10 @@ class EnhancedExecutor:
 
     # ─── Protect Open Positions ──────────────────────────────────────────────
     def protect_positions(self) -> None:
-        """
-        For every open position whose shares are fully free (qty_available > 0
-        AND no existing sell/buy-to-cover order on that symbol), place a GTC
-        trailing stop.  Skips any position already covered by an active order.
-
-        Covers today's entries too — if the bracket-order step-2 trailing stop
-        was rejected by the broker (common for inverse ETFs), this re-places it
-        so the position is never left naked intraday.  A GTC trailing stop that
-        fills same-day will count as a day trade; the PDT violation alert in
-        _validate_trade fires if the count exceeds PDT_MAX_TRADES.
-        """
+        """Disabled — PROTECT_POSITIONS_ENABLED=false. Trailing stops are only placed
+        after the 50% scale-out at TP via check_tp_targets()."""
+        if not PROTECT_POSITIONS_ENABLED:
+            return
         positions = []
         covered = set()
 
@@ -1383,9 +1363,8 @@ class EnhancedExecutor:
 
     # ── ATR Take-Profit Checker ────────────────────────────────────────────────
     def check_tp_targets(self) -> None:
-        """Scan open positions against stored ATR-based TP targets.
-        Submits a market close (sell/buy-to-cover) when current price reaches TP.
-        Called once per scan cycle alongside update_stale_orders().
+        """Scale-out at TP: sell 50% at profit target, then trail the remaining 50%.
+        Called once per scan cycle.
         """
         if not self._tp_targets:
             return
@@ -1399,7 +1378,7 @@ class EnhancedExecutor:
         for sym, tp_price in list(self._tp_targets.items()):
             pos = positions.get(sym)
             if pos is None:
-                triggered.append(sym)  # position already closed, clean up
+                triggered.append(sym)
                 continue
             qty = int(float(pos.qty))
             if qty == 0:
@@ -1410,23 +1389,55 @@ class EnhancedExecutor:
                 continue
             is_long = qty > 0
             hit = (is_long and cur_price >= tp_price) or (not is_long and cur_price <= tp_price)
-            if hit:
+            if not hit:
+                continue
+
+            # Already scaled out — trailing stop is active, TP target no longer needed
+            if sym in self._scaled_out:
+                triggered.append(sym)
+                continue
+
+            # Scale-out: sell 50% (ceil so we always close at least 1 share)
+            import math as _math
+            half_qty = max(1, _math.ceil(abs(qty) / 2))
+            side = OrderSide.SELL if is_long else OrderSide.BUY
+            try:
+                req = MarketOrderRequest(
+                    symbol=sym, qty=half_qty,
+                    side=side, time_in_force=TimeInForce.DAY,
+                )
+                self.client.submit_order(req)
+                log.info(
+                    f"TP SCALEOUT {sym}: ${cur_price:.2f} hit target ${tp_price:.2f} — "
+                    f"selling {half_qty}/{abs(qty)} shares (50%)"
+                )
+            except Exception as e:
+                log.warning(f"TP scaleout sell failed {sym}: {e}")
+                continue
+
+            # Place tight trailing stop on the remaining half
+            remaining = abs(qty) - half_qty
+            if remaining > 0:
+                stop_side = OrderSide.SELL if is_long else OrderSide.BUY
                 try:
-                    side = OrderSide.SELL if is_long else OrderSide.BUY
-                    req  = MarketOrderRequest(
-                        symbol        = sym,
-                        qty           = abs(qty),
-                        side          = side,
-                        time_in_force = TimeInForce.DAY,
+                    trail_req = TrailingStopOrderRequest(
+                        symbol=sym,
+                        qty=remaining,
+                        side=stop_side,
+                        type=AlpacaOrderType.TRAILING_STOP,
+                        time_in_force=TimeInForce.GTC,
+                        trail_percent=SCALEOUT_TRAIL_PCT,
                     )
-                    self.client.submit_order(req)
+                    self.client.submit_order(trail_req)
                     log.info(
-                        f"TP HIT {sym}: ${cur_price:.2f} {'>=  ' if is_long else '<= '}"
-                        f"${tp_price:.2f} → market {'sell' if is_long else 'buy-to-cover'}"
+                        f"TP TRAIL {sym}: {SCALEOUT_TRAIL_PCT:.1f}% trailing stop on remaining "
+                        f"{remaining} shares (letting winners run)"
                     )
-                    triggered.append(sym)
                 except Exception as e:
-                    log.warning(f"TP close failed {sym}: {e}")
+                    log.warning(f"TP trail order failed {sym}: {e}")
+
+            self._scaled_out.add(sym)
+            triggered.append(sym)
 
         for sym in triggered:
             self._tp_targets.pop(sym, None)

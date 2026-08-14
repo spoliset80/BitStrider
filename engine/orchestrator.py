@@ -814,7 +814,8 @@ def start() -> None:
     log.info("=" * 70)
 
     try:
-        ctx.executor.protect_positions()
+        if cfg.PROTECT_POSITIONS_ENABLED:
+            ctx.executor.protect_positions()
     except Exception as e:
         log.error(f"protect_positions startup error: {e}", exc_info=True)
 
@@ -892,7 +893,8 @@ def start() -> None:
 
                 if (time.time() - last_scan) >= (current_interval * 60):
                     try:
-                        ctx.executor.protect_positions()
+                        if cfg.PROTECT_POSITIONS_ENABLED:
+                            ctx.executor.protect_positions()
                     except Exception as e:
                         log.error(f"protect_positions error: {e}", exc_info=True)
                     # check_software_stops() runs in its dedicated 10s thread — not here

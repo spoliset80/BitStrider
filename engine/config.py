@@ -349,6 +349,12 @@ TRAILING_STOP_HIGH    = 6.0   # was 10% — tight on high momentum (6% drawdown 
 TRAILING_STOP_MEDIUM  = 5.0   # was 8% — very tight for normal stocks
 TRAILING_STOP_NORMAL  = 5.0   # was 8% — 5% trailing drawdown = quick exit
 
+# Scale-out at TP: sell 50% of position, then trail the remaining 50%
+# SCALEOUT_TRAIL_PCT: trailing stop % on the remaining half after TP is hit
+SCALEOUT_TRAIL_PCT    = float(os.getenv("SCALEOUT_TRAIL_PCT", "5.0"))   # tight trail on remaining half
+# PROTECT_POSITIONS_ENABLED: set false to skip protect_positions() — no trailing stops at entry
+PROTECT_POSITIONS_ENABLED = os.getenv("PROTECT_POSITIONS_ENABLED", "false").lower() in ("1", "true", "yes")
+
 # Legacy (backward compat)
 STOP_LOSS_PCT   = 3.0
 TAKE_PROFIT_PCT = float(os.getenv("TAKE_PROFIT_PCT", "25.0"))  # legacy alias; override via .env
