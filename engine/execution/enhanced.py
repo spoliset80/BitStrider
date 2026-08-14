@@ -287,9 +287,9 @@ class EnhancedExecutor:
         if force_refresh or self._account_cache is None or (now - self._account_cache.timestamp) > self._account_ttl:
             raw = self.client.get_account()
             self._account_cache = AccountSnapshot(
-                equity=float(raw.equity),
-                buying_power=float(raw.buying_power),
-                daytrade_count=int(raw.daytrade_count),
+                equity=float(raw.equity or 0),
+                buying_power=float(raw.buying_power or 0),
+                daytrade_count=int(raw.daytrade_count or 0),
                 pattern_day_trader=str(getattr(raw, "pattern_day_trader", False)).lower() in ("1", "true", "yes"),
                 timestamp=now,
             )
