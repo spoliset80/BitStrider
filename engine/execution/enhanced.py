@@ -52,6 +52,8 @@ from engine.config import (
     CONF_SCALE_MIN_MULT, CONF_SCALE_FULL_CONF,
     MARGIN_LEVERAGE,
     SCALEOUT_TRAIL_PCT, PROTECT_POSITIONS_ENABLED,
+    TP_INTERMEDIATE_PCT, TP_INTERMEDIATE_TRAIL_PCT, TP_FINAL_PCT,
+    DEAD_MONEY_MINUTES, DEAD_MONEY_MIN_GAIN_PCT,
     LIVE,
 )
 from engine.equity.strategies import Signal
@@ -135,8 +137,10 @@ class EnhancedExecutor:
         self._htb_cache:      set   = set()   # hard-to-borrow symbols — skip shorts this session
         self._entry_log:   Dict[str, dict] = {}  # {symbol: {"strategy": str, "date": date}}
         self._swap_cycle_closed: set = set()     # positions already swapped this scan cycle
-        self._tp_targets:       Dict[str, float] = {} # {symbol: take-profit price} for TP tracking
-        self._scaled_out:        set  = set()          # symbols where 50% was sold at TP; trailing stop active
+        self._tp_targets:          Dict[str, float] = {}  # {symbol: final close price (+10%)}
+        self._intermediate_targets: Dict[str, float] = {}  # {symbol: tighten-trail price (+5%)}
+        self._tightened:            set  = set()           # symbols whose trail has been tightened
+        self._scaled_out:           set  = set()           # legacy; kept for compatibility
         self.shorting_blocked: bool = False  # set true when broker rejects all short attempts for account
         self._pdt_stop_blocked: Dict[str, float] = {}  # {symbol: stop_price} — broker-rejected stops; monitored in software
         self._pdt_overnight_forced: set = set()  # symbols where PDT also blocks close — forced overnight, no retries
@@ -549,12 +553,19 @@ class EnhancedExecutor:
             order = self.client.submit_order(entry_req)
             self.order_cache[signal.symbol] = order.id
 
-            # Set TP target — check_tp_targets() closes full position at +15%
-            from engine.config import TAKE_PROFIT_PCT as _TP_PCT
-            _tp = round(signal.price * (1 + _TP_PCT / 100), 2) if order_type == OrderType.LONG \
-                else round(signal.price * (1 - _TP_PCT / 100), 2)
-            self._tp_targets[signal.symbol] = _tp
-            log.info(f"TP target set {signal.symbol}: ${_tp:.2f} ({_TP_PCT:.0f}% {'long' if order_type == OrderType.LONG else 'short'})")
+            # Set dual-phase TP targets from entry price
+            _ep  = signal.price
+            _mul = (1 + 1/100) if order_type == OrderType.LONG else (1 - 1/100)  # directional
+            _int_price   = round(_ep * (1 + TP_INTERMEDIATE_PCT / 100), 2) if order_type == OrderType.LONG \
+                           else round(_ep * (1 - TP_INTERMEDIATE_PCT / 100), 2)
+            _final_price = round(_ep * (1 + TP_FINAL_PCT / 100), 2) if order_type == OrderType.LONG \
+                           else round(_ep * (1 - TP_FINAL_PCT / 100), 2)
+            self._intermediate_targets[signal.symbol] = _int_price
+            self._tp_targets[signal.symbol]           = _final_price
+            log.info(
+                f"TP targets set {signal.symbol}: tighten@${_int_price:.2f} (+{TP_INTERMEDIATE_PCT:.0f}%) "
+                f"close@${_final_price:.2f} (+{TP_FINAL_PCT:.0f}%)"
+            )
 
             # Always set a TP target — checked each cycle by check_tp_targets()
             from engine.config import TAKE_PROFIT_PCT as _TP_PCT
@@ -833,7 +844,13 @@ class EnhancedExecutor:
         if self.use_bracket_orders and self._current_market_state().is_regular_hours:
             if self._create_bracket_order(market_signal, shares, risk_info, order_type):
                 self.pdt.add(datetime.date.today())
-                self._entry_log[signal.symbol] = {"strategy": signal.strategy, "date": datetime.date.today(), "confidence": signal.confidence}
+                self._entry_log[signal.symbol] = {
+                    "strategy":   signal.strategy,
+                    "date":       datetime.date.today(),
+                    "confidence": signal.confidence,
+                    "entry_time": datetime.datetime.now(),
+                    "entry_price": market_price if market_price > 0 else signal.price,
+                }
                 # No swap protection — position can be re-evaluated immediately
                 self._get_positions(force_refresh=True)
                 self._get_account(force_refresh=True)
@@ -841,7 +858,13 @@ class EnhancedExecutor:
 
         if self._create_simple_order(market_signal, shares, order_type):
             self.pdt.add(datetime.date.today())
-            self._entry_log[signal.symbol] = {"strategy": signal.strategy, "date": datetime.date.today(), "confidence": signal.confidence}
+            self._entry_log[signal.symbol] = {
+                "strategy":   signal.strategy,
+                "date":       datetime.date.today(),
+                "confidence": signal.confidence,
+                "entry_time": datetime.datetime.now(),
+                "entry_price": market_price if market_price > 0 else signal.price,
+            }
             # No swap protection — position can be re-evaluated immediately
             self._get_positions(force_refresh=True)
             self._get_account(force_refresh=True)
@@ -1407,11 +1430,12 @@ class EnhancedExecutor:
 
     # ── ATR Take-Profit Checker ────────────────────────────────────────────────
     def check_tp_targets(self) -> None:
-        """Close full position at TP (+15%). Trailing stop handles the stop-loss side.
-        Whichever fires first (TP or trailing stop) wins — no scale-out complexity.
+        """Dual-phase profit exit:
+          Phase 1 (+TP_INTERMEDIATE_PCT, default +5%): cancel wide trail, place TP_INTERMEDIATE_TRAIL_PCT% trail
+          Phase 2 (+TP_FINAL_PCT, default +10%): close full position at market
         Called once per scan cycle.
         """
-        if not self._tp_targets:
+        if not self._tp_targets and not self._intermediate_targets:
             return
         try:
             positions = {p.symbol: p for p in self.client.get_all_positions()}
@@ -1419,44 +1443,138 @@ class EnhancedExecutor:
             log.warning(f"check_tp_targets: fetch failed: {e}")
             return
 
-        triggered = []
-        for sym, tp_price in list(self._tp_targets.items()):
+        all_syms = set(self._tp_targets) | set(self._intermediate_targets)
+        to_clean = []
+
+        for sym in list(all_syms):
             pos = positions.get(sym)
             if pos is None:
-                triggered.append(sym)
+                to_clean.append(sym)
                 continue
             qty = int(float(pos.qty))
             if qty == 0:
-                triggered.append(sym)
+                to_clean.append(sym)
                 continue
-            cur_price = float(getattr(pos, "current_price", 0) or 0)
-            if cur_price <= 0:
+            cur = float(getattr(pos, "current_price", 0) or 0)
+            if cur <= 0:
                 continue
             is_long = qty > 0
-            hit = (is_long and cur_price >= tp_price) or (not is_long and cur_price <= tp_price)
-            if not hit:
+
+            # ── Phase 2: final close ────────────────────────────────────────────
+            final_tp = self._tp_targets.get(sym)
+            if final_tp is not None:
+                hit = (is_long and cur >= final_tp) or (not is_long and cur <= final_tp)
+                if hit:
+                    try:
+                        side = OrderSide.SELL if is_long else OrderSide.BUY
+                        self.client.submit_order(MarketOrderRequest(
+                            symbol=sym, qty=abs(qty), side=side,
+                            time_in_force=TimeInForce.DAY,
+                        ))
+                        log.info(
+                            f"TP CLOSE {sym}: ${cur:.2f} hit +{TP_FINAL_PCT:.0f}% target ${final_tp:.2f} "
+                            f"→ market close (full position)"
+                        )
+                        to_clean.append(sym)
+                    except Exception as e:
+                        log.warning(f"TP close failed {sym}: {e}")
+                    continue  # skip phase-1 check if phase-2 fired
+
+            # ── Phase 1: tighten trail ────────────────────────────────────────────
+            if sym in self._tightened:
+                continue  # already tightened
+            int_tp = self._intermediate_targets.get(sym)
+            if int_tp is None:
+                continue
+            hit1 = (is_long and cur >= int_tp) or (not is_long and cur <= int_tp)
+            if not hit1:
                 continue
 
-            # Close the full position at market — guaranteed profit booking at +15%
+            # Cancel existing wide trailing stop
+            stop_side = OrderSide.SELL if is_long else OrderSide.BUY
             try:
-                side = OrderSide.SELL if is_long else OrderSide.BUY
-                req  = MarketOrderRequest(
-                    symbol        = sym,
-                    qty           = abs(qty),
-                    side          = side,
-                    time_in_force = TimeInForce.DAY,
-                )
-                self.client.submit_order(req)
-                log.info(
-                    f"TP HIT {sym}: ${cur_price:.2f} {'>=  ' if is_long else '<= '}"
-                    f"${tp_price:.2f} → market {'sell' if is_long else 'buy-to-cover'} (full position)"
-                )
-                triggered.append(sym)
-            except Exception as e:
-                log.warning(f"TP close failed {sym}: {e}")
+                open_orders = self.client.get_orders() or []
+                for o in open_orders:
+                    if (o.symbol == sym
+                            and str(getattr(o, "type", "")).lower() == "trailing_stop"
+                            and str(getattr(o, "time_in_force", "")).upper() == "GTC"):
+                        try:
+                            self.client.cancel_order_by_id(str(o.id))
+                        except Exception:
+                            pass
+            except Exception:
+                pass
 
-        for sym in triggered:
+            # Place tight trail
+            try:
+                self.client.submit_order(TrailingStopOrderRequest(
+                    symbol=sym, qty=abs(qty), side=stop_side,
+                    type=AlpacaOrderType.TRAILING_STOP,
+                    time_in_force=TimeInForce.GTC,
+                    trail_percent=TP_INTERMEDIATE_TRAIL_PCT,
+                ))
+                log.info(
+                    f"TP TIGHTEN {sym}: ${cur:.2f} hit +{TP_INTERMEDIATE_PCT:.0f}% "
+                    f"→ trail tightened to {TP_INTERMEDIATE_TRAIL_PCT:.0f}% (locks in ~+{TP_INTERMEDIATE_PCT - TP_INTERMEDIATE_TRAIL_PCT:.0f}%)"
+                )
+                self._tightened.add(sym)
+                self._intermediate_targets.pop(sym, None)  # phase 1 done
+            except Exception as e:
+                log.warning(f"TP tighten trail failed {sym}: {e}")
+
+        for sym in to_clean:
             self._tp_targets.pop(sym, None)
+            self._intermediate_targets.pop(sym, None)
+            self._tightened.discard(sym)
+
+    def check_dead_money(self) -> None:
+        """Close stagnant positions: held > DEAD_MONEY_MINUTES with gain < DEAD_MONEY_MIN_GAIN_PCT.
+        Frees buying power for the next high-quality signal. Called each scan cycle.
+        """
+        if not self._entry_log:
+            return
+        now = datetime.datetime.now()
+        try:
+            positions = {p.symbol: p for p in self.client.get_all_positions()}
+        except Exception as e:
+            log.warning(f"check_dead_money: fetch failed: {e}")
+            return
+
+        for sym, info in list(self._entry_log.items()):
+            entry_time = info.get("entry_time")
+            if entry_time is None:
+                continue
+            elapsed_min = (now - entry_time).total_seconds() / 60
+            if elapsed_min < DEAD_MONEY_MINUTES:
+                continue
+
+            pos = positions.get(sym)
+            if pos is None:
+                continue
+            qty = int(float(pos.qty))
+            if qty == 0:
+                continue
+
+            unrealized_pct = float(getattr(pos, "unrealized_plpc", 0) or 0) * 100
+            if unrealized_pct >= DEAD_MONEY_MIN_GAIN_PCT:
+                continue  # position is moving — let it run
+
+            try:
+                side = OrderSide.SELL if qty > 0 else OrderSide.BUY
+                self.client.submit_order(MarketOrderRequest(
+                    symbol=sym, qty=abs(qty), side=side,
+                    time_in_force=TimeInForce.DAY,
+                ))
+                log.info(
+                    f"DEAD MONEY {sym}: held {elapsed_min:.0f} min, gain {unrealized_pct:+.1f}% "
+                    f"< {DEAD_MONEY_MIN_GAIN_PCT:.0f}% → closing (freeing capital)"
+                )
+                self._entry_log.pop(sym, None)
+                self._tp_targets.pop(sym, None)
+                self._intermediate_targets.pop(sym, None)
+                self._tightened.discard(sym)
+            except Exception as e:
+                log.warning(f"Dead money close failed {sym}: {e}")
 
     # ── Health ─────────────────────────────────────────────────────────────────
     def get_health(self) -> Dict:

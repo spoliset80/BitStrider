@@ -359,6 +359,19 @@ PROTECT_POSITIONS_ENABLED = os.getenv("PROTECT_POSITIONS_ENABLED", "false").lowe
 STOP_LOSS_PCT   = 3.0
 TAKE_PROFIT_PCT = float(os.getenv("TAKE_PROFIT_PCT", "25.0"))  # legacy alias; override via .env
 
+# ── Dynamic TP tightening (Option B) ───────────────────────────────────────────
+# Phase 1 (+TP_INTERMEDIATE_PCT): cancel 10% trail, place tighter TP_INTERMEDIATE_TRAIL_PCT%
+# Phase 2 (+TP_FINAL_PCT): close full position at market — guaranteed profit booking
+TP_INTERMEDIATE_PCT       = float(os.getenv("TP_INTERMEDIATE_PCT",       "5.0"))  # tighten trail at +5%
+TP_INTERMEDIATE_TRAIL_PCT = float(os.getenv("TP_INTERMEDIATE_TRAIL_PCT", "3.0"))  # new trail pct after +5%
+TP_FINAL_PCT              = float(os.getenv("TP_FINAL_PCT",              "10.0")) # close full at +10%
+
+# ── Dead money exit (Option D) ──────────────────────────────────────────────
+# Close positions that are stagnating: held > N minutes with gain < X%
+# Frees buying power for the next high-quality signal
+DEAD_MONEY_MINUTES        = int(os.getenv("DEAD_MONEY_MINUTES",        "90"))   # close if held > 90 min
+DEAD_MONEY_MIN_GAIN_PCT   = float(os.getenv("DEAD_MONEY_MIN_GAIN_PCT", "3.0"))  # and gain is < 3%
+
 # ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 # Dynamic ATR-Based Tier Assignment
 # Lower thresholds = more stocks classified as high-volatility = tighter TP/SL
