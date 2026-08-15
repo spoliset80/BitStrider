@@ -510,6 +510,14 @@ def scan_and_trade(ctx: AppContext) -> None:
     """
     _session.reset_daily(ctx.client)
 
+    # ── Hard cutoff: no trading after AFTERHOURS_END (20:00 ET) ──────────────
+    import pytz as _ptz
+    _now_et = __import__('datetime').datetime.now(_ptz.timezone("America/New_York"))
+    _end_h, _end_m = map(int, cfg.AFTERHOURS_END.split(":"))
+    if _now_et.hour > _end_h or (_now_et.hour == _end_h and _now_et.minute >= _end_m):
+        log.debug(f"[SYSTEM] After {cfg.AFTERHOURS_END} ET — no scanning")
+        return
+
     ctx.market_state = MarketState.from_now()
     ctx.market_state.resolve_regime()
 
