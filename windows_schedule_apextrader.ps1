@@ -1,18 +1,34 @@
 # Windows Scheduled Task Install for ApexTrader
 # Run in PowerShell as Administrator.
 
-$taskName = 'ApexTraderAutoRun'
-$taskDescription = 'Run ApexTrader trading bot watchdog daily at 7:00 AM ET on weekdays'
+$botDir  = 'C:\Users\spoli\Desktop\BiStrider_TS\BitStrider'
+$python  = "$botDir\apextrader\Scripts\python.exe"
+$script  = "$botDir\autobot.py"
 
-$action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument '-NoProfile -WindowStyle Hidden -Command "cd C:\Users\user\Desktop\wsapex\apextrader; .\\apextrader\\Scripts\\python.exe .\\autobot.py | Tee-Object -FilePath .\\autobot_scheduler.log"'
-# Run at 07:00 local time on weekdays (Mon-Fri). Ensure the machine local timezone is EST/EDT as desired.
-$trigger = New-ScheduledTaskTrigger -Weekly -DaysOfWeek Monday,Tuesday,Wednesday,Thursday,Friday -At 07:00
+# ── Task 1: Start bot at 7:00 AM ET Mon-Fri ─────────────────────────────────
+$startAction = New-ScheduledTaskAction `
+    -Execute 'powershell.exe' `
+    -Argument "-NoProfile -WindowStyle Hidden -Command `"Set-Location '$botDir'; `$env:TRADE_MODE='live'; & '$python' '$script'`"" `
+    -WorkingDirectory $botDir
 
-$principal = New-ScheduledTaskPrincipal -UserId "$env:UserName" -LogonType Interactive -RunLevel Highest
+$startTrigger  = New-ScheduledTaskTrigger -Weekly -DaysOfWeek Monday,Tuesday,Wednesday,Thursday,Friday -At 07:00
+$principal     = New-ScheduledTaskPrincipal -UserId "$env:UserName" -LogonType Interactive -RunLevel Highest
+$settings      = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -StartWhenAvailable -WakeToRun -DontStopIfGoingOnBatteries -Hidden
 
-$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -StartWhenAvailable -WakeToRun -DontStopIfGoingOnBatteries -Hidden
+Register-ScheduledTask -TaskName 'ApexTrader_Start' -Action $startAction -Trigger $startTrigger `
+    -Principal $principal -Settings $settings -Description 'Start ApexTrader at 7:00 AM ET on weekdays' -Force
 
-$task = New-ScheduledTask -Action $action -Trigger $trigger -Principal $principal -Settings $settings
+# ── Task 2: Stop bot at 8:30 PM ET Mon-Fri ───────────────────────────────────
+$stopAction = New-ScheduledTaskAction `
+    -Execute 'powershell.exe' `
+    -Argument "-NoProfile -WindowStyle Hidden -Command `"taskkill /F /IM python.exe; taskkill /F /IM msedge.exe; Remove-Item '$botDir\autobot.pid' -ErrorAction SilentlyContinue`""
 
-Register-ScheduledTask -TaskName $taskName -InputObject $task -Force
-Write-Host "Scheduled task '$taskName' installed successfully. Use 'schtasks /query /tn $taskName' to inspect."
+$stopTrigger = New-ScheduledTaskTrigger -Weekly -DaysOfWeek Monday,Tuesday,Wednesday,Thursday,Friday -At 20:30
+
+Register-ScheduledTask -TaskName 'ApexTrader_Stop' -Action $stopAction -Trigger $stopTrigger `
+    -Principal $principal -Settings $settings -Description 'Stop ApexTrader at 8:30 PM ET on weekdays' -Force
+
+Write-Host "Done. Two tasks registered:"
+Write-Host "  ApexTrader_Start — 7:00 AM Mon-Fri"
+Write-Host "  ApexTrader_Stop  — 8:30 PM Mon-Fri"
+Write-Host "Run: schtasks /query /tn ApexTrader_Start to verify."
