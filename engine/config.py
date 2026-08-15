@@ -734,7 +734,7 @@ RVOL_MIN                 = 1.0         # Require relative volume ≥ 1.0x before
 MIN_STOCK_PRICE          = float(os.getenv("MIN_STOCK_PRICE", "0.5"))  # override via .env
 ALPACA_MOVER_SCAN_INTERVAL_MIN = 10   # Re-poll Alpaca screener every 10 min (resets at market open)
 MIN_DOLLAR_VOLUME        = 1_000_000   # Skip illiquid setups: price × day_vol < $1M
-MAX_GAP_CHASE_PCT        = 15.0       # Skip if already up >15% without consolidation
+MAX_GAP_CHASE_PCT        = float(os.getenv("MAX_GAP_CHASE_PCT",     "8.0"))   # Skip if already up >8% (reduced from 15%)
 GAP_CHASE_CONSOL_BARS    = 5          # Number of 1-min bars to check for tight base
 
 # ─────────────────────────────────────────────────────────────────
@@ -742,10 +742,19 @@ GAP_CHASE_CONSOL_BARS    = 5          # Number of 1-min bars to check for tight 
 # ─────────────────────────────────────────────────────────────────
 # TI stocks run hard and fast; earlier entries are preferred to avoid chasing
 # tail-end moves with poor risk/reward. These thresholds prevent late entries.
-TI_MAX_GAP_CHASE_PCT     = 10.0       # Stricter: only enter if <10% up from open
-TI_RVOL_MIN              = 1.3        # Require 1.3x relative volume (vs 1.0x base)
-TI_MIN_DOLLAR_VOLUME     = 1_500_000  # Higher liquidity requirement ($1.5M vs $1M)
+TI_MAX_GAP_CHASE_PCT     = float(os.getenv("TI_MAX_GAP_CHASE_PCT",   "7.0"))   # Only enter if <7% up from open (tightened from 10%)
+TI_RVOL_MIN              = float(os.getenv("TI_RVOL_MIN",             "1.5"))   # Require 1.5x RVOL (raised from 1.3x)
+TI_MIN_DOLLAR_VOLUME     = float(os.getenv("TI_MIN_DOLLAR_VOLUME",    "1500000"))  # $1.5M liquidity floor
 TI_MAX_OVERNIGHT_GAP_PCT = 12.0       # Skip if >12% overnight/pre-market gap
+
+# ─────────────────────────────────────────────────────────────────
+# Midday Chop Filter (11:30 AM – 1:00 PM ET)
+# ─────────────────────────────────────────────────────────────────
+# Midday is the lowest-quality period for intraday entries (fading volume,
+# choppy price action, algos pulling liquidity). Only A+ setups allowed.
+MIDDAY_CHOP_START        = os.getenv("MIDDAY_CHOP_START", "11:30")   # ET time
+MIDDAY_CHOP_END          = os.getenv("MIDDAY_CHOP_END",   "13:00")   # ET time
+MIDDAY_MIN_CONFIDENCE    = float(os.getenv("MIDDAY_MIN_CONFIDENCE", "0.88"))   # require A+ setup midday
 
 USE_MARKET_REGIME_FILTER = True       # SPY below 200-day MA → cut signals to 1
 MARKET_REGIME_SIGNALS_CAP  = 5        # Max LONG entries per cycle in bear regime (swap-only); tries until one succeeds

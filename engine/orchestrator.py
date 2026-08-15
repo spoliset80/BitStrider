@@ -262,11 +262,22 @@ def _filter_eligible(
     fresh_held: set,
     regime: str,
 ) -> list:
-    """Apply confidence gate, position cross-ref, and long-only enforcement.
+    """Apply confidence gate, midday chop filter, position cross-ref, and long-only enforcement.
 
     Returns the eligible signal list ready for execution.
     """
-    short_min_conf = cfg.MIN_SHORT_CONFIDENCE_BEAR if regime == "bear" else cfg.MIN_SIGNAL_CONFIDENCE
+    import pytz as _ptz, datetime as _dt
+    _now_et   = _dt.datetime.now(_ptz.timezone("America/New_York"))
+    _now_hhmm = _now_et.strftime("%H:%M")
+    _midday   = cfg.MIDDAY_CHOP_START <= _now_hhmm < cfg.MIDDAY_CHOP_END
+    _conf_floor = cfg.MIDDAY_MIN_CONFIDENCE if _midday else cfg.MIN_SIGNAL_CONFIDENCE
+    if _midday:
+        log.info(
+            f"[MIDDAY] Chop filter active ({cfg.MIDDAY_CHOP_START}–{cfg.MIDDAY_CHOP_END} ET) — "
+            f"min confidence raised to {_conf_floor:.0%}"
+        )
+
+    short_min_conf = cfg.MIN_SHORT_CONFIDENCE_BEAR if regime == "bear" else _conf_floor
     long_only      = cfg.LONG_ONLY_MODE or ctx.executor.shorting_blocked
 
     if ctx.executor.shorting_blocked and not cfg.LONG_ONLY_MODE:
@@ -277,7 +288,7 @@ def _filter_eligible(
         if s.symbol in fresh_held:
             continue
         conf = round(float(s.confidence), 2)
-        if s.action == "buy" and conf >= cfg.MIN_SIGNAL_CONFIDENCE:
+        if s.action == "buy" and conf >= _conf_floor:
             eligible.append(s)
         elif (
             s.action in ("sell", "short")
