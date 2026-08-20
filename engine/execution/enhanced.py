@@ -54,7 +54,7 @@ from engine.config import (
     POSITION_SIZE_PCT, SMALL_ACCOUNT_POSITION_SIZE_PCT,
     LIVE_PROBE_MODE, LIVE_PROBE_SHARES, LIVE_PROBE_MAX_ENTRIES_PER_DAY,
     LIVE_PROBE_SCALE_IN_ENABLED, LIVE_PROBE_SCALE_IN_MINUTES,
-    LIVE_PROBE_SCALE_IN_MIN_GAIN_PCT, LIVE_PROBE_SCALE_IN_MAX_POSITION_PCT,
+    LIVE_PROBE_SCALE_IN_MIN_GAIN_PCT, LIVE_PROBE_SCALE_IN_BUYING_POWER_PCT,
     LIVE_PROBE_SCALE_IN_CUTOFF_TIME,
     CONF_SCALE_MIN_MULT, CONF_SCALE_FULL_CONF,
     MARGIN_LEVERAGE,
@@ -348,14 +348,15 @@ class EnhancedExecutor:
             if (is_long and not is_bull) or (not is_long and is_bull):
                 continue
 
-            target_dollars = account.equity * LIVE_PROBE_SCALE_IN_MAX_POSITION_PCT / 100
-            target_shares = int(target_dollars / current_price)
-            add_shares = max(0, target_shares - abs(qty))
             margin = 1.0 if is_long else 2.0
             usable_bp = max(0.0, account.buying_power - self._options_cost_reserve)
-            add_shares = min(add_shares, int(usable_bp / (current_price * margin)))
+            scale_budget = usable_bp * LIVE_PROBE_SCALE_IN_BUYING_POWER_PCT / 100
+            add_shares = min(
+                int(scale_budget / (current_price * margin)),
+                int(usable_bp / (current_price * margin)),
+            )
             if add_shares < 1:
-                log.info(f"LIVE PROBE {sym}: scale-in skipped; insufficient buying power for cap")
+                log.info(f"LIVE PROBE {sym}: scale-in skipped; insufficient buying power")
                 continue
 
             side = OrderSide.BUY if is_long else OrderSide.SELL
@@ -384,7 +385,7 @@ class EnhancedExecutor:
                 state_changed = True
                 log.info(
                     f"LIVE PROBE SCALE-IN {sym}: +{add_shares} shares after {LIVE_PROBE_SCALE_IN_MINUTES} min "
-                    f"at {gain_pct:+.2f}% | total cap {LIVE_PROBE_SCALE_IN_MAX_POSITION_PCT:.1f}% equity"
+                    f"at {gain_pct:+.2f}% | used {LIVE_PROBE_SCALE_IN_BUYING_POWER_PCT:.1f}% available buying power"
                 )
             except Exception as e:
                 log.warning(f"LIVE PROBE scale-in failed {sym}: {e}")

@@ -109,15 +109,15 @@ class EquityExitLifecycleTests(unittest.TestCase):
         ), patch.object(enhanced, "LIVE_PROBE_SCALE_IN_ENABLED", True), patch.object(
             enhanced, "LIVE_PROBE_SCALE_IN_MINUTES", 30
         ), patch.object(enhanced, "LIVE_PROBE_SCALE_IN_MIN_GAIN_PCT", 0.5), patch.object(
-            enhanced, "LIVE_PROBE_SCALE_IN_MAX_POSITION_PCT", 25.0
+            enhanced, "LIVE_PROBE_SCALE_IN_BUYING_POWER_PCT", 50.0
         ), patch.object(enhanced, "LIVE_PROBE_SCALE_IN_CUTOFF_TIME", "15:15"):
             with patch.object(enhanced, "get_dynamic_tier", return_value={"ts": 6.0}):
                 executor.check_live_probe_scale_ins()
                 executor.check_live_probe_scale_ins()
 
         self.assertEqual(len(client.orders), 2)
-        self.assertEqual(client.orders[0].qty, 23)
-        self.assertEqual(client.orders[1].qty, 23)
+        self.assertEqual(client.orders[0].qty, 49)
+        self.assertEqual(client.orders[1].qty, 49)
 
     def test_exit_state_round_trip_restores_targets(self):
         with tempfile.TemporaryDirectory() as directory:
