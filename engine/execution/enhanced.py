@@ -9,13 +9,16 @@ Optimized trade executor with consolidated logic:
   - Real-time bid/ask validation before order submission
 """
 
-import logging
 import datetime
+import json
+import logging
 import re
+import threading
 import time
 from typing import Optional, Dict, Tuple
 from dataclasses import dataclass, field
 from enum import Enum
+from pathlib import Path
 
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import (
@@ -148,6 +151,10 @@ class EnhancedExecutor:
         self._eod_close_done: object = None  # date of last completed EOD close (prevents duplicate runs)
         self.market_state: Optional[MarketState] = None
         self._options_cost_reserve: float = 0.0  # $ currently deployed in options — set by orchestrator each cycle
+        self._exit_state_path = Path(__file__).resolve().parent.parent / ".position_exit_state.json"
+        self._exit_state_lock = threading.Lock()
+        self._submitted_entry_orders: Dict[str, object] = {}
+        self._restore_exit_state()
         self._rebuild_entry_log_from_orders()
 
     def update_market_state(self, market_state: MarketState) -> None:
@@ -161,6 +168,81 @@ class EnhancedExecutor:
         cannot double-spend the capital already committed to open options positions.
         """
         self._options_cost_reserve = max(0.0, cost)
+
+    def _save_exit_state(self) -> None:
+        """Persist entry and target data needed to resume exit management after restart."""
+        entries = {}
+        for sym, info in self._entry_log.items():
+            entry_time = info.get("entry_time")
+            entry_price = float(info.get("entry_price") or 0)
+            if not isinstance(entry_time, datetime.datetime) or entry_price <= 0:
+                continue
+            entries[sym] = {
+                "strategy": info.get("strategy", "restored"),
+                "date": str(info.get("date") or entry_time.date()),
+                "confidence": float(info.get("confidence", 0) or 0),
+                "entry_time": entry_time.isoformat(),
+                "entry_price": entry_price,
+                "intermediate_target": self._intermediate_targets.get(sym),
+                "final_target": self._tp_targets.get(sym),
+                "tightened": sym in self._tightened,
+            }
+
+        try:
+            with self._exit_state_lock:
+                if not entries:
+                    self._exit_state_path.unlink(missing_ok=True)
+                    return
+                temp_path = self._exit_state_path.with_suffix(".tmp")
+                temp_path.write_text(json.dumps({"entries": entries}), encoding="utf-8")
+                temp_path.replace(self._exit_state_path)
+        except Exception as e:
+            log.warning(f"Could not save position exit state: {e}")
+
+    def _restore_exit_state(self) -> None:
+        """Restore exit state for positions that are still open at process startup."""
+        try:
+            if not self._exit_state_path.exists():
+                return
+            raw_entries = json.loads(self._exit_state_path.read_text(encoding="utf-8")).get("entries", {})
+            open_symbols = {p.symbol for p in self.client.get_all_positions()}
+            for sym, saved in raw_entries.items():
+                if sym not in open_symbols:
+                    continue
+                entry_time = datetime.datetime.fromisoformat(saved["entry_time"])
+                self._entry_log[sym] = {
+                    "strategy": saved.get("strategy", "restored"),
+                    "date": datetime.date.fromisoformat(saved.get("date", str(entry_time.date()))),
+                    "confidence": float(saved.get("confidence", 0) or 0),
+                    "entry_time": entry_time,
+                    "entry_price": float(saved["entry_price"]),
+                }
+                if saved.get("intermediate_target") is not None:
+                    self._intermediate_targets[sym] = float(saved["intermediate_target"])
+                if saved.get("final_target") is not None:
+                    self._tp_targets[sym] = float(saved["final_target"])
+                if saved.get("tightened"):
+                    self._tightened.add(sym)
+            self._save_exit_state()
+            if self._entry_log:
+                log.info(f"Restored position exit state: {', '.join(self._entry_log)}")
+        except Exception as e:
+            log.warning(f"Could not restore position exit state: {e}")
+
+    def _record_entry(self, signal: Signal, fallback_price: float) -> None:
+        """Track an entry using the broker-reported fill price when immediately available."""
+        order = self._submitted_entry_orders.pop(signal.symbol, None)
+        entry_price = float(getattr(order, "filled_avg_price", 0) or 0)
+        if entry_price <= 0:
+            entry_price = fallback_price
+        self._entry_log[signal.symbol] = {
+            "strategy": signal.strategy,
+            "date": datetime.date.today(),
+            "confidence": signal.confidence,
+            "entry_time": datetime.datetime.now(),
+            "entry_price": entry_price,
+        }
+        self._save_exit_state()
 
     # -- Entry Log Rebuild (survive restarts) ----------------------------
     def _rebuild_entry_log_from_orders(self) -> None:
@@ -552,6 +634,7 @@ class EnhancedExecutor:
             )
             order = self.client.submit_order(entry_req)
             self.order_cache[signal.symbol] = order.id
+            self._submitted_entry_orders[signal.symbol] = order
 
             # Set dual-phase TP targets from entry price
             _ep  = signal.price
@@ -649,6 +732,7 @@ class EnhancedExecutor:
                 )
                 order = self.client.submit_order(req)
                 self.order_cache[signal.symbol] = order.id
+                self._submitted_entry_orders[signal.symbol] = order
                 log.info(f"{action} LIMIT {signal.symbol}: {shares} @ ${limit:.2f} (ext-hours) | {signal.strategy}")
                 return True
             else:
@@ -661,6 +745,7 @@ class EnhancedExecutor:
                 )
                 order = self.client.submit_order(req)
                 self.order_cache[signal.symbol] = order.id
+                self._submitted_entry_orders[signal.symbol] = order
                 log.info(f"{action} {signal.symbol}: {shares} @ ${signal.price:.2f} | {signal.strategy}")
                 return True
 
@@ -836,13 +921,7 @@ class EnhancedExecutor:
         if self.use_bracket_orders and self._current_market_state().is_regular_hours:
             if self._create_bracket_order(market_signal, shares, risk_info, order_type):
                 self.pdt.add(datetime.date.today())
-                self._entry_log[signal.symbol] = {
-                    "strategy":   signal.strategy,
-                    "date":       datetime.date.today(),
-                    "confidence": signal.confidence,
-                    "entry_time": datetime.datetime.now(),
-                    "entry_price": market_price if market_price > 0 else signal.price,
-                }
+                self._record_entry(signal, market_price if market_price > 0 else signal.price)
                 # No swap protection — position can be re-evaluated immediately
                 self._get_positions(force_refresh=True)
                 self._get_account(force_refresh=True)
@@ -850,13 +929,7 @@ class EnhancedExecutor:
 
         if self._create_simple_order(market_signal, shares, order_type):
             self.pdt.add(datetime.date.today())
-            self._entry_log[signal.symbol] = {
-                "strategy":   signal.strategy,
-                "date":       datetime.date.today(),
-                "confidence": signal.confidence,
-                "entry_time": datetime.datetime.now(),
-                "entry_price": market_price if market_price > 0 else signal.price,
-            }
+            self._record_entry(signal, market_price if market_price > 0 else signal.price)
             # No swap protection — position can be re-evaluated immediately
             self._get_positions(force_refresh=True)
             self._get_account(force_refresh=True)
@@ -1152,15 +1225,12 @@ class EnhancedExecutor:
                     continue
 
             try:
-                # Cancel only DAY-TIF orders holding shares for this symbol before
-                # submitting the market close ("insufficient qty available" error).
-                # GTC trailing stops are intentionally preserved — they protect the
-                # position until the close fill settles and should not be cancelled.
+                # Cancel open orders before closing so broker-reserved shares are
+                # available for the EOD market order.
                 try:
                     sym_orders = [
                         o for o in (self.client.get_orders() or [])
                         if o.symbol == sym
-                        and str(getattr(o, "time_in_force", "")).upper() != "GTC"
                     ]
                     for _o in sym_orders:
                         try:
@@ -1179,24 +1249,29 @@ class EnhancedExecutor:
                 )
                 self.client.submit_order(req)
                 self._entry_log.pop(sym, None)
+                self._tp_targets.pop(sym, None)
+                self._intermediate_targets.pop(sym, None)
+                self._tightened.discard(sym)
 
                 pnl = float(pos.unrealized_pl)
+                strategy = entry_info.get("strategy", "unknown") if entry_info else "unknown"
                 closed_items.append({
                     "symbol": sym,
                     "qty": abs(qty),
-                    "strategy": entry_info.get("strategy", "unknown"),
+                    "strategy": strategy,
                     "pnl": pnl,
                 })
 
                 log.info(
                     f"EOD CLOSE {sym}: {abs(qty)} shares | "
-                    f"strategy={entry_info['strategy']} | P&L ${pnl:.2f}"
+                    f"strategy={strategy} | P&L ${pnl:.2f}"
                 )
             except Exception as e:
                 failed_items.append({"symbol": sym, "error": str(e)})
                 log.error(f"EOD close failed {sym}: {e}")
 
         self._eod_close_done = today
+        self._save_exit_state()
 
         summary = {
             "date": today.isoformat(),
@@ -1437,6 +1512,7 @@ class EnhancedExecutor:
 
         all_syms = set(self._tp_targets) | set(self._intermediate_targets)
         to_clean = []
+        state_changed = False
 
         for sym in list(all_syms):
             pos = positions.get(sym)
@@ -1511,6 +1587,7 @@ class EnhancedExecutor:
                 )
                 self._tightened.add(sym)
                 self._intermediate_targets.pop(sym, None)  # phase 1 done
+                state_changed = True
             except Exception as e:
                 log.warning(f"TP tighten trail failed {sym}: {e}")
 
@@ -1518,6 +1595,10 @@ class EnhancedExecutor:
             self._tp_targets.pop(sym, None)
             self._intermediate_targets.pop(sym, None)
             self._tightened.discard(sym)
+            state_changed = True
+
+        if state_changed:
+            self._save_exit_state()
 
     def check_dead_money(self) -> None:
         """Close positions held for DEAD_MONEY_MINUTES with minimal price movement.
@@ -1532,6 +1613,7 @@ class EnhancedExecutor:
             log.warning(f"check_dead_money: fetch failed: {e}")
             return
 
+        state_changed = False
         for sym, info in list(self._entry_log.items()):
             entry_time = info.get("entry_time")
             if entry_time is None:
@@ -1542,6 +1624,11 @@ class EnhancedExecutor:
 
             pos = positions.get(sym)
             if pos is None:
+                self._entry_log.pop(sym, None)
+                self._tp_targets.pop(sym, None)
+                self._intermediate_targets.pop(sym, None)
+                self._tightened.discard(sym)
+                state_changed = True
                 continue
             qty = int(float(pos.qty))
             if qty == 0:
@@ -1571,8 +1658,12 @@ class EnhancedExecutor:
                 self._tp_targets.pop(sym, None)
                 self._intermediate_targets.pop(sym, None)
                 self._tightened.discard(sym)
+                state_changed = True
             except Exception as e:
                 log.warning(f"Dead money close failed {sym}: {e}")
+
+        if state_changed:
+            self._save_exit_state()
 
     # ── Health ─────────────────────────────────────────────────────────────────
     def get_health(self) -> Dict:

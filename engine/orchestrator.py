@@ -690,13 +690,15 @@ def log_status(ctx: AppContext) -> None:
             log.info(f"Quarterly:  {q_gain:+.1f}% (target >= {cfg.QUARTERLY_PROFIT_TARGET_PCT:.0f}%)")
         log.info(f"Positions:  {len(positions)}")
         if positions:
-            total_pnl = sum(float(p.unrealized_pl) for p in positions)
+            total_pnl = sum(float(getattr(p, "unrealized_pl", 0) or 0) for p in positions)
             log.info(f"Unrealized: ${total_pnl:.2f}")
             for p in positions:
-                pct = float(p.unrealized_plpc) * 100
+                entry_price = float(getattr(p, "avg_entry_price", 0) or 0)
+                unrealized_pnl = float(getattr(p, "unrealized_pl", 0) or 0)
+                pct = float(getattr(p, "unrealized_plpc", 0) or 0) * 100
                 log.info(
-                    f"  {p.symbol}: {p.qty} @ ${float(p.avg_entry_price):.2f} "
-                    f"| ${float(p.unrealized_pl):.2f} ({pct:+.2f}%)"
+                    f"  {p.symbol}: {getattr(p, 'qty', 0)} @ ${entry_price:.2f} "
+                    f"| ${unrealized_pnl:.2f} ({pct:+.2f}%)"
                 )
         log.info("=" * 70)
     except Exception as e:
