@@ -366,11 +366,10 @@ TP_INTERMEDIATE_PCT       = float(os.getenv("TP_INTERMEDIATE_PCT",       "5.0"))
 TP_INTERMEDIATE_TRAIL_PCT = float(os.getenv("TP_INTERMEDIATE_TRAIL_PCT", "3.0"))  # new trail pct after +5%
 TP_FINAL_PCT              = float(os.getenv("TP_FINAL_PCT",              "10.0")) # close full at +10%
 
-# ── Dead money exit (Option D) ──────────────────────────────────────────────
-# Close positions that are stagnating: held > N minutes with price drift <= X%
-# Frees buying power for the next high-quality signal
-DEAD_MONEY_MINUTES             = int(os.getenv("DEAD_MONEY_MINUTES", "90"))
-DEAD_MONEY_MAX_PRICE_DRIFT_PCT = float(os.getenv("DEAD_MONEY_MAX_PRICE_DRIFT_PCT", "0.5"))
+# ── Time-based loss exit ────────────────────────────────────────────────────
+# Close positions still moving adversely by X% after N minutes.
+DEAD_MONEY_MINUTES                   = int(os.getenv("DEAD_MONEY_MINUTES", "90"))
+DEAD_MONEY_MAX_ADVERSE_DRIFT_PCT     = float(os.getenv("DEAD_MONEY_MAX_ADVERSE_DRIFT_PCT", "1.5"))
 
 # ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 # Dynamic ATR-Based Tier Assignment

@@ -56,7 +56,7 @@ from engine.config import (
     MARGIN_LEVERAGE,
     SCALEOUT_TRAIL_PCT, PROTECT_POSITIONS_ENABLED,
     TP_INTERMEDIATE_PCT, TP_INTERMEDIATE_TRAIL_PCT, TP_FINAL_PCT,
-    DEAD_MONEY_MINUTES, DEAD_MONEY_MAX_PRICE_DRIFT_PCT,
+    DEAD_MONEY_MINUTES, DEAD_MONEY_MAX_ADVERSE_DRIFT_PCT,
     LIVE,
 )
 from engine.equity.strategies import Signal
@@ -1601,8 +1601,8 @@ class EnhancedExecutor:
             self._save_exit_state()
 
     def check_dead_money(self) -> None:
-        """Close positions held for DEAD_MONEY_MINUTES with minimal price movement.
-        Frees buying power for the next high-quality signal. Called each scan cycle.
+        """Close positions still moving adversely after DEAD_MONEY_MINUTES.
+        A profitable or recovering position remains managed by its trailing stop and TP targets.
         """
         if not self._entry_log:
             return
@@ -1640,8 +1640,9 @@ class EnhancedExecutor:
                 log.warning(f"DEAD MONEY {sym}: missing entry or current price; skipping drift check")
                 continue
 
-            price_drift_pct = abs(current_price - entry_price) / entry_price * 100
-            if price_drift_pct > DEAD_MONEY_MAX_PRICE_DRIFT_PCT:
+            price_change_pct = (current_price - entry_price) / entry_price * 100
+            adverse_drift_pct = -price_change_pct if qty > 0 else price_change_pct
+            if adverse_drift_pct < DEAD_MONEY_MAX_ADVERSE_DRIFT_PCT:
                 continue
 
             try:
@@ -1651,8 +1652,8 @@ class EnhancedExecutor:
                     time_in_force=TimeInForce.DAY,
                 ))
                 log.info(
-                    f"DEAD MONEY {sym}: held {elapsed_min:.0f} min, price drift {price_drift_pct:.2f}% "
-                    f"<= {DEAD_MONEY_MAX_PRICE_DRIFT_PCT:.2f}% → closing (freeing capital)"
+                    f"TIME LOSS {sym}: held {elapsed_min:.0f} min, adverse drift {adverse_drift_pct:.2f}% "
+                    f">= {DEAD_MONEY_MAX_ADVERSE_DRIFT_PCT:.2f}% → closing"
                 )
                 self._entry_log.pop(sym, None)
                 self._tp_targets.pop(sym, None)

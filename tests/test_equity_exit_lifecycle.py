@@ -74,10 +74,10 @@ class EquityExitLifecycleTests(unittest.TestCase):
             self.assertEqual(restored._intermediate_targets["AAPL"], 106.0)
             self.assertEqual(restored._tp_targets["AAPL"], 120.0)
 
-    def test_restored_stagnant_position_closes(self):
+    def test_restored_losing_position_closes(self):
         with tempfile.TemporaryDirectory() as directory:
             state_path = Path(directory) / "position_exit_state.json"
-            client = MockClient([MockPosition("AAPL", "10", 100.5)])
+            client = MockClient([MockPosition("AAPL", "10", 98.5)])
             source = build_executor(client, state_path)
             source._entry_log["AAPL"] = {
                 "strategy": "Momentum",
@@ -92,12 +92,32 @@ class EquityExitLifecycleTests(unittest.TestCase):
             restored = build_executor(client, state_path)
             restored._restore_exit_state()
             with patch.object(enhanced, "DEAD_MONEY_MINUTES", 45), patch.object(
-                enhanced, "DEAD_MONEY_MAX_PRICE_DRIFT_PCT", 1.5
+                enhanced, "DEAD_MONEY_MAX_ADVERSE_DRIFT_PCT", 1.5
             ):
                 restored.check_dead_money()
 
             self.assertEqual(len(client.orders), 1)
             self.assertFalse(state_path.exists())
+
+    def test_restored_profitable_position_is_not_time_loss_exit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = Path(directory) / "position_exit_state.json"
+            client = MockClient([MockPosition("AAPL", "10", 101.5)])
+            executor = build_executor(client, state_path)
+            executor._entry_log["AAPL"] = {
+                "strategy": "Momentum",
+                "date": datetime.date.today(),
+                "confidence": 0.9,
+                "entry_time": datetime.datetime.now() - datetime.timedelta(minutes=46),
+                "entry_price": 100.0,
+            }
+
+            with patch.object(enhanced, "DEAD_MONEY_MINUTES", 45), patch.object(
+                enhanced, "DEAD_MONEY_MAX_ADVERSE_DRIFT_PCT", 1.5
+            ):
+                executor.check_dead_money()
+
+            self.assertEqual(client.orders, [])
 
     def test_eod_close_releases_trailing_order_for_untracked_position(self):
         class EodClient(MockClient):
