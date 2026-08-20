@@ -320,6 +320,8 @@ MAX_POSITIONS        = int(os.getenv("MAX_POSITIONS", "12"))  # max open stock p
 SWAP_ON_FULL         = True   # enabled — close weakest position for a better signal when full
 SWAP_MIN_CONFIDENCE  = 0.68   # was 0.75 — lower threshold → more aggressive swaps
 POSITION_SIZE_PCT    = float(os.getenv("POSITION_SIZE_PCT", "6.0"))  # % of equity per position; override via .env
+LIVE_PROBE_MODE      = os.getenv("LIVE_PROBE_MODE", "false").lower() in ("1", "true", "yes")
+LIVE_PROBE_SHARES    = max(1, int(os.getenv("LIVE_PROBE_SHARES", "1")))
 # Margin leverage multiplier: 1.0 = no leverage, 4.0 = 4× intraday margin (requires margin account + marginable stock)
 # Only stocks flagged marginable=True by Alpaca are eligible when MARGIN_LEVERAGE > 1.0
 MARGIN_LEVERAGE      = float(os.getenv("MARGIN_LEVERAGE", "1.0"))
@@ -367,9 +369,13 @@ TP_INTERMEDIATE_TRAIL_PCT = float(os.getenv("TP_INTERMEDIATE_TRAIL_PCT", "3.0"))
 TP_FINAL_PCT              = float(os.getenv("TP_FINAL_PCT",              "10.0")) # close full at +10%
 
 # ── Time-based loss exit ────────────────────────────────────────────────────
-# Close positions still moving adversely by X% after N minutes.
+# Close positions still moving adversely after N minutes using 0.35 × ATR%,
+# bounded between the configured minimum and maximum thresholds.
 DEAD_MONEY_MINUTES                   = int(os.getenv("DEAD_MONEY_MINUTES", "90"))
 DEAD_MONEY_MAX_ADVERSE_DRIFT_PCT     = float(os.getenv("DEAD_MONEY_MAX_ADVERSE_DRIFT_PCT", "1.5"))
+TIME_LOSS_ATR_MULTIPLIER             = float(os.getenv("TIME_LOSS_ATR_MULTIPLIER", "0.35"))
+TIME_LOSS_ATR_MIN_PCT                = float(os.getenv("TIME_LOSS_ATR_MIN_PCT", "1.0"))
+TIME_LOSS_ATR_MAX_PCT                = float(os.getenv("TIME_LOSS_ATR_MAX_PCT", "2.5"))
 
 # ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 # Dynamic ATR-Based Tier Assignment

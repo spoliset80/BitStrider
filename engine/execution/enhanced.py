@@ -52,11 +52,14 @@ from engine.config import (
     SMALL_ACCOUNT_EQUITY_THRESHOLD, SMALL_ACCOUNT_MAX_POSITIONS,
     SMALL_ACCOUNT_MIN_POSITION_DOLLARS,
     POSITION_SIZE_PCT, SMALL_ACCOUNT_POSITION_SIZE_PCT,
+    LIVE_PROBE_MODE, LIVE_PROBE_SHARES,
     CONF_SCALE_MIN_MULT, CONF_SCALE_FULL_CONF,
     MARGIN_LEVERAGE,
     SCALEOUT_TRAIL_PCT, PROTECT_POSITIONS_ENABLED,
     TP_INTERMEDIATE_PCT, TP_INTERMEDIATE_TRAIL_PCT, TP_FINAL_PCT,
     DEAD_MONEY_MINUTES, DEAD_MONEY_MAX_ADVERSE_DRIFT_PCT,
+    TIME_LOSS_ATR_MULTIPLIER, TIME_LOSS_ATR_MIN_PCT, TIME_LOSS_ATR_MAX_PCT,
+    ATR_STOP_MULTIPLIER,
     LIVE,
 )
 from engine.equity.strategies import Signal
@@ -183,6 +186,7 @@ class EnhancedExecutor:
                 "confidence": float(info.get("confidence", 0) or 0),
                 "entry_time": entry_time.isoformat(),
                 "entry_price": entry_price,
+                "atr_stop": info.get("atr_stop"),
                 "intermediate_target": self._intermediate_targets.get(sym),
                 "final_target": self._tp_targets.get(sym),
                 "tightened": sym in self._tightened,
@@ -216,6 +220,7 @@ class EnhancedExecutor:
                     "confidence": float(saved.get("confidence", 0) or 0),
                     "entry_time": entry_time,
                     "entry_price": float(saved["entry_price"]),
+                    "atr_stop": float(saved.get("atr_stop") or 0),
                 }
                 if saved.get("intermediate_target") is not None:
                     self._intermediate_targets[sym] = float(saved["intermediate_target"])
@@ -241,6 +246,7 @@ class EnhancedExecutor:
             "confidence": signal.confidence,
             "entry_time": datetime.datetime.now(),
             "entry_price": entry_price,
+            "atr_stop": float(getattr(signal, "atr_stop", 0) or 0),
         }
         self._save_exit_state()
 
@@ -910,6 +916,13 @@ class EnhancedExecutor:
         if order_type == OrderType.SHORT and LONG_ONLY_MODE:
             log.info(f"Skipping {signal.symbol} SHORT because LONG_ONLY_MODE is active")
             return False
+
+        if LIVE and LIVE_PROBE_MODE:
+            log.info(
+                f"LIVE PROBE {signal.symbol}: sizing {shares} → {LIVE_PROBE_SHARES} share(s); "
+                "no automatic scale-in"
+            )
+            shares = LIVE_PROBE_SHARES
 
         # Create new signal with market-validated price for order submission
         market_signal = entry_signal
@@ -1642,7 +1655,17 @@ class EnhancedExecutor:
 
             price_change_pct = (current_price - entry_price) / entry_price * 100
             adverse_drift_pct = -price_change_pct if qty > 0 else price_change_pct
-            if adverse_drift_pct < DEAD_MONEY_MAX_ADVERSE_DRIFT_PCT:
+            atr_stop = float(info.get("atr_stop") or 0)
+            if atr_stop > 0 and ATR_STOP_MULTIPLIER > 0:
+                atr_pct = atr_stop / ATR_STOP_MULTIPLIER / entry_price * 100
+                adverse_threshold_pct = min(
+                    TIME_LOSS_ATR_MAX_PCT,
+                    max(TIME_LOSS_ATR_MIN_PCT, atr_pct * TIME_LOSS_ATR_MULTIPLIER),
+                )
+            else:
+                adverse_threshold_pct = DEAD_MONEY_MAX_ADVERSE_DRIFT_PCT
+
+            if adverse_drift_pct < adverse_threshold_pct:
                 continue
 
             try:
@@ -1653,7 +1676,7 @@ class EnhancedExecutor:
                 ))
                 log.info(
                     f"TIME LOSS {sym}: held {elapsed_min:.0f} min, adverse drift {adverse_drift_pct:.2f}% "
-                    f">= {DEAD_MONEY_MAX_ADVERSE_DRIFT_PCT:.2f}% → closing"
+                    f">= {adverse_threshold_pct:.2f}% → closing"
                 )
                 self._entry_log.pop(sym, None)
                 self._tp_targets.pop(sym, None)

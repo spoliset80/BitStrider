@@ -49,6 +49,33 @@ def build_executor(client, state_path):
 
 
 class EquityExitLifecycleTests(unittest.TestCase):
+    def test_live_probe_uses_one_share_after_entry_checks(self):
+        executor = object.__new__(EnhancedExecutor)
+        executor.use_bracket_orders = True
+        submitted_shares = []
+        signal = SimpleNamespace(symbol="AAPL", price=100.0, confidence=0.9, strategy="Momentum")
+        account = SimpleNamespace(equity=10_000.0, buying_power=40_000.0, daytrade_count=0)
+        executor.pdt = SimpleNamespace(add=lambda _date: None, remaining=lambda *_args: 999)
+        executor._validate_trade = lambda *_args, **_kwargs: (True, None)
+        executor._validate_market_price = lambda *_args: (True, 100.0)
+        executor._size_with_buying_power = lambda *_args: (50, None)
+        executor._current_market_state = lambda: SimpleNamespace(is_regular_hours=True)
+        executor._create_bracket_order = lambda _signal, shares, *_args: submitted_shares.append(shares) or True
+        executor._record_entry = lambda *_args: None
+        executor._get_positions = lambda **_kwargs: None
+        executor._get_account = lambda **_kwargs: None
+
+        with patch.object(enhanced, "LIVE", True), patch.object(
+            enhanced, "LIVE_PROBE_MODE", True
+        ), patch.object(enhanced, "LIVE_PROBE_SHARES", 1), patch.object(
+            enhanced, "MARGIN_LEVERAGE", 1.0
+        ), patch.object(
+            enhanced, "calculate_risk_adjusted_size", return_value={"dollar_amount": 5_000.0}
+        ):
+            self.assertTrue(executor._execute_entry(signal, account, enhanced.OrderType.LONG))
+
+        self.assertEqual(submitted_shares, [1])
+
     def test_exit_state_round_trip_restores_targets(self):
         with tempfile.TemporaryDirectory() as directory:
             state_path = Path(directory) / "position_exit_state.json"
@@ -85,6 +112,7 @@ class EquityExitLifecycleTests(unittest.TestCase):
                 "confidence": 0.9,
                 "entry_time": datetime.datetime.now() - datetime.timedelta(minutes=46),
                 "entry_price": 100.0,
+                "atr_stop": 0.0,
             }
             source._tp_targets["AAPL"] = 120.0
             source._save_exit_state()
@@ -110,11 +138,34 @@ class EquityExitLifecycleTests(unittest.TestCase):
                 "confidence": 0.9,
                 "entry_time": datetime.datetime.now() - datetime.timedelta(minutes=46),
                 "entry_price": 100.0,
+                "atr_stop": 0.0,
             }
 
             with patch.object(enhanced, "DEAD_MONEY_MINUTES", 45), patch.object(
                 enhanced, "DEAD_MONEY_MAX_ADVERSE_DRIFT_PCT", 1.5
             ):
+                executor.check_dead_money()
+
+            self.assertEqual(client.orders, [])
+
+    def test_atr_time_loss_allows_normal_high_volatility_pullback(self):
+        with tempfile.TemporaryDirectory() as directory:
+            client = MockClient([MockPosition("AAPL", "10", 98.5)])
+            executor = build_executor(client, Path(directory) / "position_exit_state.json")
+            executor._entry_log["AAPL"] = {
+                "strategy": "Momentum",
+                "date": datetime.date.today(),
+                "confidence": 0.9,
+                "entry_time": datetime.datetime.now() - datetime.timedelta(minutes=46),
+                "entry_price": 100.0,
+                "atr_stop": 9.0,
+            }
+
+            with patch.object(enhanced, "DEAD_MONEY_MINUTES", 45), patch.object(
+                enhanced, "ATR_STOP_MULTIPLIER", 1.5
+            ), patch.object(enhanced, "TIME_LOSS_ATR_MULTIPLIER", 0.35), patch.object(
+                enhanced, "TIME_LOSS_ATR_MIN_PCT", 1.0
+            ), patch.object(enhanced, "TIME_LOSS_ATR_MAX_PCT", 2.5):
                 executor.check_dead_money()
 
             self.assertEqual(client.orders, [])
