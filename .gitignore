@@ -15,6 +15,7 @@ apextrader.log
 *.pid
 *.lock
 engine/.position_exit_state.json
+engine/.probe_journal.jsonl
 
 # Environment files
 .env

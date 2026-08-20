@@ -1,4 +1,5 @@
 import datetime
+import json
 import tempfile
 import threading
 import unittest
@@ -46,6 +47,8 @@ def build_executor(client, state_path):
     executor._live_probe_scaled_in = set()
     executor._exit_state_path = state_path
     executor._exit_state_lock = threading.Lock()
+    executor._probe_journal_path = state_path.with_name("probe_journal.jsonl")
+    executor._probe_journal_lock = threading.Lock()
     return executor
 
 
@@ -109,15 +112,59 @@ class EquityExitLifecycleTests(unittest.TestCase):
         ), patch.object(enhanced, "LIVE_PROBE_SCALE_IN_ENABLED", True), patch.object(
             enhanced, "LIVE_PROBE_SCALE_IN_MINUTES", 30
         ), patch.object(enhanced, "LIVE_PROBE_SCALE_IN_MIN_GAIN_PCT", 0.5), patch.object(
-            enhanced, "LIVE_PROBE_SCALE_IN_BUYING_POWER_PCT", 50.0
+            enhanced, "LIVE_PROBE_SCALE_IN_BUYING_POWER_PCT", 25.0
         ), patch.object(enhanced, "LIVE_PROBE_SCALE_IN_CUTOFF_TIME", "15:15"):
             with patch.object(enhanced, "get_dynamic_tier", return_value={"ts": 6.0}):
                 executor.check_live_probe_scale_ins()
                 executor.check_live_probe_scale_ins()
 
         self.assertEqual(len(client.orders), 2)
-        self.assertEqual(client.orders[0].qty, 49)
-        self.assertEqual(client.orders[1].qty, 49)
+        self.assertEqual(client.orders[0].qty, 24)
+        self.assertEqual(client.orders[1].qty, 24)
+
+    def test_short_probe_does_not_scale_in(self):
+        client = MockClient([MockPosition("AAPL", "-1", 99.0)])
+        with tempfile.TemporaryDirectory() as directory:
+            executor = build_executor(client, Path(directory) / "exit_state.json")
+            executor._options_cost_reserve = 0.0
+            executor._pdt_stop_blocked = {}
+            executor._get_account = lambda **_kwargs: SimpleNamespace(equity=10_000.0, buying_power=10_000.0)
+            executor._current_market_state = lambda: SimpleNamespace(
+                is_regular_hours=True,
+                now=datetime.datetime(2026, 8, 20, 10, 30),
+                resolve_regime=lambda: False,
+            )
+            executor._entry_log["AAPL"] = {
+                "entry_time": datetime.datetime.now() - datetime.timedelta(minutes=31),
+                "entry_price": 100.0,
+            }
+
+            with patch.object(enhanced, "LIVE", True), patch.object(
+                enhanced, "LIVE_PROBE_MODE", True
+            ), patch.object(enhanced, "LIVE_PROBE_SCALE_IN_ENABLED", True):
+                executor.check_live_probe_scale_ins()
+
+            self.assertEqual(client.orders, [])
+
+    def test_probe_outcome_journal_records_managed_exit(self):
+        client = MockClient([])
+        with tempfile.TemporaryDirectory() as directory:
+            executor = build_executor(client, Path(directory) / "exit_state.json")
+            executor._entry_log["AAPL"] = {
+                "strategy": "Momentum",
+                "regime_at_entry": "bull",
+                "entry_time": datetime.datetime(2026, 8, 20, 10, 0),
+                "entry_price": 100.0,
+            }
+            position = MockPosition("AAPL", "2", 105.0)
+            with patch.object(enhanced, "LIVE", True), patch.object(enhanced, "LIVE_PROBE_MODE", True):
+                executor._record_probe_outcome("AAPL", position, "TP_CLOSE")
+
+            record = json.loads(executor._probe_journal_path.read_text(encoding="utf-8"))
+            self.assertEqual(record["strategy"], "Momentum")
+            self.assertEqual(record["regime_at_entry"], "bull")
+            self.assertEqual(record["estimated_pnl_pct"], 5.0)
+            self.assertEqual(record["exit_reason"], "TP_CLOSE")
 
     def test_exit_state_round_trip_restores_targets(self):
         with tempfile.TemporaryDirectory() as directory:

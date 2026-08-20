@@ -326,7 +326,7 @@ LIVE_PROBE_MAX_ENTRIES_PER_DAY = max(1, int(os.getenv("LIVE_PROBE_MAX_ENTRIES_PE
 LIVE_PROBE_SCALE_IN_ENABLED = os.getenv("LIVE_PROBE_SCALE_IN_ENABLED", "false").lower() in ("1", "true", "yes")
 LIVE_PROBE_SCALE_IN_MINUTES = max(1, int(os.getenv("LIVE_PROBE_SCALE_IN_MINUTES", "30")))
 LIVE_PROBE_SCALE_IN_MIN_GAIN_PCT = float(os.getenv("LIVE_PROBE_SCALE_IN_MIN_GAIN_PCT", "0.5"))
-LIVE_PROBE_SCALE_IN_BUYING_POWER_PCT = float(os.getenv("LIVE_PROBE_SCALE_IN_BUYING_POWER_PCT", "50.0"))
+LIVE_PROBE_SCALE_IN_BUYING_POWER_PCT = float(os.getenv("LIVE_PROBE_SCALE_IN_BUYING_POWER_PCT", "25.0"))
 LIVE_PROBE_SCALE_IN_CUTOFF_TIME = os.getenv("LIVE_PROBE_SCALE_IN_CUTOFF_TIME", "15:15")
 # Margin leverage multiplier: 1.0 = no leverage, 4.0 = 4× intraday margin (requires margin account + marginable stock)
 # Only stocks flagged marginable=True by Alpaca are eligible when MARGIN_LEVERAGE > 1.0

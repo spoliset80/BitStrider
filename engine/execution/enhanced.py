@@ -159,6 +159,8 @@ class EnhancedExecutor:
         self._options_cost_reserve: float = 0.0  # $ currently deployed in options — set by orchestrator each cycle
         self._exit_state_path = Path(__file__).resolve().parent.parent / ".position_exit_state.json"
         self._exit_state_lock = threading.Lock()
+        self._probe_journal_path = Path(__file__).resolve().parent.parent / ".probe_journal.jsonl"
+        self._probe_journal_lock = threading.Lock()
         self._submitted_entry_orders: Dict[str, object] = {}
         self._live_probe_count_date: Optional[datetime.date] = None
         self._live_probe_entries_today = 0
@@ -194,6 +196,7 @@ class EnhancedExecutor:
                 "entry_time": entry_time.isoformat(),
                 "entry_price": entry_price,
                 "atr_stop": info.get("atr_stop"),
+                "regime_at_entry": info.get("regime_at_entry", "unknown"),
                 "scaled_in": sym in self._live_probe_scaled_in,
                 "intermediate_target": self._intermediate_targets.get(sym),
                 "final_target": self._tp_targets.get(sym),
@@ -229,6 +232,7 @@ class EnhancedExecutor:
                     "entry_time": entry_time,
                     "entry_price": float(saved["entry_price"]),
                     "atr_stop": float(saved.get("atr_stop") or 0),
+                    "regime_at_entry": saved.get("regime_at_entry", "unknown"),
                 }
                 if saved.get("intermediate_target") is not None:
                     self._intermediate_targets[sym] = float(saved["intermediate_target"])
@@ -250,6 +254,10 @@ class EnhancedExecutor:
         entry_price = float(getattr(order, "filled_avg_price", 0) or 0)
         if entry_price <= 0:
             entry_price = fallback_price
+        try:
+            regime_at_entry = "bull" if self._current_market_state().resolve_regime() else "bear"
+        except Exception:
+            regime_at_entry = "unknown"
         self._entry_log[signal.symbol] = {
             "strategy": signal.strategy,
             "date": datetime.date.today(),
@@ -257,10 +265,46 @@ class EnhancedExecutor:
             "entry_time": datetime.datetime.now(),
             "entry_price": entry_price,
             "atr_stop": float(getattr(signal, "atr_stop", 0) or 0),
+            "regime_at_entry": regime_at_entry,
         }
         if LIVE and LIVE_PROBE_MODE:
             self._live_probe_entries_today += 1
         self._save_exit_state()
+
+    def _record_probe_outcome(self, sym: str, pos, exit_reason: str) -> None:
+        """Append a secret-free mark-to-market outcome for a bot-managed live probe exit."""
+        if not (LIVE and LIVE_PROBE_MODE):
+            return
+        info = self._entry_log.get(sym)
+        if not info:
+            return
+        entry_price = float(info.get("entry_price") or 0)
+        exit_price = float(getattr(pos, "current_price", 0) or 0)
+        qty = int(float(getattr(pos, "qty", 0) or 0))
+        if entry_price <= 0 or exit_price <= 0 or qty == 0:
+            return
+        direction = "long" if qty > 0 else "short"
+        pnl_pct = ((exit_price - entry_price) / entry_price * 100) * (1 if qty > 0 else -1)
+        payload = {
+            "timestamp": datetime.datetime.now().isoformat(),
+            "symbol": sym,
+            "strategy": info.get("strategy", "unknown"),
+            "regime_at_entry": info.get("regime_at_entry", "unknown"),
+            "direction": direction,
+            "entry_time": info.get("entry_time").isoformat() if isinstance(info.get("entry_time"), datetime.datetime) else None,
+            "entry_price": entry_price,
+            "exit_mark_price": exit_price,
+            "quantity": abs(qty),
+            "estimated_pnl_pct": round(pnl_pct, 4),
+            "scaled_in": sym in self._live_probe_scaled_in,
+            "exit_reason": exit_reason,
+        }
+        try:
+            with self._probe_journal_lock:
+                with self._probe_journal_path.open("a", encoding="utf-8") as journal:
+                    journal.write(json.dumps(payload) + "\n")
+        except Exception as e:
+            log.warning(f"Could not record probe outcome for {sym}: {e}")
 
     def _restore_live_probe_count(self) -> None:
         """Recount today's probe entries so the live cap survives watchdog restarts."""
@@ -345,7 +389,7 @@ class EnhancedExecutor:
             gain_pct = ((current_price - entry_price) / entry_price * 100) * (1 if is_long else -1)
             if gain_pct < LIVE_PROBE_SCALE_IN_MIN_GAIN_PCT:
                 continue
-            if (is_long and not is_bull) or (not is_long and is_bull):
+            if not (is_long and is_bull):
                 continue
 
             margin = 1.0 if is_long else 2.0
@@ -1407,6 +1451,7 @@ class EnhancedExecutor:
                     side=side, time_in_force=TimeInForce.DAY,
                 )
                 self.client.submit_order(req)
+                self._record_probe_outcome(sym, pos, "EOD_CLOSE")
                 self._entry_log.pop(sym, None)
                 self._tp_targets.pop(sym, None)
                 self._intermediate_targets.pop(sym, None)
@@ -1698,6 +1743,7 @@ class EnhancedExecutor:
                             symbol=sym, qty=abs(qty), side=side,
                             time_in_force=TimeInForce.DAY,
                         ))
+                        self._record_probe_outcome(sym, pos, "TP_CLOSE")
                         log.info(
                             f"TP CLOSE {sym}: ${cur:.2f} hit +{TP_FINAL_PCT:.0f}% target ${final_tp:.2f} "
                             f"→ market close (full position)"
@@ -1820,6 +1866,7 @@ class EnhancedExecutor:
                     symbol=sym, qty=abs(qty), side=side,
                     time_in_force=TimeInForce.DAY,
                 ))
+                self._record_probe_outcome(sym, pos, "TIME_LOSS")
                 log.info(
                     f"TIME LOSS {sym}: held {elapsed_min:.0f} min, adverse drift {adverse_drift_pct:.2f}% "
                     f">= {adverse_threshold_pct:.2f}% → closing"
