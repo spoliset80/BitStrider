@@ -53,7 +53,7 @@ from engine.config import (
     MARGIN_LEVERAGE,
     SCALEOUT_TRAIL_PCT, PROTECT_POSITIONS_ENABLED,
     TP_INTERMEDIATE_PCT, TP_INTERMEDIATE_TRAIL_PCT, TP_FINAL_PCT,
-    DEAD_MONEY_MINUTES, DEAD_MONEY_MIN_GAIN_PCT,
+    DEAD_MONEY_MINUTES, DEAD_MONEY_MAX_PRICE_DRIFT_PCT,
     LIVE,
 )
 from engine.equity.strategies import Signal
@@ -555,7 +555,6 @@ class EnhancedExecutor:
 
             # Set dual-phase TP targets from entry price
             _ep  = signal.price
-            _mul = (1 + 1/100) if order_type == OrderType.LONG else (1 - 1/100)  # directional
             _int_price   = round(_ep * (1 + TP_INTERMEDIATE_PCT / 100), 2) if order_type == OrderType.LONG \
                            else round(_ep * (1 - TP_INTERMEDIATE_PCT / 100), 2)
             _final_price = round(_ep * (1 + TP_FINAL_PCT / 100), 2) if order_type == OrderType.LONG \
@@ -566,13 +565,6 @@ class EnhancedExecutor:
                 f"TP targets set {signal.symbol}: tighten@${_int_price:.2f} (+{TP_INTERMEDIATE_PCT:.0f}%) "
                 f"close@${_final_price:.2f} (+{TP_FINAL_PCT:.0f}%)"
             )
-
-            # Always set a TP target — checked each cycle by check_tp_targets()
-            from engine.config import TAKE_PROFIT_PCT as _TP_PCT
-            _tp = round(signal.price * (1 + _TP_PCT / 100), 2) if order_type == OrderType.LONG \
-                else round(signal.price * (1 - _TP_PCT / 100), 2)
-            self._tp_targets[signal.symbol] = _tp
-            log.info(f"TP target set {signal.symbol}: ${_tp:.2f} (+{_TP_PCT:.0f}% {'long' if order_type == OrderType.LONG else 'short'})")
 
         except Exception as e:
             err = str(e).lower()
@@ -1528,7 +1520,7 @@ class EnhancedExecutor:
             self._tightened.discard(sym)
 
     def check_dead_money(self) -> None:
-        """Close stagnant positions: held > DEAD_MONEY_MINUTES with gain < DEAD_MONEY_MIN_GAIN_PCT.
+        """Close positions held for DEAD_MONEY_MINUTES with minimal price movement.
         Frees buying power for the next high-quality signal. Called each scan cycle.
         """
         if not self._entry_log:
@@ -1555,9 +1547,15 @@ class EnhancedExecutor:
             if qty == 0:
                 continue
 
-            unrealized_pct = float(getattr(pos, "unrealized_plpc", 0) or 0) * 100
-            if unrealized_pct >= DEAD_MONEY_MIN_GAIN_PCT:
-                continue  # position is moving — let it run
+            entry_price = float(info.get("entry_price") or 0)
+            current_price = float(getattr(pos, "current_price", 0) or 0)
+            if entry_price <= 0 or current_price <= 0:
+                log.warning(f"DEAD MONEY {sym}: missing entry or current price; skipping drift check")
+                continue
+
+            price_drift_pct = abs(current_price - entry_price) / entry_price * 100
+            if price_drift_pct > DEAD_MONEY_MAX_PRICE_DRIFT_PCT:
+                continue
 
             try:
                 side = OrderSide.SELL if qty > 0 else OrderSide.BUY
@@ -1566,8 +1564,8 @@ class EnhancedExecutor:
                     time_in_force=TimeInForce.DAY,
                 ))
                 log.info(
-                    f"DEAD MONEY {sym}: held {elapsed_min:.0f} min, gain {unrealized_pct:+.1f}% "
-                    f"< {DEAD_MONEY_MIN_GAIN_PCT:.0f}% → closing (freeing capital)"
+                    f"DEAD MONEY {sym}: held {elapsed_min:.0f} min, price drift {price_drift_pct:.2f}% "
+                    f"<= {DEAD_MONEY_MAX_PRICE_DRIFT_PCT:.2f}% → closing (freeing capital)"
                 )
                 self._entry_log.pop(sym, None)
                 self._tp_targets.pop(sym, None)

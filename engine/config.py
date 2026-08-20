@@ -367,10 +367,10 @@ TP_INTERMEDIATE_TRAIL_PCT = float(os.getenv("TP_INTERMEDIATE_TRAIL_PCT", "3.0"))
 TP_FINAL_PCT              = float(os.getenv("TP_FINAL_PCT",              "10.0")) # close full at +10%
 
 # ── Dead money exit (Option D) ──────────────────────────────────────────────
-# Close positions that are stagnating: held > N minutes with gain < X%
+# Close positions that are stagnating: held > N minutes with price drift <= X%
 # Frees buying power for the next high-quality signal
-DEAD_MONEY_MINUTES        = int(os.getenv("DEAD_MONEY_MINUTES",        "90"))   # close if held > 90 min
-DEAD_MONEY_MIN_GAIN_PCT   = float(os.getenv("DEAD_MONEY_MIN_GAIN_PCT", "3.0"))  # and gain is < 3%
+DEAD_MONEY_MINUTES             = int(os.getenv("DEAD_MONEY_MINUTES", "90"))
+DEAD_MONEY_MAX_PRICE_DRIFT_PCT = float(os.getenv("DEAD_MONEY_MAX_PRICE_DRIFT_PCT", "0.5"))
 
 # ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 # Dynamic ATR-Based Tier Assignment
@@ -388,14 +388,14 @@ HIGH_MOMENTUM_STOCKS    = ["QNTM", "MRLN", "DMRA", "RCAX", "ALDX", "NAMM", "PAYP
 # ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 # Adaptive Scan Intervals (VIX-Based)
 # ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
-ADAPTIVE_INTERVALS          = True
+ADAPTIVE_INTERVALS          = os.getenv("ADAPTIVE_INTERVALS", "true").lower() in ("1", "true", "yes")
 SCAN_INTERVAL_EXTREME_VOL   = 3    # VIX > 30
 SCAN_INTERVAL_HIGH_VOL      = 5    # VIX 26-30
 SCAN_INTERVAL_MODERATE_VOL  = 10   # VIX 22-26
 SCAN_INTERVAL_NORMAL_VOL    = 15   # VIX 18-22
 SCAN_INTERVAL_CALM_VOL      = 20   # VIX 15-18
 SCAN_INTERVAL_LOW_VOL       = 30   # VIX < 15
-SCAN_INTERVAL_MIN            = 10  # Default fallback
+SCAN_INTERVAL_MIN            = int(os.getenv("SCAN_INTERVAL_MIN", "10"))
 
 # ─────────────────────────────────────────────────────────────────
 # Kill Mode — Emergency Capital Protection
