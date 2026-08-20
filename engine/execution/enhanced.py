@@ -52,7 +52,10 @@ from engine.config import (
     SMALL_ACCOUNT_EQUITY_THRESHOLD, SMALL_ACCOUNT_MAX_POSITIONS,
     SMALL_ACCOUNT_MIN_POSITION_DOLLARS,
     POSITION_SIZE_PCT, SMALL_ACCOUNT_POSITION_SIZE_PCT,
-    LIVE_PROBE_MODE, LIVE_PROBE_SHARES,
+    LIVE_PROBE_MODE, LIVE_PROBE_SHARES, LIVE_PROBE_MAX_ENTRIES_PER_DAY,
+    LIVE_PROBE_SCALE_IN_ENABLED, LIVE_PROBE_SCALE_IN_MINUTES,
+    LIVE_PROBE_SCALE_IN_MIN_GAIN_PCT, LIVE_PROBE_SCALE_IN_MAX_POSITION_PCT,
+    LIVE_PROBE_SCALE_IN_CUTOFF_TIME,
     CONF_SCALE_MIN_MULT, CONF_SCALE_FULL_CONF,
     MARGIN_LEVERAGE,
     SCALEOUT_TRAIL_PCT, PROTECT_POSITIONS_ENABLED,
@@ -157,8 +160,12 @@ class EnhancedExecutor:
         self._exit_state_path = Path(__file__).resolve().parent.parent / ".position_exit_state.json"
         self._exit_state_lock = threading.Lock()
         self._submitted_entry_orders: Dict[str, object] = {}
+        self._live_probe_count_date: Optional[datetime.date] = None
+        self._live_probe_entries_today = 0
+        self._live_probe_scaled_in: set = set()
         self._restore_exit_state()
         self._rebuild_entry_log_from_orders()
+        self._restore_live_probe_count()
 
     def update_market_state(self, market_state: MarketState) -> None:
         """Store the active market snapshot for per-cycle execution decisions."""
@@ -187,6 +194,7 @@ class EnhancedExecutor:
                 "entry_time": entry_time.isoformat(),
                 "entry_price": entry_price,
                 "atr_stop": info.get("atr_stop"),
+                "scaled_in": sym in self._live_probe_scaled_in,
                 "intermediate_target": self._intermediate_targets.get(sym),
                 "final_target": self._tp_targets.get(sym),
                 "tightened": sym in self._tightened,
@@ -228,6 +236,8 @@ class EnhancedExecutor:
                     self._tp_targets[sym] = float(saved["final_target"])
                 if saved.get("tightened"):
                     self._tightened.add(sym)
+                if saved.get("scaled_in"):
+                    self._live_probe_scaled_in.add(sym)
             self._save_exit_state()
             if self._entry_log:
                 log.info(f"Restored position exit state: {', '.join(self._entry_log)}")
@@ -248,7 +258,139 @@ class EnhancedExecutor:
             "entry_price": entry_price,
             "atr_stop": float(getattr(signal, "atr_stop", 0) or 0),
         }
+        if LIVE and LIVE_PROBE_MODE:
+            self._live_probe_entries_today += 1
         self._save_exit_state()
+
+    def _restore_live_probe_count(self) -> None:
+        """Recount today's probe entries so the live cap survives watchdog restarts."""
+        if not (LIVE and LIVE_PROBE_MODE):
+            return
+        today = datetime.date.today()
+        try:
+            import pytz
+            from alpaca.trading.requests import GetOrdersRequest
+            from alpaca.trading.enums import QueryOrderStatus
+
+            today_start = datetime.datetime.combine(today, datetime.time.min).replace(tzinfo=pytz.UTC)
+            orders = self.client.get_orders(filter=GetOrdersRequest(status=QueryOrderStatus.ALL, after=today_start))
+            self._live_probe_entries_today = sum(
+                1 for order in orders
+                if str(getattr(order, "client_order_id", "")).startswith("apex-")
+                and str(getattr(order, "side", "")).lower() in ("buy", "sell")
+            )
+            self._live_probe_count_date = today
+            log.info(
+                f"LIVE PROBE daily count restored: {self._live_probe_entries_today}/"
+                f"{LIVE_PROBE_MAX_ENTRIES_PER_DAY}"
+            )
+        except Exception as e:
+            self._live_probe_count_date = None
+            log.warning(f"Could not restore live probe daily count: {e}")
+
+    def _can_submit_live_probe(self) -> bool:
+        """Return whether the live probe daily cap permits another entry."""
+        if not (LIVE and LIVE_PROBE_MODE):
+            return True
+        if self._live_probe_count_date != datetime.date.today():
+            self._restore_live_probe_count()
+        if self._live_probe_count_date != datetime.date.today():
+            log.warning("LIVE PROBE skipped: unable to verify today's entry count")
+            return False
+        if self._live_probe_entries_today >= LIVE_PROBE_MAX_ENTRIES_PER_DAY:
+            log.info(
+                f"LIVE PROBE skipped: daily cap reached "
+                f"({self._live_probe_entries_today}/{LIVE_PROBE_MAX_ENTRIES_PER_DAY})"
+            )
+            return False
+        return True
+
+    def check_live_probe_scale_ins(self) -> None:
+        """Add once to a profitable live probe while its direction still matches regime."""
+        if not (LIVE and LIVE_PROBE_MODE and LIVE_PROBE_SCALE_IN_ENABLED):
+            return
+        if not self._entry_log or not self._current_market_state().is_regular_hours:
+            return
+
+        cutoff_hour, cutoff_minute = map(int, LIVE_PROBE_SCALE_IN_CUTOFF_TIME.split(":"))
+        market_state = self._current_market_state()
+        if (market_state.now.hour, market_state.now.minute) >= (cutoff_hour, cutoff_minute):
+            return
+
+        try:
+            positions = {p.symbol: p for p in self.client.get_all_positions()}
+            account = self._get_account(force_refresh=True)
+        except Exception as e:
+            log.warning(f"LIVE PROBE scale-in check failed: {e}")
+            return
+
+        state_changed = False
+        is_bull = market_state.resolve_regime()
+        for sym, info in list(self._entry_log.items()):
+            if sym in self._live_probe_scaled_in or sym in self._tightened:
+                continue
+            entry_time = info.get("entry_time")
+            entry_price = float(info.get("entry_price") or 0)
+            pos = positions.get(sym)
+            if not isinstance(entry_time, datetime.datetime) or entry_price <= 0 or pos is None:
+                continue
+            if (datetime.datetime.now() - entry_time).total_seconds() < LIVE_PROBE_SCALE_IN_MINUTES * 60:
+                continue
+
+            qty = int(float(getattr(pos, "qty", 0) or 0))
+            current_price = float(getattr(pos, "current_price", 0) or 0)
+            if qty == 0 or current_price <= 0:
+                continue
+            is_long = qty > 0
+            gain_pct = ((current_price - entry_price) / entry_price * 100) * (1 if is_long else -1)
+            if gain_pct < LIVE_PROBE_SCALE_IN_MIN_GAIN_PCT:
+                continue
+            if (is_long and not is_bull) or (not is_long and is_bull):
+                continue
+
+            target_dollars = account.equity * LIVE_PROBE_SCALE_IN_MAX_POSITION_PCT / 100
+            target_shares = int(target_dollars / current_price)
+            add_shares = max(0, target_shares - abs(qty))
+            margin = 1.0 if is_long else 2.0
+            usable_bp = max(0.0, account.buying_power - self._options_cost_reserve)
+            add_shares = min(add_shares, int(usable_bp / (current_price * margin)))
+            if add_shares < 1:
+                log.info(f"LIVE PROBE {sym}: scale-in skipped; insufficient buying power for cap")
+                continue
+
+            side = OrderSide.BUY if is_long else OrderSide.SELL
+            try:
+                self.client.submit_order(MarketOrderRequest(
+                    symbol=sym, qty=add_shares, side=side,
+                    time_in_force=TimeInForce.DAY,
+                ))
+                stop_side = OrderSide.SELL if is_long else OrderSide.BUY
+                trail_pct = get_dynamic_tier(sym, current_price)["ts"]
+                try:
+                    self.client.submit_order(TrailingStopOrderRequest(
+                        symbol=sym, qty=add_shares, side=stop_side,
+                        type=AlpacaOrderType.TRAILING_STOP,
+                        time_in_force=TimeInForce.GTC,
+                        trail_percent=trail_pct,
+                    ))
+                except Exception as stop_error:
+                    stop_price = current_price * (1 - trail_pct / 100) if is_long else current_price * (1 + trail_pct / 100)
+                    self._pdt_stop_blocked[sym] = stop_price
+                    log.warning(
+                        f"LIVE PROBE {sym}: scale-in trailing stop rejected ({stop_error}); "
+                        f"software stop armed at ${stop_price:.2f}"
+                    )
+                self._live_probe_scaled_in.add(sym)
+                state_changed = True
+                log.info(
+                    f"LIVE PROBE SCALE-IN {sym}: +{add_shares} shares after {LIVE_PROBE_SCALE_IN_MINUTES} min "
+                    f"at {gain_pct:+.2f}% | total cap {LIVE_PROBE_SCALE_IN_MAX_POSITION_PCT:.1f}% equity"
+                )
+            except Exception as e:
+                log.warning(f"LIVE PROBE scale-in failed {sym}: {e}")
+
+        if state_changed:
+            self._save_exit_state()
 
     # -- Entry Log Rebuild (survive restarts) ----------------------------
     def _rebuild_entry_log_from_orders(self) -> None:
@@ -833,6 +975,9 @@ class EnhancedExecutor:
         if not valid:
             if reason:
                 log.info(f"Skip {signal.symbol}: {reason}")
+            return False
+
+        if not self._can_submit_live_probe():
             return False
 
         # ── Market Data Price Validation: ensure signal price is still valid ────

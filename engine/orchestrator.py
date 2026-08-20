@@ -611,6 +611,7 @@ def scan_and_trade(ctx: AppContext) -> None:
     ctx.executor.update_stale_orders()
     ctx.executor.check_tp_targets()
     ctx.executor.check_dead_money()
+    ctx.executor.check_live_probe_scale_ins()
 
     _run_discovery(ctx, market_state)
 

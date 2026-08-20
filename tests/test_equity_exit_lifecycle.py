@@ -43,6 +43,7 @@ def build_executor(client, state_path):
     executor._tp_targets = {}
     executor._intermediate_targets = {}
     executor._tightened = set()
+    executor._live_probe_scaled_in = set()
     executor._exit_state_path = state_path
     executor._exit_state_lock = threading.Lock()
     return executor
@@ -57,6 +58,7 @@ class EquityExitLifecycleTests(unittest.TestCase):
         account = SimpleNamespace(equity=10_000.0, buying_power=40_000.0, daytrade_count=0)
         executor.pdt = SimpleNamespace(add=lambda _date: None, remaining=lambda *_args: 999)
         executor._validate_trade = lambda *_args, **_kwargs: (True, None)
+        executor._can_submit_live_probe = lambda: True
         executor._validate_market_price = lambda *_args: (True, 100.0)
         executor._size_with_buying_power = lambda *_args: (50, None)
         executor._current_market_state = lambda: SimpleNamespace(is_regular_hours=True)
@@ -75,6 +77,47 @@ class EquityExitLifecycleTests(unittest.TestCase):
             self.assertTrue(executor._execute_entry(signal, account, enhanced.OrderType.LONG))
 
         self.assertEqual(submitted_shares, [1])
+
+    def test_live_probe_daily_cap_blocks_entry(self):
+        executor = object.__new__(EnhancedExecutor)
+        executor._live_probe_count_date = datetime.date.today()
+        executor._live_probe_entries_today = 10
+
+        with patch.object(enhanced, "LIVE", True), patch.object(
+            enhanced, "LIVE_PROBE_MODE", True
+        ), patch.object(enhanced, "LIVE_PROBE_MAX_ENTRIES_PER_DAY", 10):
+            self.assertFalse(executor._can_submit_live_probe())
+
+    def test_profitable_live_probe_scales_in_once_to_cap(self):
+        client = MockClient([MockPosition("AAPL", "1", 101.0)])
+        executor = build_executor(client, Path(tempfile.gettempdir()) / "unused_probe_state.json")
+        executor._options_cost_reserve = 0.0
+        executor._pdt_stop_blocked = {}
+        executor._get_account = lambda **_kwargs: SimpleNamespace(equity=10_000.0, buying_power=10_000.0)
+        executor._current_market_state = lambda: SimpleNamespace(
+            is_regular_hours=True,
+            now=datetime.datetime(2026, 8, 20, 10, 30),
+            resolve_regime=lambda: True,
+        )
+        executor._entry_log["AAPL"] = {
+            "entry_time": datetime.datetime.now() - datetime.timedelta(minutes=31),
+            "entry_price": 100.0,
+        }
+
+        with patch.object(enhanced, "LIVE", True), patch.object(
+            enhanced, "LIVE_PROBE_MODE", True
+        ), patch.object(enhanced, "LIVE_PROBE_SCALE_IN_ENABLED", True), patch.object(
+            enhanced, "LIVE_PROBE_SCALE_IN_MINUTES", 30
+        ), patch.object(enhanced, "LIVE_PROBE_SCALE_IN_MIN_GAIN_PCT", 0.5), patch.object(
+            enhanced, "LIVE_PROBE_SCALE_IN_MAX_POSITION_PCT", 25.0
+        ), patch.object(enhanced, "LIVE_PROBE_SCALE_IN_CUTOFF_TIME", "15:15"):
+            with patch.object(enhanced, "get_dynamic_tier", return_value={"ts": 6.0}):
+                executor.check_live_probe_scale_ins()
+                executor.check_live_probe_scale_ins()
+
+        self.assertEqual(len(client.orders), 2)
+        self.assertEqual(client.orders[0].qty, 23)
+        self.assertEqual(client.orders[1].qty, 23)
 
     def test_exit_state_round_trip_restores_targets(self):
         with tempfile.TemporaryDirectory() as directory:
