@@ -962,10 +962,24 @@ class ORBStrategy:
             return None
 
         price = float(intraday["close"].iloc[-1])
+        atr14 = _calc_atr14(intraday)
+        buffer_distance = (
+            atr14 * ORB["breakout_buffer_atr"]
+            if atr14 > 0
+            else price * ORB["breakout_buffer_pct"] / 100
+        )
 
-        # Must break above ORB high by at least a small buffer
-        if price <= orb_high * (1 + ORB["breakout_buffer_pct"] / 100):
+        # Require an adaptive volatility-scaled break above the range high.
+        if price <= orb_high + buffer_distance:
             return None
+
+        # Avoid breakouts that remain below the session's volume-weighted price.
+        volume_total = float(intraday["volume"].sum())
+        if ORB["require_above_vwap"] and volume_total > 0:
+            typical_price = (intraday["high"] + intraday["low"] + intraday["close"]) / 3
+            session_vwap = float((typical_price * intraday["volume"]).sum() / volume_total)
+            if price <= session_vwap:
+                return None
 
         # Volume confirmation: last 3 bars vs ORB avg
         vol_post = intraday["volume"].iloc[ORB["range_minutes"]:].iloc[-3:].mean()
@@ -974,7 +988,16 @@ class ORBStrategy:
             return None
         vol_ratio = vol_post / vol_orb
 
-        if vol_ratio < ORB["volume_surge"]:
+        range_pct = orb_range / price * 100
+        range_span = max(ORB["range_vol_high_pct"] - ORB["range_vol_low_pct"], 0.01)
+        range_factor = min(
+            1.0,
+            max(0.0, (range_pct - ORB["range_vol_low_pct"]) / range_span),
+        )
+        volume_threshold = ORB["volume_surge_min"] + (
+            ORB["volume_surge_max"] - ORB["volume_surge_min"]
+        ) * range_factor
+        if vol_ratio < volume_threshold:
             return None
 
         # R-multiple: reward = price - orb_high, risk = orb_range
@@ -983,8 +1006,10 @@ class ORBStrategy:
 
         return Signal(
             symbol, "buy", price, confidence,
-            f"ORB breakout above ${orb_high:.2f} | range ${orb_range:.2f} | vol x{vol_ratio:.1f}",
+            f"ORB breakout above ${orb_high:.2f} | range ${orb_range:.2f} | "
+            f"buffer ${buffer_distance:.2f} | vol x{vol_ratio:.1f}/{volume_threshold:.1f}",
             "ORB",
+            atr_stop=max(price - orb_low, orb_range),
         )
 
 

@@ -45,7 +45,8 @@ from engine.config import (
     MIN_BUYING_POWER_PCT, MIN_POSITION_DOLLARS, PDT_WARN_AT_REMAINING,
     TAKE_PROFIT_NORMAL, TAKE_PROFIT_HIGH, STOP_LOSS_PCT,
     ATR_TP_RATIO, MAX_SHORT_FLOAT_PCT, HIGH_SHORT_FLOAT_STOCKS, is_high_short_float,
-    EOD_CLOSE_ENABLED, EOD_CLOSE_ALL, EOD_CLOSE_TIME, EOD_CLOSE_STRATEGIES,
+    EOD_CLOSE_ENABLED, EOD_CLOSE_ALL, EOD_CLOSE_TIME, EOD_AFTERHOURS_LIMIT_BUFFER_PCT,
+    MARGIN_EOD_FORCE_CLOSE, EOD_CLOSE_STRATEGIES,
     LONG_ONLY_MODE,
     STALE_ORDER_MINUTES, STALE_ORDER_MINUTES_INTRADAY,
     KILL_MODE_TRAIL_PCT,
@@ -55,6 +56,7 @@ from engine.config import (
     LIVE_PROBE_MODE, LIVE_PROBE_SHARES, LIVE_PROBE_MAX_ENTRIES_PER_DAY,
     LIVE_PROBE_SCALE_IN_ENABLED, LIVE_PROBE_SCALE_IN_MINUTES,
     LIVE_PROBE_SCALE_IN_MIN_GAIN_PCT, LIVE_PROBE_SCALE_IN_BUYING_POWER_PCT,
+    LIVE_PROBE_MAX_TOTAL_BUYING_POWER_PCT,
     LIVE_PROBE_SCALE_IN_CUTOFF_TIME,
     CONF_SCALE_MIN_MULT, CONF_SCALE_FULL_CONF,
     MARGIN_LEVERAGE,
@@ -63,6 +65,7 @@ from engine.config import (
     DEAD_MONEY_MINUTES, DEAD_MONEY_MAX_ADVERSE_DRIFT_PCT,
     TIME_LOSS_ATR_MULTIPLIER, TIME_LOSS_ATR_MIN_PCT, TIME_LOSS_ATR_MAX_PCT,
     ATR_STOP_MULTIPLIER,
+    ORB,
     LIVE,
 )
 from engine.equity.strategies import Signal
@@ -267,13 +270,13 @@ class EnhancedExecutor:
             "atr_stop": float(getattr(signal, "atr_stop", 0) or 0),
             "regime_at_entry": regime_at_entry,
         }
-        if LIVE and LIVE_PROBE_MODE:
+        if LIVE_PROBE_MODE:
             self._live_probe_entries_today += 1
         self._save_exit_state()
 
     def _record_probe_outcome(self, sym: str, pos, exit_reason: str) -> None:
         """Append a secret-free mark-to-market outcome for a bot-managed live probe exit."""
-        if not (LIVE and LIVE_PROBE_MODE):
+        if not LIVE_PROBE_MODE:
             return
         info = self._entry_log.get(sym)
         if not info:
@@ -308,7 +311,7 @@ class EnhancedExecutor:
 
     def _restore_live_probe_count(self) -> None:
         """Recount today's probe entries so the live cap survives watchdog restarts."""
-        if not (LIVE and LIVE_PROBE_MODE):
+        if not LIVE_PROBE_MODE:
             return
         today = datetime.date.today()
         try:
@@ -334,7 +337,7 @@ class EnhancedExecutor:
 
     def _can_submit_live_probe(self) -> bool:
         """Return whether the live probe daily cap permits another entry."""
-        if not (LIVE and LIVE_PROBE_MODE):
+        if not LIVE_PROBE_MODE:
             return True
         if self._live_probe_count_date != datetime.date.today():
             self._restore_live_probe_count()
@@ -351,7 +354,7 @@ class EnhancedExecutor:
 
     def check_live_probe_scale_ins(self) -> None:
         """Add once to a profitable live probe while its direction still matches regime."""
-        if not (LIVE and LIVE_PROBE_MODE and LIVE_PROBE_SCALE_IN_ENABLED):
+        if not (LIVE_PROBE_MODE and LIVE_PROBE_SCALE_IN_ENABLED):
             return
         if not self._entry_log or not self._current_market_state().is_regular_hours:
             return
@@ -394,7 +397,13 @@ class EnhancedExecutor:
 
             margin = 1.0 if is_long else 2.0
             usable_bp = max(0.0, account.buying_power - self._options_cost_reserve)
-            scale_budget = usable_bp * LIVE_PROBE_SCALE_IN_BUYING_POWER_PCT / 100
+            current_exposure = abs(qty) * current_price
+            max_total_exposure = usable_bp * LIVE_PROBE_MAX_TOTAL_BUYING_POWER_PCT / 100
+            remaining_exposure = max(0.0, max_total_exposure - current_exposure)
+            scale_budget = min(
+                usable_bp * LIVE_PROBE_SCALE_IN_BUYING_POWER_PCT / 100,
+                remaining_exposure,
+            )
             add_shares = min(
                 int(scale_budget / (current_price * margin)),
                 int(usable_bp / (current_price * margin)),
@@ -419,12 +428,21 @@ class EnhancedExecutor:
                         trail_percent=trail_pct,
                     ))
                 except Exception as stop_error:
-                    stop_price = current_price * (1 - trail_pct / 100) if is_long else current_price * (1 + trail_pct / 100)
-                    self._pdt_stop_blocked[sym] = stop_price
                     log.warning(
                         f"LIVE PROBE {sym}: scale-in trailing stop rejected ({stop_error}); "
-                        f"software stop armed at ${stop_price:.2f}"
+                        "unwinding added shares"
                     )
+                    unwind_side = OrderSide.SELL if is_long else OrderSide.BUY
+                    try:
+                        self.client.submit_order(MarketOrderRequest(
+                            symbol=sym, qty=add_shares, side=unwind_side,
+                            time_in_force=TimeInForce.DAY,
+                        ))
+                    except Exception as unwind_error:
+                        log.error(
+                            f"LIVE PROBE {sym}: failed to unwind unprotected scale-in: {unwind_error}"
+                        )
+                    continue
                 self._live_probe_scaled_in.add(sym)
                 state_changed = True
                 log.info(
@@ -1107,7 +1125,7 @@ class EnhancedExecutor:
             log.info(f"Skipping {signal.symbol} SHORT because LONG_ONLY_MODE is active")
             return False
 
-        if LIVE and LIVE_PROBE_MODE:
+        if LIVE_PROBE_MODE:
             log.info(
                 f"LIVE PROBE {signal.symbol}: sizing {shares} → {LIVE_PROBE_SHARES} share(s); "
                 "no automatic scale-in"
@@ -1398,6 +1416,7 @@ class EnhancedExecutor:
             return None  # Not yet EOD close time
         if now_et.hour >= 20:
             return None  # Extended hours ended
+        regular_hours = (now_et.hour, now_et.minute) < (16, 0)
 
         today = datetime.date.today()
         if getattr(self, "_eod_close_done", None) == today:
@@ -1409,8 +1428,34 @@ class EnhancedExecutor:
             log.error(f"close_eod_positions: fetch failed: {e}")
             return None
 
+        # ── Margin safety: never carry margin-funded exposure overnight ──────
+        # Identify positions whose combined market value exceeds available cash
+        # and force-close them first, regardless of EOD_CLOSE_ALL/strategy filters.
+        margin_force_syms: set = set()
+        if MARGIN_EOD_FORCE_CLOSE:
+            try:
+                acct = self.client.get_account()
+                cash = float(getattr(acct, "cash", 0) or 0)
+                exposures = sorted(
+                    ((p.symbol, abs(float(getattr(p, "market_value", 0) or 0))) for p in positions),
+                    key=lambda item: item[1], reverse=True,
+                )
+                running = sum(mv for _, mv in exposures)
+                for sym, mv in exposures:
+                    if running <= cash:
+                        break
+                    margin_force_syms.add(sym)
+                    running -= mv
+                if margin_force_syms:
+                    log.warning(f"MARGIN EOD: cash=${cash:,.0f} exposure requires closing {sorted(margin_force_syms)} to avoid overnight margin")
+            except Exception as e:
+                log.warning(f"MARGIN EOD check failed (non-fatal): {e}")
+
         closed_items = []
         failed_items = []
+
+        # Close margin-forced positions first so partial failures don't skip them.
+        positions = sorted(positions, key=lambda p: p.symbol not in margin_force_syms)
 
         for pos in positions:
             sym = pos.symbol
@@ -1419,7 +1464,8 @@ class EnhancedExecutor:
                 continue
 
             entry_info = self._entry_log.get(sym)
-            if not EOD_CLOSE_ALL:
+            is_margin_force = sym in margin_force_syms
+            if not EOD_CLOSE_ALL and not is_margin_force:
                 if not entry_info:
                     continue
                 if entry_info.get("date") != today:
@@ -1446,12 +1492,29 @@ class EnhancedExecutor:
                     pass
 
                 side = OrderSide.SELL if qty > 0 else OrderSide.BUY
-                req = MarketOrderRequest(
-                    symbol=sym, qty=abs(qty),
-                    side=side, time_in_force=TimeInForce.DAY,
-                )
+                if regular_hours:
+                    req = MarketOrderRequest(
+                        symbol=sym, qty=abs(qty),
+                        side=side, time_in_force=TimeInForce.DAY,
+                    )
+                else:
+                    current_price = float(getattr(pos, "current_price", 0) or 0)
+                    limit_price = round(
+                        current_price * (1 - EOD_AFTERHOURS_LIMIT_BUFFER_PCT / 100)
+                        if qty > 0 else current_price * (1 + EOD_AFTERHOURS_LIMIT_BUFFER_PCT / 100),
+                        2,
+                    )
+                    if limit_price <= 0:
+                        raise ValueError("no usable after-hours position mark")
+                    req = LimitOrderRequest(
+                        symbol=sym, qty=abs(qty), side=side,
+                        limit_price=limit_price,
+                        time_in_force=TimeInForce.DAY,
+                        extended_hours=True,
+                    )
                 self.client.submit_order(req)
-                self._record_probe_outcome(sym, pos, "EOD_CLOSE")
+                exit_reason = "MARGIN_EOD_CLOSE" if is_margin_force else "EOD_CLOSE"
+                self._record_probe_outcome(sym, pos, exit_reason)
                 self._entry_log.pop(sym, None)
                 self._tp_targets.pop(sym, None)
                 self._intermediate_targets.pop(sym, None)
@@ -1466,15 +1529,18 @@ class EnhancedExecutor:
                     "pnl": pnl,
                 })
 
+                order_style = "market" if regular_hours else f"extended-hours limit ${limit_price:.2f}"
+                label = "MARGIN EOD CLOSE" if is_margin_force else "EOD CLOSE"
                 log.info(
-                    f"EOD CLOSE {sym}: {abs(qty)} shares | "
+                    f"{label} {sym}: {abs(qty)} shares | {order_style} | "
                     f"strategy={strategy} | P&L ${pnl:.2f}"
                 )
             except Exception as e:
                 failed_items.append({"symbol": sym, "error": str(e)})
                 log.error(f"EOD close failed {sym}: {e}")
 
-        self._eod_close_done = today
+        if not failed_items:
+            self._eod_close_done = today
         self._save_exit_state()
 
         summary = {
@@ -1824,7 +1890,12 @@ class EnhancedExecutor:
             if entry_time is None:
                 continue
             elapsed_min = (now - entry_time).total_seconds() / 60
-            if elapsed_min < DEAD_MONEY_MINUTES:
+            time_stop_minutes = (
+                ORB["time_stop_minutes"]
+                if info.get("strategy") == "ORB"
+                else DEAD_MONEY_MINUTES
+            )
+            if elapsed_min < time_stop_minutes:
                 continue
 
             pos = positions.get(sym)
@@ -1847,14 +1918,18 @@ class EnhancedExecutor:
 
             price_change_pct = (current_price - entry_price) / entry_price * 100
             adverse_drift_pct = -price_change_pct if qty > 0 else price_change_pct
+            if info.get("strategy") == "ORB" and abs(price_change_pct) <= ORB["flat_max_gain_pct"]:
+                adverse_threshold_pct = -1.0
+            else:
+                adverse_threshold_pct = None
             atr_stop = float(info.get("atr_stop") or 0)
-            if atr_stop > 0 and ATR_STOP_MULTIPLIER > 0:
+            if adverse_threshold_pct is None and atr_stop > 0 and ATR_STOP_MULTIPLIER > 0:
                 atr_pct = atr_stop / ATR_STOP_MULTIPLIER / entry_price * 100
                 adverse_threshold_pct = min(
                     TIME_LOSS_ATR_MAX_PCT,
                     max(TIME_LOSS_ATR_MIN_PCT, atr_pct * TIME_LOSS_ATR_MULTIPLIER),
                 )
-            else:
+            elif adverse_threshold_pct is None:
                 adverse_threshold_pct = DEAD_MONEY_MAX_ADVERSE_DRIFT_PCT
 
             if adverse_drift_pct < adverse_threshold_pct:

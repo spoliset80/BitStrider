@@ -12,11 +12,12 @@ from engine.execution.enhanced import EnhancedExecutor
 
 
 class MockPosition:
-    def __init__(self, symbol, qty, current_price):
+    def __init__(self, symbol, qty, current_price, market_value=None):
         self.symbol = symbol
         self.qty = qty
         self.current_price = current_price
         self.unrealized_pl = 0.0
+        self.market_value = market_value if market_value is not None else float(qty) * current_price
 
 
 class MockClient:
@@ -26,6 +27,9 @@ class MockClient:
 
     def get_all_positions(self):
         return self.positions
+
+    def get_account(self):
+        return SimpleNamespace(cash=1_000_000.0)
 
     def submit_order(self, order):
         self.orders.append(order)
@@ -81,6 +85,34 @@ class EquityExitLifecycleTests(unittest.TestCase):
 
         self.assertEqual(submitted_shares, [1])
 
+    def test_probe_uses_one_share_in_paper_mode(self):
+        executor = object.__new__(EnhancedExecutor)
+        executor.use_bracket_orders = True
+        submitted_shares = []
+        signal = SimpleNamespace(symbol="AAPL", price=100.0, confidence=0.9, strategy="Momentum")
+        account = SimpleNamespace(equity=10_000.0, buying_power=40_000.0, daytrade_count=0)
+        executor.pdt = SimpleNamespace(add=lambda _date: None, remaining=lambda *_args: 999)
+        executor._validate_trade = lambda *_args, **_kwargs: (True, None)
+        executor._can_submit_live_probe = lambda: True
+        executor._validate_market_price = lambda *_args: (True, 100.0)
+        executor._size_with_buying_power = lambda *_args: (50, None)
+        executor._current_market_state = lambda: SimpleNamespace(is_regular_hours=True)
+        executor._create_bracket_order = lambda _signal, shares, *_args: submitted_shares.append(shares) or True
+        executor._record_entry = lambda *_args: None
+        executor._get_positions = lambda **_kwargs: None
+        executor._get_account = lambda **_kwargs: None
+
+        with patch.object(enhanced, "LIVE", False), patch.object(
+            enhanced, "LIVE_PROBE_MODE", True
+        ), patch.object(enhanced, "LIVE_PROBE_SHARES", 1), patch.object(
+            enhanced, "MARGIN_LEVERAGE", 1.0
+        ), patch.object(
+            enhanced, "calculate_risk_adjusted_size", return_value={"dollar_amount": 5_000.0}
+        ):
+            self.assertTrue(executor._execute_entry(signal, account, enhanced.OrderType.LONG))
+
+        self.assertEqual(submitted_shares, [1])
+
     def test_live_probe_daily_cap_blocks_entry(self):
         executor = object.__new__(EnhancedExecutor)
         executor._live_probe_count_date = datetime.date.today()
@@ -119,8 +151,8 @@ class EquityExitLifecycleTests(unittest.TestCase):
                 executor.check_live_probe_scale_ins()
 
         self.assertEqual(len(client.orders), 2)
-        self.assertEqual(client.orders[0].qty, 24)
-        self.assertEqual(client.orders[1].qty, 24)
+        self.assertEqual(client.orders[0].qty, 23)
+        self.assertEqual(client.orders[1].qty, 23)
 
     def test_short_probe_does_not_scale_in(self):
         client = MockClient([MockPosition("AAPL", "-1", 99.0)])
@@ -292,6 +324,101 @@ class EquityExitLifecycleTests(unittest.TestCase):
             self.assertEqual(client.cancelled_orders, ["trail-1"])
             self.assertEqual(len(client.orders), 1)
             self.assertEqual(summary["closed_count"], 1)
+
+    def test_margin_eod_force_closes_position_ignoring_strategy_filter(self):
+        class MarginClient(MockClient):
+            def get_account(self):
+                return SimpleNamespace(cash=500.0)
+
+        class FixedDateTime(datetime.datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return cls(2026, 8, 19, 15, 56, tzinfo=tz)
+
+        with tempfile.TemporaryDirectory() as directory:
+            client = MarginClient([MockPosition("AAPL", "10", 100.0)])  # $1,000 market value > $500 cash
+            executor = build_executor(client, Path(directory) / "position_exit_state.json")
+            executor._eod_close_done = None
+            executor._entry_log["AAPL"] = {"strategy": "Momentum", "date": datetime.date(2026, 8, 19)}
+
+            with patch.object(enhanced, "EOD_CLOSE_ENABLED", True), patch.object(
+                enhanced, "EOD_CLOSE_ALL", False
+            ), patch.object(enhanced, "EOD_CLOSE_TIME", "15:55"), patch.object(
+                enhanced, "MARGIN_EOD_FORCE_CLOSE", True
+            ), patch.object(enhanced.datetime, "datetime", FixedDateTime):
+                summary = executor.close_eod_positions()
+
+            self.assertEqual(len(client.orders), 1)
+            self.assertEqual(summary["closed_count"], 1)
+
+    def test_no_margin_no_force_close_when_strategy_not_eligible(self):
+        class FixedDateTime(datetime.datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return cls(2026, 8, 19, 15, 56, tzinfo=tz)
+
+        with tempfile.TemporaryDirectory() as directory:
+            client = MockClient([MockPosition("AAPL", "10", 100.0)])  # cash covers exposure — no margin
+            executor = build_executor(client, Path(directory) / "position_exit_state.json")
+            executor._eod_close_done = None
+            executor._entry_log["AAPL"] = {"strategy": "Momentum", "date": datetime.date(2026, 8, 19)}
+
+            with patch.object(enhanced, "EOD_CLOSE_ENABLED", True), patch.object(
+                enhanced, "EOD_CLOSE_ALL", False
+            ), patch.object(enhanced, "EOD_CLOSE_TIME", "15:55"), patch.object(
+                enhanced, "MARGIN_EOD_FORCE_CLOSE", True
+            ), patch.object(enhanced.datetime, "datetime", FixedDateTime):
+                summary = executor.close_eod_positions()
+
+            self.assertEqual(client.orders, [])
+            self.assertEqual(summary["closed_count"], 0)
+
+    def test_after_hours_eod_close_uses_executable_limit_order(self):
+        class FixedDateTime(datetime.datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return cls(2026, 8, 20, 16, 30, tzinfo=tz)
+
+        with tempfile.TemporaryDirectory() as directory:
+            client = MockClient([MockPosition("AAPL", "10", 100.0)])
+            executor = build_executor(client, Path(directory) / "exit_state.json")
+            executor._eod_close_done = None
+            executor._record_probe_outcome = lambda *_args: None
+
+            with patch.object(enhanced, "EOD_CLOSE_ENABLED", True), patch.object(
+                enhanced, "EOD_CLOSE_ALL", True
+            ), patch.object(enhanced, "EOD_CLOSE_TIME", "15:55"), patch.object(
+                enhanced.datetime, "datetime", FixedDateTime
+            ):
+                summary = executor.close_eod_positions()
+
+            request = client.orders[0]
+            self.assertEqual(request.limit_price, 99.0)
+            self.assertTrue(request.extended_hours)
+            self.assertEqual(summary["failed_count"], 0)
+
+    def test_after_hours_eod_close_retries_when_quote_is_unavailable(self):
+        class FixedDateTime(datetime.datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return cls(2026, 8, 20, 16, 30, tzinfo=tz)
+
+        with tempfile.TemporaryDirectory() as directory:
+            client = MockClient([MockPosition("AAPL", "10", 0.0)])
+            executor = build_executor(client, Path(directory) / "exit_state.json")
+            executor._eod_close_done = None
+            executor._record_probe_outcome = lambda *_args: None
+
+            with patch.object(enhanced, "EOD_CLOSE_ENABLED", True), patch.object(
+                enhanced, "EOD_CLOSE_ALL", True
+            ), patch.object(enhanced, "EOD_CLOSE_TIME", "15:55"), patch.object(
+                enhanced.datetime, "datetime", FixedDateTime
+            ):
+                summary = executor.close_eod_positions()
+
+            self.assertEqual(client.orders, [])
+            self.assertEqual(summary["failed_count"], 1)
+            self.assertIsNone(executor._eod_close_done)
 
 
 if __name__ == "__main__":

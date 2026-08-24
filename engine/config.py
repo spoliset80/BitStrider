@@ -327,6 +327,7 @@ LIVE_PROBE_SCALE_IN_ENABLED = os.getenv("LIVE_PROBE_SCALE_IN_ENABLED", "false").
 LIVE_PROBE_SCALE_IN_MINUTES = max(1, int(os.getenv("LIVE_PROBE_SCALE_IN_MINUTES", "30")))
 LIVE_PROBE_SCALE_IN_MIN_GAIN_PCT = float(os.getenv("LIVE_PROBE_SCALE_IN_MIN_GAIN_PCT", "0.5"))
 LIVE_PROBE_SCALE_IN_BUYING_POWER_PCT = float(os.getenv("LIVE_PROBE_SCALE_IN_BUYING_POWER_PCT", "25.0"))
+LIVE_PROBE_MAX_TOTAL_BUYING_POWER_PCT = float(os.getenv("LIVE_PROBE_MAX_TOTAL_BUYING_POWER_PCT", "25.0"))
 LIVE_PROBE_SCALE_IN_CUTOFF_TIME = os.getenv("LIVE_PROBE_SCALE_IN_CUTOFF_TIME", "15:15")
 # Margin leverage multiplier: 1.0 = no leverage, 4.0 = 4× intraday margin (requires margin account + marginable stock)
 # Only stocks flagged marginable=True by Alpaca are eligible when MARGIN_LEVERAGE > 1.0
@@ -579,6 +580,9 @@ FORCE_SCAN = os.getenv("FORCE_SCAN", "false").lower() in ("1", "true", "yes")
 EOD_CLOSE_ENABLED    = True
 EOD_CLOSE_ALL        = os.getenv("EOD_CLOSE_ALL", "false").lower() in ("1", "true", "yes")  # close ALL positions at EOD regardless of strategy
 EOD_CLOSE_TIME       = os.getenv("EOD_CLOSE_TIME", "15:50")  # override via .env; default = 10 min before regular close
+EOD_AFTERHOURS_LIMIT_BUFFER_PCT = float(os.getenv("EOD_AFTERHOURS_LIMIT_BUFFER_PCT", "1.0"))
+# Force-close positions whose market value exceeds cash, so no margin carries overnight.
+MARGIN_EOD_FORCE_CLOSE = os.getenv("MARGIN_EOD_FORCE_CLOSE", "true").lower() in ("1", "true", "yes")
 EOD_CLOSE_STRATEGIES = {         # Strategy names that must be closed same day
     "FloatRotation",
     "GapBreakout",
@@ -686,9 +690,17 @@ GAP_BREAKOUT = {
 ORB = {
     "range_minutes":       15,   # ORB formed in first 15 min (9:30-9:45)
     "entry_start_min":     15,   # Start looking for breakouts after ORB forms
-    "entry_end_min":       120,  # Stop entering after 2 hrs into session
-    "breakout_buffer_pct": 0.1,  # Require 0.1% above ORB high to confirm
-    "volume_surge":        2.0,  # Post-ORB vol must be > 2.0x ORB avg (raised from 1.5)
+    "entry_end_min":       90,   # Stop entering after 90 min into session
+    "breakout_buffer_pct": 0.1,  # Fallback buffer when ATR is unavailable
+    "breakout_buffer_atr": 0.15, # Adaptive breakout buffer as a fraction of ATR-14
+    "volume_surge":        1.8,  # Baseline post-ORB volume confirmation
+    "volume_surge_min":    1.5,  # Lower threshold for narrow opening ranges
+    "volume_surge_max":    2.0,  # Higher threshold for wide opening ranges
+    "range_vol_low_pct":   1.0,  # Narrow-range threshold as % of entry price
+    "range_vol_high_pct":  3.0,  # Wide-range threshold as % of entry price
+    "require_above_vwap":   True, # Breakout must have intraday VWAP support
+    "time_stop_minutes":   45,   # Exit an ORB trade that remains flat
+    "flat_max_gain_pct":    0.5,  # Flat means price has not exceeded this gain
 }
 
 # ─────────────────────────────────────────────────────────────────
