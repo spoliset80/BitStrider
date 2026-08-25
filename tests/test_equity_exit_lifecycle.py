@@ -42,6 +42,19 @@ class MockClient:
         pass
 
 
+class FlattenClient(MockClient):
+    def __init__(self, positions, close_errors=None):
+        super().__init__(positions)
+        self.close_errors = close_errors or {}
+        self.close_attempts = []
+
+    def close_position(self, symbol):
+        self.close_attempts.append(symbol)
+        error = self.close_errors.get(symbol)
+        if error:
+            raise error
+
+
 def build_executor(client, state_path):
     executor = object.__new__(EnhancedExecutor)
     executor.client = client
@@ -58,6 +71,30 @@ def build_executor(client, state_path):
 
 
 class EquityExitLifecycleTests(unittest.TestCase):
+    def test_flatten_ignores_inactive_assets(self):
+        client = FlattenClient(
+            [MockPosition("AVNS", "10", 5.0)],
+            {"AVNS": RuntimeError('{"code":40010001,"message":"asset AVNS is not active"}')},
+        )
+        executor = build_executor(client, Path(tempfile.gettempdir()) / "unused_flatten_state.json")
+
+        self.assertTrue(executor.flatten_portfolio("INTRADAY FINAL RESET"))
+        self.assertEqual(client.close_attempts, ["AVNS"])
+        self.assertEqual(executor._flatten_in_progress, set())
+        self.assertEqual(executor._flatten_failed, set())
+        self.assertTrue(executor.flatten_portfolio("INTRADAY FINAL RESET"))
+        self.assertEqual(client.close_attempts, ["AVNS"])
+
+    def test_flatten_still_waits_for_active_close_failure(self):
+        client = FlattenClient(
+            [MockPosition("AAPL", "10", 100.0)],
+            {"AAPL": RuntimeError("temporary broker failure")},
+        )
+        executor = build_executor(client, Path(tempfile.gettempdir()) / "unused_flatten_state.json")
+
+        self.assertFalse(executor.flatten_portfolio("INTRADAY FINAL RESET"))
+        self.assertEqual(executor._flatten_failed, {"AAPL"})
+
     def test_live_probe_uses_one_share_after_entry_checks(self):
         executor = object.__new__(EnhancedExecutor)
         executor.use_bracket_orders = True

@@ -76,6 +76,12 @@ from engine.notifications.notifications import send_email
 log = logging.getLogger("ApexTrader")
 
 
+def _is_inactive_asset_error(error: Exception) -> bool:
+    """Return whether Alpaca rejected an order because the asset is inactive."""
+    message = str(error).lower()
+    return "40010001" in message or ("asset" in message and "not active" in message)
+
+
 # ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 # Helpers
 # ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
@@ -1475,7 +1481,8 @@ class EnhancedExecutor:
         retained = set()
         if allow_momentum_exemptions:
             retained = self._momentum_exemptions(positions)
-        close_symbols = active - retained
+        ignored = getattr(self, "_flatten_ignored", set()) & active
+        close_symbols = active - retained - ignored
 
         try:
             for order in self.client.get_orders() or []:
@@ -1502,12 +1509,21 @@ class EnhancedExecutor:
                 requested.add(pos.symbol)
                 log.warning(f"{reason}: close submitted for {pos.symbol} qty={pos.qty}")
             except Exception as e:
+                if _is_inactive_asset_error(e):
+                    ignored.add(pos.symbol)
+                    requested.discard(pos.symbol)
+                    log.warning(f"{reason}: ignoring inactive asset {pos.symbol}: {e}")
+                    continue
                 failed.add(pos.symbol)
                 log.error(f"{reason}: close failed for {pos.symbol}: {e}")
         self._flatten_in_progress = requested
         self._flatten_failed = failed
-        remaining = close_symbols
-        log.warning(f"{reason}: waiting for flat account; remaining={sorted(remaining)}")
+        self._flatten_ignored = ignored
+        remaining = close_symbols & (requested | failed)
+        if remaining:
+            log.warning(f"{reason}: waiting for flat account; remaining={sorted(remaining)}")
+        else:
+            log.info(f"{reason}: flatten complete; ignored_inactive={sorted(ignored)}")
         return not remaining
 
     # ── Legacy EOD Close ─────────────────────────────────────────────────────
