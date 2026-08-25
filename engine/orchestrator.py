@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import datetime
+import json
 import logging
 import time
 from dataclasses import dataclass, field
@@ -58,6 +59,7 @@ from engine.crypto.trader import CryptoTrader
 log = setup_logging()
 
 _WINDOW_FLAT_STATE: dict = {}
+_WINDOW_STATE_PATH = REPO_ROOT / ".intraday_session_state.json"
 
 import logging as _logging
 _logging.getLogger("WDM").setLevel(_logging.ERROR)
@@ -508,6 +510,26 @@ def _check_kill_mode(ctx: AppContext) -> bool:
     )
 
 
+def _load_intraday_state(today: datetime.date) -> str:
+    try:
+        state = json.loads(_WINDOW_STATE_PATH.read_text(encoding="utf-8"))
+        if state.get("date") == today.isoformat():
+            return state.get("phase", "pre_session")
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        pass
+    return "pre_session"
+
+
+def _save_intraday_state(today: datetime.date, phase: str) -> None:
+    try:
+        _WINDOW_STATE_PATH.write_text(
+            json.dumps({"date": today.isoformat(), "phase": phase}),
+            encoding="utf-8",
+        )
+    except OSError as e:
+        log.warning(f"Could not save intraday session state: {e}")
+
+
 def _manage_intraday_window(ctx: AppContext) -> bool:
     """Allow two ET trading windows and flatten at each session boundary."""
     now = datetime.datetime.now(pytz.timezone("America/New_York"))
@@ -524,31 +546,41 @@ def _manage_intraday_window(ctx: AppContext) -> bool:
     cutoff = minutes(cfg.INTRADAY_FINAL_CUTOFF)
     final_reset = minutes(cfg.INTRADAY_FINAL_RESET)
     today = now.date()
+    phase_state = _load_intraday_state(today)
 
     if current < start or current >= final_reset:
         if current >= final_reset:
             ctx.executor.flatten_portfolio(
                 f"INTRADAY FINAL RESET {cfg.INTRADAY_FINAL_RESET} ET"
             )
+            _save_intraday_state(today, "final_reset")
         return False
     if current >= cutoff:
         return False
 
     phase = "first" if current < reset else "second"
     key = (today, phase)
-    if not _WINDOW_FLAT_STATE.get(key):
+    if phase == "second" and phase_state == "pre_session":
+        # A restart after 11:00 must not retroactively flatten Session 2.
+        _save_intraday_state(today, "session_2")
+        phase_state = "session_2"
+
+    if phase == "first" and phase_state != "session_1":
         reason = (
-            f"INTRADAY {cfg.INTRADAY_RESET_TIME} ET RESET"
-            if phase == "second"
-            else f"INTRADAY {cfg.INTRADAY_WINDOW_START} ET START"
+            f"INTRADAY {cfg.INTRADAY_WINDOW_START} ET START"
         )
         if not ctx.executor.flatten_portfolio(reason):
             return False
-        _WINDOW_FLAT_STATE[key] = True
-        if ctx.options_executor is not None:
-            ctx.options_executor._positions.clear()
-        if ctx.crypto_trader is not None:
-            ctx.crypto_trader._sync_positions()
+        _save_intraday_state(today, "session_1")
+    elif phase == "second" and phase_state == "session_1":
+        if not ctx.executor.flatten_portfolio(f"INTRADAY {cfg.INTRADAY_RESET_TIME} ET RESET"):
+            return False
+        _save_intraday_state(today, "session_2")
+    _WINDOW_FLAT_STATE[key] = True
+    if ctx.options_executor is not None:
+        ctx.options_executor._positions.clear()
+    if ctx.crypto_trader is not None:
+        ctx.crypto_trader._sync_positions()
     return True
 
 
@@ -661,12 +693,12 @@ def scan_and_trade(ctx: AppContext) -> None:
     ctx.executor.update_stale_orders()
     ctx.executor.check_tp_targets()
     ctx.executor.check_dead_money()
-    ctx.executor.check_live_probe_scale_ins()
 
     _run_discovery(ctx, market_state)
 
     scan_targets, excluded = _build_scan_targets(ctx)
     if not scan_targets:
+        ctx.executor.check_live_probe_scale_ins()
         log.info("[SCAN] No targets after filtering — skipping scan")
         return
 
@@ -692,6 +724,7 @@ def scan_and_trade(ctx: AppContext) -> None:
         log.info(f"[SCAN] TOP5_RAW #{idx}: {s.symbol} {s.action.upper()} ${s.price:.2f} conf={s.confidence:.0%} [{s.strategy}] — {s.reason}")
 
     if not signals:
+        ctx.executor.check_live_probe_scale_ins()
         log.info("[SCAN] No signals this cycle")
         return
 
@@ -709,8 +742,12 @@ def scan_and_trade(ctx: AppContext) -> None:
     notify_scan_results(eligible[:5], datetime.date.today(), sentiment, regime)
 
     if not eligible:
+        ctx.executor.check_live_probe_scale_ins()
         log.info("[SCAN] No eligible signals after filtering")
         return
+
+    # Fresh strategy evaluation is complete; now validate existing probes for scale-in.
+    ctx.executor.check_live_probe_scale_ins()
 
     if regime == "bear":
         _execute_bear_plan(ctx, eligible, daily_loss_limit, loss_pct)

@@ -1407,24 +1407,11 @@ class EnhancedExecutor:
     # ── Scheduled portfolio flatten ──────────────────────────────────────────
     def flatten_portfolio(self, reason: str) -> bool:
         """Cancel all open orders, close all positions, and wait until flat."""
-        in_progress = getattr(self, "_flatten_in_progress", set())
         try:
             positions = self.client.get_all_positions()
         except Exception as e:
             log.error(f"{reason}: position fetch failed: {e}")
             return False
-
-        if not in_progress:
-            try:
-                for order in self.client.get_orders() or []:
-                    try:
-                        self.client.cancel_order_by_id(str(order.id))
-                        log.info(f"{reason}: cancelled order {order.id} ({order.symbol})")
-                    except Exception as e:
-                        log.warning(f"{reason}: could not cancel order {order.id}: {e}")
-            except Exception as e:
-                log.error(f"{reason}: open-order fetch failed: {e}")
-                return False
 
         active = {
             p.symbol for p in positions
@@ -1432,37 +1419,39 @@ class EnhancedExecutor:
         }
         if not active:
             self._flatten_in_progress = set()
+            self._flatten_failed = set()
             return True
 
-        if in_progress:
-            self._flatten_in_progress = in_progress & active
-            if self._flatten_in_progress:
-                log.warning(
-                    f"{reason}: waiting for flat account; "
-                    f"remaining={sorted(self._flatten_in_progress)}"
-                )
-                return False
-            return True
-
-        if not in_progress:
-            requested = set()
-            for pos in positions:
-                if pos.symbol not in active:
-                    continue
+        try:
+            for order in self.client.get_orders() or []:
                 try:
-                    self.client.close_position(pos.symbol)
-                    requested.add(pos.symbol)
-                    log.warning(f"{reason}: close submitted for {pos.symbol} qty={pos.qty}")
+                    self.client.cancel_order_by_id(str(order.id))
+                    log.info(f"{reason}: cancelled order {order.id} ({order.symbol})")
                 except Exception as e:
-                    log.error(f"{reason}: close failed for {pos.symbol}: {e}")
-            self._flatten_in_progress = requested
-        if self._flatten_in_progress:
-            log.warning(
-                f"{reason}: waiting for flat account; "
-                f"remaining={sorted(self._flatten_in_progress)}"
-            )
+                    log.warning(f"{reason}: could not cancel order {order.id}: {e}")
+        except Exception as e:
+            log.error(f"{reason}: open-order fetch failed: {e}")
             return False
-        return not active
+
+        requested = getattr(self, "_flatten_in_progress", set()) & active
+        failed = getattr(self, "_flatten_failed", set()) & active
+        retry = (active - requested) | failed
+        failed = set()
+        for pos in positions:
+            if pos.symbol not in retry:
+                continue
+            try:
+                self.client.close_position(pos.symbol)
+                requested.add(pos.symbol)
+                log.warning(f"{reason}: close submitted for {pos.symbol} qty={pos.qty}")
+            except Exception as e:
+                failed.add(pos.symbol)
+                log.error(f"{reason}: close failed for {pos.symbol}: {e}")
+        self._flatten_in_progress = requested
+        self._flatten_failed = failed
+        remaining = active
+        log.warning(f"{reason}: waiting for flat account; remaining={sorted(remaining)}")
+        return False
 
     # ── Legacy EOD Close ─────────────────────────────────────────────────────
     def close_eod_positions(self) -> Optional[dict]:
