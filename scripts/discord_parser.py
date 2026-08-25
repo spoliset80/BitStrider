@@ -117,7 +117,7 @@ _NOISE = re.compile(
 
 # Ticker extraction: avoid capturing numeric option styles ($42C) as tickers
 _RE_SYMBOL_TAG  = re.compile(r"Symbol:\s*\$([A-Z]{1,5})\b", re.I)
-_RE_DOLLAR_TKR  = re.compile(r"\b\$([A-Z]{1,5})\b", re.I) 
+_RE_DOLLAR_TKR  = re.compile(r"\$([A-Z]{1,5})\b", re.I)
 _RE_COLON_TKR   = re.compile(r"^([A-Z]{1,5})\s*:", re.M)
 
 # Action keywords
@@ -131,6 +131,9 @@ _RE_OUT_EXIT = re.compile(r"\bOut\s+\$?([A-Z]{1,5})\s+(calls?|puts?)\b", re.I)
 # Option type + strike (Stricter matching to prevent overlap with standard numbers)
 _RE_OPT_DOLLAR = re.compile(r"\$(\d{1,4}(?:\.\d+)?)(C|P)\b", re.I)          # $42C
 _RE_OPT_BARE   = re.compile(r"\b(\d{1,4}(?:\.\d+)?)(c|p)\b(?!\d)", re.I)    # 265c
+_RE_OPT_WORD_STRIKE = re.compile(
+    r"\$?(\d{1,4}(?:\.\d+)?)\s*(CALLS?|PUTS?)\b", re.I
+)                                                                            # $90 Calls
 _RE_OPT_WORD   = re.compile(r"\b(CALLS?|PUTS?|CSP|LEAPS?)\b", re.I)         # CALLS
 
 # Expiry phrase regex engines
@@ -205,6 +208,13 @@ def parse_trade(raw: str) -> Optional[Trade]:
             strike = float(m.group(1))
             option_type = "CALL" if m.group(2).lower() == "c" else "PUT"
             notes.append(f"option via bare strike+cp → {option_type} ${strike}")
+
+    if not option_type:
+        m = _RE_OPT_WORD_STRIKE.search(text)
+        if m:
+            strike = float(m.group(1))
+            option_type = "PUT" if m.group(2).upper().startswith("PUT") else "CALL"
+            notes.append(f"option via strike + keyword → {option_type} ${strike}")
 
     if not option_type:
         m = _RE_OPT_WORD.search(text)

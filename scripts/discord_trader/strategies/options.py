@@ -15,6 +15,11 @@ def handle_options(trade, broker, risk, buying_power: Optional[float]) -> Option
     is_buy = trade.action == "BUY"
 
     if is_buy:
+        if buying_power is None or buying_power <= 0:
+            reason = "buying power unavailable"
+            logger.warning(f"  [SKIP] {ticker}: {reason}")
+            return {"status": "skip", "reason": reason}
+
         notional = risk.notional_for(trade.confidence, buying_power)
         try:
             open_count = broker.open_position_count()
