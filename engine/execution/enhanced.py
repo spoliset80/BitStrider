@@ -57,6 +57,8 @@ from engine.config import (
     LIVE_PROBE_SCALE_IN_ENABLED,
     LIVE_PROBE_SCALE_IN_MIN_GAIN_PCT, LIVE_PROBE_SCALE_IN_BUYING_POWER_PCT,
     LIVE_PROBE_MAX_TOTAL_BUYING_POWER_PCT,
+    INTRADAY_MOMENTUM_EXEMPTIONS, INTRADAY_MOMENTUM_MIN_GAIN_PCT,
+    INTRADAY_MOMENTUM_MIN_RVOL, INTRADAY_MOMENTUM_MIN_5M_RETURN_PCT,
     CONF_SCALE_MIN_MULT, CONF_SCALE_FULL_CONF,
     MARGIN_LEVERAGE,
     SCALEOUT_TRAIL_PCT, PROTECT_POSITIONS_ENABLED,
@@ -1405,8 +1407,56 @@ class EnhancedExecutor:
                 log.error(f"check_software_stops {sym}: {e}")
 
     # ── Scheduled portfolio flatten ──────────────────────────────────────────
-    def flatten_portfolio(self, reason: str) -> bool:
-        """Cancel all open orders, close all positions, and wait until flat."""
+    def _momentum_exemptions(self, positions: list) -> set:
+        """Return at most two fresh, strongly trending equity symbols to retain."""
+        from engine.utils import get_bars
+
+        try:
+            open_orders = self.client.get_orders() or []
+        except Exception as e:
+            log.info(f"MOMENTUM RETAIN: skipped; protective-order check failed ({e})")
+            return set()
+        protected_symbols = {
+            order.symbol for order in open_orders
+            if "stop" in str(getattr(order, "type", "")).lower()
+        }
+        candidates = []
+        for pos in positions:
+            if getattr(pos, "asset_class", "us_equity") != "us_equity":
+                continue
+            entry = float(getattr(pos, "avg_entry_price", 0) or 0)
+            current = float(getattr(pos, "current_price", 0) or 0)
+            if float(getattr(pos, "qty", 0) or 0) <= 0 or entry <= 0 or current <= 0:
+                continue
+            if pos.symbol not in protected_symbols:
+                log.info(f"MOMENTUM RETAIN {pos.symbol}: skipped; no protective stop found")
+                continue
+            gain_pct = (current - entry) / entry * 100
+            if gain_pct < INTRADAY_MOMENTUM_MIN_GAIN_PCT:
+                continue
+            try:
+                bars = get_bars(pos.symbol, period="1d", interval="5m")
+                if bars is None or len(bars) < 4:
+                    continue
+                closes = [float(v) for v in bars["close"].tail(4)]
+                volumes = [float(v) for v in bars["volume"].iloc[:-1] if float(v) > 0]
+                latest_volume = float(bars["volume"].iloc[-1])
+                typical = (bars["high"] + bars["low"] + bars["close"]) / 3
+                vwap = float((typical * bars["volume"]).sum() / bars["volume"].sum())
+                rvol = latest_volume / (sum(volumes) / len(volumes)) if volumes else 0
+                return_5m = (closes[-1] / closes[-2] - 1) * 100
+                if current > vwap and closes[-1] > closes[0] and return_5m >= INTRADAY_MOMENTUM_MIN_5M_RETURN_PCT and rvol >= INTRADAY_MOMENTUM_MIN_RVOL:
+                    candidates.append((gain_pct, pos.symbol))
+            except Exception as e:
+                log.info(f"MOMENTUM RETAIN {pos.symbol}: skipped; fresh data unavailable ({e})")
+        candidates.sort(reverse=True)
+        retained = {symbol for _, symbol in candidates[:max(0, INTRADAY_MOMENTUM_EXEMPTIONS)]}
+        if retained:
+            log.warning(f"MOMENTUM RETAIN: exempting {sorted(retained)} from {INTRADAY_MOMENTUM_EXEMPTIONS}-position reset allowance")
+        return retained
+
+    def flatten_portfolio(self, reason: str, allow_momentum_exemptions: bool = False) -> bool:
+        """Cancel orders and close positions, optionally retaining strong equities."""
         try:
             positions = self.client.get_all_positions()
         except Exception as e:
@@ -1422,9 +1472,16 @@ class EnhancedExecutor:
             self._flatten_failed = set()
             return True
 
+        retained = set()
+        if allow_momentum_exemptions:
+            retained = self._momentum_exemptions(positions)
+        close_symbols = active - retained
+
         try:
             for order in self.client.get_orders() or []:
                 try:
+                    if order.symbol not in close_symbols:
+                        continue
                     self.client.cancel_order_by_id(str(order.id))
                     log.info(f"{reason}: cancelled order {order.id} ({order.symbol})")
                 except Exception as e:
@@ -1433,9 +1490,9 @@ class EnhancedExecutor:
             log.error(f"{reason}: open-order fetch failed: {e}")
             return False
 
-        requested = getattr(self, "_flatten_in_progress", set()) & active
+        requested = getattr(self, "_flatten_in_progress", set()) & close_symbols
         failed = getattr(self, "_flatten_failed", set()) & active
-        retry = (active - requested) | failed
+        retry = (close_symbols - requested) | failed
         failed = set()
         for pos in positions:
             if pos.symbol not in retry:
@@ -1449,9 +1506,9 @@ class EnhancedExecutor:
                 log.error(f"{reason}: close failed for {pos.symbol}: {e}")
         self._flatten_in_progress = requested
         self._flatten_failed = failed
-        remaining = active
+        remaining = close_symbols
         log.warning(f"{reason}: waiting for flat account; remaining={sorted(remaining)}")
-        return False
+        return not remaining
 
     # ── Legacy EOD Close ─────────────────────────────────────────────────────
     def close_eod_positions(self) -> Optional[dict]:

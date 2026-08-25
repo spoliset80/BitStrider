@@ -551,7 +551,8 @@ def _manage_intraday_window(ctx: AppContext) -> bool:
     if current < start or current >= final_reset:
         if current >= final_reset:
             ctx.executor.flatten_portfolio(
-                f"INTRADAY FINAL RESET {cfg.INTRADAY_FINAL_RESET} ET"
+                f"INTRADAY FINAL RESET {cfg.INTRADAY_FINAL_RESET} ET",
+                allow_momentum_exemptions=False,
             )
             _save_intraday_state(today, "final_reset")
         return False
@@ -569,11 +570,14 @@ def _manage_intraday_window(ctx: AppContext) -> bool:
         reason = (
             f"INTRADAY {cfg.INTRADAY_WINDOW_START} ET START"
         )
-        if not ctx.executor.flatten_portfolio(reason):
+        if not ctx.executor.flatten_portfolio(reason, allow_momentum_exemptions=True):
             return False
         _save_intraday_state(today, "session_1")
     elif phase == "second" and phase_state == "session_1":
-        if not ctx.executor.flatten_portfolio(f"INTRADAY {cfg.INTRADAY_RESET_TIME} ET RESET"):
+        if not ctx.executor.flatten_portfolio(
+            f"INTRADAY {cfg.INTRADAY_RESET_TIME} ET RESET",
+            allow_momentum_exemptions=True,
+        ):
             return False
         _save_intraday_state(today, "session_2")
     _WINDOW_FLAT_STATE[key] = True

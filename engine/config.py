@@ -324,11 +324,9 @@ LIVE_PROBE_MODE      = os.getenv("LIVE_PROBE_MODE", "false").lower() in ("1", "t
 LIVE_PROBE_SHARES    = max(1, int(os.getenv("LIVE_PROBE_SHARES", "1")))
 LIVE_PROBE_MAX_ENTRIES_PER_DAY = max(1, int(os.getenv("LIVE_PROBE_MAX_ENTRIES_PER_DAY", "10")))
 LIVE_PROBE_SCALE_IN_ENABLED = os.getenv("LIVE_PROBE_SCALE_IN_ENABLED", "false").lower() in ("1", "true", "yes")
-LIVE_PROBE_SCALE_IN_MINUTES = max(1, int(os.getenv("LIVE_PROBE_SCALE_IN_MINUTES", "30")))
 LIVE_PROBE_SCALE_IN_MIN_GAIN_PCT = float(os.getenv("LIVE_PROBE_SCALE_IN_MIN_GAIN_PCT", "0.5"))
 LIVE_PROBE_SCALE_IN_BUYING_POWER_PCT = float(os.getenv("LIVE_PROBE_SCALE_IN_BUYING_POWER_PCT", "25.0"))
 LIVE_PROBE_MAX_TOTAL_BUYING_POWER_PCT = float(os.getenv("LIVE_PROBE_MAX_TOTAL_BUYING_POWER_PCT", "25.0"))
-LIVE_PROBE_SCALE_IN_CUTOFF_TIME = os.getenv("LIVE_PROBE_SCALE_IN_CUTOFF_TIME", "15:15")
 # Margin leverage multiplier: 1.0 = no leverage, 4.0 = 4× intraday margin (requires margin account + marginable stock)
 # Only stocks flagged marginable=True by Alpaca are eligible when MARGIN_LEVERAGE > 1.0
 MARGIN_LEVERAGE      = float(os.getenv("MARGIN_LEVERAGE", "1.0"))
@@ -585,6 +583,10 @@ INTRADAY_WINDOW_START = os.getenv("INTRADAY_WINDOW_START", "07:00")
 INTRADAY_RESET_TIME    = os.getenv("INTRADAY_RESET_TIME", "11:00")
 INTRADAY_FINAL_CUTOFF  = os.getenv("INTRADAY_FINAL_CUTOFF", "14:50")
 INTRADAY_FINAL_RESET   = os.getenv("INTRADAY_FINAL_RESET", "14:55")
+INTRADAY_MOMENTUM_EXEMPTIONS = int(os.getenv("INTRADAY_MOMENTUM_EXEMPTIONS", "2"))
+INTRADAY_MOMENTUM_MIN_GAIN_PCT = float(os.getenv("INTRADAY_MOMENTUM_MIN_GAIN_PCT", "1.0"))
+INTRADAY_MOMENTUM_MIN_RVOL = float(os.getenv("INTRADAY_MOMENTUM_MIN_RVOL", "1.5"))
+INTRADAY_MOMENTUM_MIN_5M_RETURN_PCT = float(os.getenv("INTRADAY_MOMENTUM_MIN_5M_RETURN_PCT", "0.5"))
 # Force-close positions whose market value exceeds cash, so no margin carries overnight.
 MARGIN_EOD_FORCE_CLOSE = os.getenv("MARGIN_EOD_FORCE_CLOSE", "true").lower() in ("1", "true", "yes")
 EOD_CLOSE_STRATEGIES = {         # Strategy names that must be closed same day
