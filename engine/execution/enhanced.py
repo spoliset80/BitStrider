@@ -54,10 +54,9 @@ from engine.config import (
     SMALL_ACCOUNT_MIN_POSITION_DOLLARS,
     POSITION_SIZE_PCT, SMALL_ACCOUNT_POSITION_SIZE_PCT,
     LIVE_PROBE_MODE, LIVE_PROBE_SHARES, LIVE_PROBE_MAX_ENTRIES_PER_DAY,
-    LIVE_PROBE_SCALE_IN_ENABLED, LIVE_PROBE_SCALE_IN_MINUTES,
+    LIVE_PROBE_SCALE_IN_ENABLED,
     LIVE_PROBE_SCALE_IN_MIN_GAIN_PCT, LIVE_PROBE_SCALE_IN_BUYING_POWER_PCT,
     LIVE_PROBE_MAX_TOTAL_BUYING_POWER_PCT,
-    LIVE_PROBE_SCALE_IN_CUTOFF_TIME,
     CONF_SCALE_MIN_MULT, CONF_SCALE_FULL_CONF,
     MARGIN_LEVERAGE,
     SCALEOUT_TRAIL_PCT, PROTECT_POSITIONS_ENABLED,
@@ -353,16 +352,12 @@ class EnhancedExecutor:
         return True
 
     def check_live_probe_scale_ins(self) -> None:
-        """Add once to a profitable live probe while its direction still matches regime."""
+        """Add once to a profitable live probe after the strategy scan completes."""
         if not (LIVE_PROBE_MODE and LIVE_PROBE_SCALE_IN_ENABLED):
             return
-        if not self._entry_log or not self._current_market_state().is_regular_hours:
+        if not self._entry_log:
             return
-
-        cutoff_hour, cutoff_minute = map(int, LIVE_PROBE_SCALE_IN_CUTOFF_TIME.split(":"))
         market_state = self._current_market_state()
-        if (market_state.now.hour, market_state.now.minute) >= (cutoff_hour, cutoff_minute):
-            return
 
         try:
             positions = {p.symbol: p for p in self.client.get_all_positions()}
@@ -376,23 +371,27 @@ class EnhancedExecutor:
         for sym, info in list(self._entry_log.items()):
             if sym in self._live_probe_scaled_in or sym in self._tightened:
                 continue
-            entry_time = info.get("entry_time")
-            entry_price = float(info.get("entry_price") or 0)
             pos = positions.get(sym)
-            if not isinstance(entry_time, datetime.datetime) or entry_price <= 0 or pos is None:
-                continue
-            if (datetime.datetime.now() - entry_time).total_seconds() < LIVE_PROBE_SCALE_IN_MINUTES * 60:
+            entry_price = float(getattr(pos, "avg_entry_price", 0) or 0) if pos is not None else 0
+            if entry_price <= 0 or pos is None:
+                log.info(f"LIVE PROBE {sym}: scale-in skipped; broker fill price unavailable")
                 continue
 
             qty = int(float(getattr(pos, "qty", 0) or 0))
             current_price = float(getattr(pos, "current_price", 0) or 0)
             if qty == 0 or current_price <= 0:
+                log.info(f"LIVE PROBE {sym}: scale-in skipped; position has no usable quantity/price")
                 continue
             is_long = qty > 0
             gain_pct = ((current_price - entry_price) / entry_price * 100) * (1 if is_long else -1)
             if gain_pct < LIVE_PROBE_SCALE_IN_MIN_GAIN_PCT:
+                log.info(
+                    f"LIVE PROBE {sym}: scale-in skipped; gain {gain_pct:+.2f}% "
+                    f"< {LIVE_PROBE_SCALE_IN_MIN_GAIN_PCT:.2f}%"
+                )
                 continue
             if not (is_long and is_bull):
+                log.info(f"LIVE PROBE {sym}: scale-in skipped; requires long position in bullish regime")
                 continue
 
             margin = 1.0 if is_long else 2.0
@@ -446,7 +445,7 @@ class EnhancedExecutor:
                 self._live_probe_scaled_in.add(sym)
                 state_changed = True
                 log.info(
-                    f"LIVE PROBE SCALE-IN {sym}: +{add_shares} shares after {LIVE_PROBE_SCALE_IN_MINUTES} min "
+                    f"LIVE PROBE SCALE-IN {sym}: +{add_shares} shares "
                     f"at {gain_pct:+.2f}% | used {LIVE_PROBE_SCALE_IN_BUYING_POWER_PCT:.1f}% available buying power"
                 )
             except Exception as e:

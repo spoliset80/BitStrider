@@ -12,10 +12,11 @@ from engine.execution.enhanced import EnhancedExecutor
 
 
 class MockPosition:
-    def __init__(self, symbol, qty, current_price, market_value=None):
+    def __init__(self, symbol, qty, current_price, market_value=None, avg_entry_price=None):
         self.symbol = symbol
         self.qty = qty
         self.current_price = current_price
+        self.avg_entry_price = current_price if avg_entry_price is None else avg_entry_price
         self.unrealized_pl = 0.0
         self.market_value = market_value if market_value is not None else float(qty) * current_price
 
@@ -124,7 +125,7 @@ class EquityExitLifecycleTests(unittest.TestCase):
             self.assertFalse(executor._can_submit_live_probe())
 
     def test_profitable_live_probe_scales_in_once_to_cap(self):
-        client = MockClient([MockPosition("AAPL", "1", 101.0)])
+        client = MockClient([MockPosition("AAPL", "1", 101.0, avg_entry_price=100.0)])
         executor = build_executor(client, Path(tempfile.gettempdir()) / "unused_probe_state.json")
         executor._options_cost_reserve = 0.0
         executor._pdt_stop_blocked = {}
@@ -142,10 +143,8 @@ class EquityExitLifecycleTests(unittest.TestCase):
         with patch.object(enhanced, "LIVE", True), patch.object(
             enhanced, "LIVE_PROBE_MODE", True
         ), patch.object(enhanced, "LIVE_PROBE_SCALE_IN_ENABLED", True), patch.object(
-            enhanced, "LIVE_PROBE_SCALE_IN_MINUTES", 30
-        ), patch.object(enhanced, "LIVE_PROBE_SCALE_IN_MIN_GAIN_PCT", 0.5), patch.object(
-            enhanced, "LIVE_PROBE_SCALE_IN_BUYING_POWER_PCT", 25.0
-        ), patch.object(enhanced, "LIVE_PROBE_SCALE_IN_CUTOFF_TIME", "15:15"):
+            enhanced, "LIVE_PROBE_SCALE_IN_MIN_GAIN_PCT", 0.5
+        ), patch.object(enhanced, "LIVE_PROBE_SCALE_IN_BUYING_POWER_PCT", 25.0):
             with patch.object(enhanced, "get_dynamic_tier", return_value={"ts": 6.0}):
                 executor.check_live_probe_scale_ins()
                 executor.check_live_probe_scale_ins()
