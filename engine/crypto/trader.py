@@ -367,10 +367,11 @@ class CryptoTrader:
             cash_bp       = float(getattr(account, "non_marginable_buying_power", None) or account.buying_power)
 
             # ── Max positions gate ────────────────────────────────────────────
-            open_count = len(self._positions)
-            if open_count >= _cfg.CRYPTO_MAX_POSITIONS:
+            portfolio_count = len(self._client.get_all_positions())
+            if portfolio_count >= _cfg.MAX_POSITIONS:
                 log.info(
-                    f"[CRYPTO] Max positions reached ({open_count}/{_cfg.CRYPTO_MAX_POSITIONS}) — skipping {signal.symbol}"
+                    f"[CRYPTO] Portfolio position cap reached "
+                    f"({portfolio_count}/{_cfg.MAX_POSITIONS}) — skipping {signal.symbol}"
                 )
                 return False
 

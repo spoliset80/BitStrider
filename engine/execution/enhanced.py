@@ -703,11 +703,11 @@ class EnhancedExecutor:
         # ── Max positions gate (secondary; optional swap if at limit) ─────
         if positions.total_count >= effective_max:
             if not (SWAP_ON_FULL and signal.confidence >= SWAP_MIN_CONFIDENCE):
-                # At max but BP available — allow entry (no swap needed)
-                log.debug(
-                    f"At max positions {positions.total_count}/{effective_max} but allowing entry "
-                    f"due to available BP ${acct.buying_power:,.0f}"
+                log.info(
+                    f"Max positions reached ({positions.total_count}/{effective_max}) — "
+                    f"skipping {signal.symbol}"
                 )
+                return False, f"Max positions reached: {positions.total_count}/{effective_max}"
             else:
                 # Strong confidence signal + at max: prefer swap to maintain position count
                 label = "SWAP (bear)" if swap_only else "SWAP"
@@ -720,8 +720,11 @@ class EnhancedExecutor:
                     try:
                         self.client.close_position(weakest)
                         self._swap_cycle_closed.add(weakest)
-                        # Closing a prior-day position is NOT a day trade — do not count against PDT
-                        positions = self._get_positions(force_refresh=True)
+                        log.info(
+                            f"SWAP close submitted for {weakest}; waiting for position count "
+                            f"to fall below {effective_max} before entering {signal.symbol}"
+                        )
+                        return False, f"Swap close submitted for {weakest}; retry after close"
                     except Exception as e:
                         err_str = str(e)
                         if "40310100" in err_str:
@@ -1402,7 +1405,67 @@ class EnhancedExecutor:
             except Exception as e:
                 log.error(f"check_software_stops {sym}: {e}")
 
-    # ── EOD Close ─────────────────────────────────────────────────────────────
+    # ── Scheduled portfolio flatten ──────────────────────────────────────────
+    def flatten_portfolio(self, reason: str) -> bool:
+        """Cancel all open orders, close all positions, and wait until flat."""
+        in_progress = getattr(self, "_flatten_in_progress", set())
+        try:
+            positions = self.client.get_all_positions()
+        except Exception as e:
+            log.error(f"{reason}: position fetch failed: {e}")
+            return False
+
+        if not in_progress:
+            try:
+                for order in self.client.get_orders() or []:
+                    try:
+                        self.client.cancel_order_by_id(str(order.id))
+                        log.info(f"{reason}: cancelled order {order.id} ({order.symbol})")
+                    except Exception as e:
+                        log.warning(f"{reason}: could not cancel order {order.id}: {e}")
+            except Exception as e:
+                log.error(f"{reason}: open-order fetch failed: {e}")
+                return False
+
+        active = {
+            p.symbol for p in positions
+            if float(getattr(p, "qty", 0) or 0) != 0
+        }
+        if not active:
+            self._flatten_in_progress = set()
+            return True
+
+        if in_progress:
+            self._flatten_in_progress = in_progress & active
+            if self._flatten_in_progress:
+                log.warning(
+                    f"{reason}: waiting for flat account; "
+                    f"remaining={sorted(self._flatten_in_progress)}"
+                )
+                return False
+            return True
+
+        if not in_progress:
+            requested = set()
+            for pos in positions:
+                if pos.symbol not in active:
+                    continue
+                try:
+                    self.client.close_position(pos.symbol)
+                    requested.add(pos.symbol)
+                    log.warning(f"{reason}: close submitted for {pos.symbol} qty={pos.qty}")
+                except Exception as e:
+                    log.error(f"{reason}: close failed for {pos.symbol}: {e}")
+            self._flatten_in_progress = requested
+        if self._flatten_in_progress:
+            log.warning(
+                f"{reason}: waiting for flat account; "
+                f"remaining={sorted(self._flatten_in_progress)}"
+            )
+            return False
+        return not active
+
+    # ── Legacy EOD Close ─────────────────────────────────────────────────────
     def close_eod_positions(self) -> Optional[dict]:
         """Close all intraday-strategy positions at EOD_CLOSE_TIME.
         Targets FloatRotation, GapBreakout, ORB, VWAPReclaim opened today."""

@@ -45,7 +45,7 @@ from .equity.strategies import Signal
 from .equity.scan import get_scan_targets, scan_universe
 from .equity.universe import filter_universe_by_positions
 from .equity import discovery as _discovery
-from .notifications import notify_scan_results, notify_eod
+from .notifications import notify_scan_results
 from .predictions import save_day_picks
 from . import session as _session
 from engine.broker.broker_factory import BrokerFactory
@@ -56,6 +56,8 @@ from engine.risk import kill_mode as _kill_mode
 from engine.crypto.trader import CryptoTrader
 
 log = setup_logging()
+
+_WINDOW_FLAT_STATE: dict = {}
 
 import logging as _logging
 _logging.getLogger("WDM").setLevel(_logging.ERROR)
@@ -506,6 +508,50 @@ def _check_kill_mode(ctx: AppContext) -> bool:
     )
 
 
+def _manage_intraday_window(ctx: AppContext) -> bool:
+    """Allow two ET trading windows and flatten at each session boundary."""
+    now = datetime.datetime.now(pytz.timezone("America/New_York"))
+    if now.weekday() >= 5:
+        return False
+
+    def minutes(value: str) -> int:
+        hour, minute = map(int, value.split(":"))
+        return hour * 60 + minute
+
+    current = now.hour * 60 + now.minute
+    start = minutes(cfg.INTRADAY_WINDOW_START)
+    reset = minutes(cfg.INTRADAY_RESET_TIME)
+    cutoff = minutes(cfg.INTRADAY_FINAL_CUTOFF)
+    final_reset = minutes(cfg.INTRADAY_FINAL_RESET)
+    today = now.date()
+
+    if current < start or current >= final_reset:
+        if current >= final_reset:
+            ctx.executor.flatten_portfolio(
+                f"INTRADAY FINAL RESET {cfg.INTRADAY_FINAL_RESET} ET"
+            )
+        return False
+    if current >= cutoff:
+        return False
+
+    phase = "first" if current < reset else "second"
+    key = (today, phase)
+    if not _WINDOW_FLAT_STATE.get(key):
+        reason = (
+            f"INTRADAY {cfg.INTRADAY_RESET_TIME} ET RESET"
+            if phase == "second"
+            else f"INTRADAY {cfg.INTRADAY_WINDOW_START} ET START"
+        )
+        if not ctx.executor.flatten_portfolio(reason):
+            return False
+        _WINDOW_FLAT_STATE[key] = True
+        if ctx.options_executor is not None:
+            ctx.options_executor._positions.clear()
+        if ctx.crypto_trader is not None:
+            ctx.crypto_trader._sync_positions()
+    return True
+
+
 def scan_and_trade(ctx: AppContext) -> None:
     """One complete scan-and-trade cycle.
 
@@ -520,6 +566,10 @@ def scan_and_trade(ctx: AppContext) -> None:
       8. Execution (bear or bull plan)
     """
     _session.reset_daily(ctx.client)
+
+    if not _manage_intraday_window(ctx):
+        log.info("[SYSTEM] Outside an active intraday window or waiting for portfolio flatten")
+        return
 
     # ── Hard cutoff: no trading after AFTERHOURS_END (20:00 ET) ──────────────
     import pytz as _ptz
@@ -921,20 +971,6 @@ def start() -> None:
                     except Exception as e:
                         log.error(f"protect_positions error: {e}", exc_info=True)
                     # check_software_stops() runs in its dedicated 10s thread — not here
-
-                    eod_summary = None
-                    try:
-                        eod_summary = ctx.executor.close_eod_positions()
-                    except Exception as e:
-                        log.error(f"close_eod_positions error: {e}", exc_info=True)
-
-                    if eod_summary:
-                        try:
-                            account   = ctx.client.get_account()
-                            positions = ctx.client.get_all_positions()
-                            notify_eod(eod_summary, account, positions, _session.daily_pnl, _session.trades, _discovery.trending_stocks)
-                        except Exception as e:
-                            log.error(f"EOD notify error: {e}", exc_info=True)
 
                     try:
                         scan_and_trade(ctx)

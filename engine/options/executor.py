@@ -39,6 +39,7 @@ from engine.config import (
     OPTIONS_ENABLED,
     OPTIONS_ALLOCATION_PCT,
     OPTIONS_MAX_POSITIONS,
+    MAX_POSITIONS,
     OPTIONS_MAX_MLEG_POSITIONS,
     OPTIONS_MAX_MLEG_CONTRACTS,
     OPTIONS_PROFIT_TARGET_PCT,
@@ -806,6 +807,18 @@ class OptionsExecutor:
         Production-ready order placement for ApexTrader.
         Fixes communications with Alpaca API and internal state tracking.
         """
+        try:
+            portfolio_count = len(self.client.get_all_positions())
+            if portfolio_count >= MAX_POSITIONS:
+                log.info(
+                    f"[OPTIONS] Portfolio position cap reached "
+                    f"({portfolio_count}/{MAX_POSITIONS}) — skipping {signal.symbol}"
+                )
+                return False
+        except Exception as e:
+            log.warning(f"[OPTIONS] Could not verify portfolio position count: {e} — skipping entry")
+            return False
+
         # Fetch budget once — reused by the gross-notional pre-check (section 0) and
         # contract sizing (section 3) to avoid two account API calls per order.
         total_budget, remaining = self._get_options_budget()

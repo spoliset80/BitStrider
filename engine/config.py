@@ -315,7 +315,7 @@ STOCKS = {
 # ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 # Trading Parameters ΓÇö Swing Trading Optimized
 # ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
-MAX_POSITIONS        = int(os.getenv("MAX_POSITIONS", "12"))  # max open stock positions; override via .env
+MAX_POSITIONS        = int(os.getenv("MAX_POSITIONS", "10"))  # max open portfolio positions; override via .env
 # When full, close the weakest position to make room if new signal conf > this threshold
 SWAP_ON_FULL         = True   # enabled — close weakest position for a better signal when full
 SWAP_MIN_CONFIDENCE  = 0.68   # was 0.75 — lower threshold → more aggressive swaps
@@ -581,6 +581,10 @@ EOD_CLOSE_ENABLED    = True
 EOD_CLOSE_ALL        = os.getenv("EOD_CLOSE_ALL", "false").lower() in ("1", "true", "yes")  # close ALL positions at EOD regardless of strategy
 EOD_CLOSE_TIME       = os.getenv("EOD_CLOSE_TIME", "15:50")  # override via .env; default = 10 min before regular close
 EOD_AFTERHOURS_LIMIT_BUFFER_PCT = float(os.getenv("EOD_AFTERHOURS_LIMIT_BUFFER_PCT", "1.0"))
+INTRADAY_WINDOW_START = os.getenv("INTRADAY_WINDOW_START", "07:00")
+INTRADAY_RESET_TIME    = os.getenv("INTRADAY_RESET_TIME", "11:00")
+INTRADAY_FINAL_CUTOFF  = os.getenv("INTRADAY_FINAL_CUTOFF", "14:50")
+INTRADAY_FINAL_RESET   = os.getenv("INTRADAY_FINAL_RESET", "14:55")
 # Force-close positions whose market value exceeds cash, so no margin carries overnight.
 MARGIN_EOD_FORCE_CLOSE = os.getenv("MARGIN_EOD_FORCE_CLOSE", "true").lower() in ("1", "true", "yes")
 EOD_CLOSE_STRATEGIES = {         # Strategy names that must be closed same day
