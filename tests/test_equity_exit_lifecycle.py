@@ -409,6 +409,29 @@ class EquityExitLifecycleTests(unittest.TestCase):
             self.assertEqual(client.orders, [])
             self.assertEqual(summary["closed_count"], 0)
 
+    def test_after_hours_entry_uses_live_quote_for_limit(self):
+        class RecordingClient:
+            def __init__(self):
+                self.last_order = None
+            def get_latest_quote(self, symbol):
+                return SimpleNamespace(bid_price=98.8, ask_price=99.2)
+            def submit_order(self, order):
+                self.last_order = order
+                return SimpleNamespace(id="order-1")
+
+        client = RecordingClient()
+        executor = object.__new__(EnhancedExecutor)
+        executor.client = client
+        executor.order_cache = {}
+        executor._submitted_entry_orders = {}
+        executor.market_state = None
+        executor._current_market_state = lambda: SimpleNamespace(is_regular_hours=False)
+
+        signal = SimpleNamespace(symbol="AAPL", price=100.0, strategy="Momentum")
+        self.assertTrue(executor._create_simple_order(signal, 10, enhanced.OrderType.LONG))
+        self.assertLessEqual(client.last_order.limit_price, 99.2)
+        self.assertLess(client.last_order.limit_price, 100.0)
+
     def test_after_hours_eod_close_uses_executable_limit_order(self):
         class FixedDateTime(datetime.datetime):
             @classmethod

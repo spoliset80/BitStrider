@@ -21,6 +21,8 @@ from enum import Enum
 from pathlib import Path
 
 from alpaca.trading.client import TradingClient
+from alpaca.data.historical import StockHistoricalDataClient
+from alpaca.data.requests import StockLatestQuoteRequest
 from alpaca.trading.requests import (
     MarketOrderRequest,
     LimitOrderRequest,
@@ -61,6 +63,7 @@ from engine.config import (
     INTRADAY_MOMENTUM_MIN_RVOL, INTRADAY_MOMENTUM_MIN_5M_RETURN_PCT,
     CONF_SCALE_MIN_MULT, CONF_SCALE_FULL_CONF,
     MARGIN_LEVERAGE,
+    API_KEY, API_SECRET,
     SCALEOUT_TRAIL_PCT, PROTECT_POSITIONS_ENABLED,
     TP_INTERMEDIATE_PCT, TP_INTERMEDIATE_TRAIL_PCT, TP_FINAL_PCT,
     DEAD_MONEY_MINUTES, DEAD_MONEY_MAX_ADVERSE_DRIFT_PCT,
@@ -511,6 +514,49 @@ class EnhancedExecutor:
             return self.market_state
         raise RuntimeError("EnhancedExecutor requires market_state to be set before execution")
 
+    def _after_hours_limit_price(self, symbol: str, signal_price: float, side: OrderSide) -> tuple[float, str | None]:
+        """Return (limit_price, reason) using live quote-first execution rules.
+
+        For pre/post-market limits, the current bid/ask is the real executable price.
+        We intentionally skip stale or too-passive orders instead of submitting a
+        limit that has almost no chance to fill.
+        """
+        fallback = round(signal_price * 1.002, 2) if side == OrderSide.SELL else round(signal_price * 0.998, 2)
+        try:
+            if hasattr(self.client, "get_latest_quote"):
+                quote = self.client.get_latest_quote(symbol)
+            else:
+                data_client = getattr(self, "_stock_data_client", None)
+                if data_client is None:
+                    data_client = StockHistoricalDataClient(API_KEY, API_SECRET)
+                    self._stock_data_client = data_client
+                quotes = data_client.get_stock_latest_quote(
+                    StockLatestQuoteRequest(symbol_or_symbols=symbol)
+                )
+                quote = quotes[symbol]
+            bid = float(getattr(quote, "bid_price", 0) or 0)
+            ask = float(getattr(quote, "ask_price", 0) or 0)
+            if bid <= 0 and ask <= 0:
+                return fallback, "no live quote"
+
+            if side == OrderSide.BUY:
+                if ask <= 0:
+                    return round(bid, 2), None
+                limit = round(ask * 0.9995, 2)
+                if limit <= 0:
+                    return fallback, "bad quote"
+                return limit, None
+
+            if bid <= 0:
+                return round(ask, 2), None
+            limit = round(bid * 1.0005, 2)
+            if limit <= 0:
+                return fallback, "bad quote"
+            return limit, None
+        except Exception as exc:
+            log.warning("After-hours quote lookup failed for %s: %s", symbol, exc)
+            return fallback, "quote fetch error"
+
     # -- Position Cache ----------------------------------------------------
     def _find_weakest_position(self) -> Optional[str]:
         """Return the symbol of the open long position with the worst unrealized P&L %.
@@ -940,9 +986,11 @@ class EnhancedExecutor:
         try:
             coid = f"apex-{signal.strategy}-{signal.symbol}-{int(time.time())}"
             if EXTENDED_HOURS and not self._current_market_state().is_regular_hours:
-                adj   = 1.002 if order_type == OrderType.LONG else 0.998
-                limit = round(signal.price * adj, 2)
-                req   = LimitOrderRequest(
+                limit, quote_reason = self._after_hours_limit_price(signal.symbol, float(signal.price or 0), side)
+                if quote_reason is not None:
+                    log.info(f"{action} LIMIT SKIP {signal.symbol}: {quote_reason}; no executable quote for after-hours order")
+                    return False
+                req = LimitOrderRequest(
                     symbol          = signal.symbol,
                     qty             = shares,
                     side            = side,
@@ -954,7 +1002,7 @@ class EnhancedExecutor:
                 order = self.client.submit_order(req)
                 self.order_cache[signal.symbol] = order.id
                 self._submitted_entry_orders[signal.symbol] = order
-                log.info(f"{action} LIMIT {signal.symbol}: {shares} @ ${limit:.2f} (ext-hours) | {signal.strategy}")
+                log.info(f"{action} LIMIT {signal.symbol}: {shares} @ ${limit:.2f} (ext-hours quote-first) | {signal.strategy}")
                 return True
             else:
                 req = MarketOrderRequest(
@@ -1208,10 +1256,11 @@ class EnhancedExecutor:
         try:
             qty = abs(int(positions.positions_dict[signal.symbol].qty))
             if EXTENDED_HOURS and not self._current_market_state().is_regular_hours:
+                price = self._after_hours_limit_price(signal.symbol, float(signal.price or 0), OrderSide.BUY)
                 req = LimitOrderRequest(
                     symbol=signal.symbol, qty=qty, side=OrderSide.BUY,
                     time_in_force=TimeInForce.DAY,
-                    limit_price=round(signal.price * 1.002, 2), extended_hours=True,
+                    limit_price=price, extended_hours=True,
                 )
             else:
                 req = MarketOrderRequest(
