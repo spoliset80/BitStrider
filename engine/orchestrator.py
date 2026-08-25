@@ -531,7 +531,7 @@ def _save_intraday_state(today: datetime.date, phase: str) -> None:
 
 
 def _manage_intraday_window(ctx: AppContext) -> bool:
-    """Allow two ET trading windows and flatten at each session boundary."""
+    """Allow three ET trading windows and flatten at each session boundary."""
     now = datetime.datetime.now(pytz.timezone("America/New_York"))
     if now.weekday() >= 5:
         return False
@@ -545,21 +545,28 @@ def _manage_intraday_window(ctx: AppContext) -> bool:
     reset = minutes(cfg.INTRADAY_RESET_TIME)
     cutoff = minutes(cfg.INTRADAY_FINAL_CUTOFF)
     final_reset = minutes(cfg.INTRADAY_FINAL_RESET)
+    end = minutes(cfg.AFTERHOURS_END)
     today = now.date()
     phase_state = _load_intraday_state(today)
 
-    if current < start or current >= final_reset:
-        if current >= final_reset:
-            ctx.executor.flatten_portfolio(
-                f"INTRADAY FINAL RESET {cfg.INTRADAY_FINAL_RESET} ET",
+    if current < start or current >= end:
+        if current >= end and phase_state != "final_reset":
+            if not ctx.executor.flatten_portfolio(
+                f"INTRADAY FINAL RESET {cfg.AFTERHOURS_END} ET",
                 allow_momentum_exemptions=False,
-            )
+            ):
+                return False
             _save_intraday_state(today, "final_reset")
         return False
-    if current >= cutoff:
+    if cutoff <= current < final_reset:
         return False
 
-    phase = "first" if current < reset else "second"
+    if current < reset:
+        phase = "first"
+    elif current < final_reset:
+        phase = "second"
+    else:
+        phase = "third"
     key = (today, phase)
     if phase == "second" and phase_state == "pre_session":
         # A restart after 11:00 must not retroactively flatten Session 2.
@@ -580,6 +587,15 @@ def _manage_intraday_window(ctx: AppContext) -> bool:
         ):
             return False
         _save_intraday_state(today, "session_2")
+    elif phase == "third" and phase_state not in ("session_3", "final_reset", "pre_session"):
+        if not ctx.executor.flatten_portfolio(
+            f"INTRADAY {cfg.INTRADAY_FINAL_RESET} ET RESET",
+            allow_momentum_exemptions=False,
+        ):
+            return False
+        _save_intraday_state(today, "session_3")
+    elif phase == "third" and phase_state in ("final_reset", "pre_session"):
+        _save_intraday_state(today, "session_3")
     _WINDOW_FLAT_STATE[key] = True
     if ctx.options_executor is not None:
         ctx.options_executor._positions.clear()
