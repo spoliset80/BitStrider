@@ -178,6 +178,7 @@ class EnhancedExecutor:
         self._live_probe_count_date: Optional[datetime.date] = None
         self._live_probe_entries_today = 0
         self._live_probe_scaled_in: set = set()
+        self._live_probe_scale_in_pending: Dict[str, dict] = {}
         self._restore_exit_state()
         self._rebuild_entry_log_from_orders()
         self._restore_live_probe_count()
@@ -379,6 +380,8 @@ class EnhancedExecutor:
 
         state_changed = False
         is_bull = market_state.resolve_regime()
+        pending_scale_ins = getattr(self, "_live_probe_scale_in_pending", {})
+        cumulative_scale_cost = 0.0  # Track buying power used across iterations
         for sym, info in list(self._entry_log.items()):
             if sym in self._live_probe_scaled_in or sym in self._tightened:
                 continue
@@ -394,6 +397,45 @@ class EnhancedExecutor:
                 log.info(f"LIVE PROBE {sym}: scale-in skipped; position has no usable quantity/price")
                 continue
             is_long = qty > 0
+            pending_scale_in = pending_scale_ins.get(sym)
+            if pending_scale_in is not None:
+                if not market_state.is_regular_hours:
+                    log.info(f"LIVE PROBE {sym}: premarket scale-in limit order still pending")
+                    continue
+                if abs(qty) > pending_scale_in["qty"]:
+                    try:
+                        for order in self.client.get_orders() or []:
+                            if order.symbol == sym:
+                                self.client.cancel_order_by_id(str(order.id))
+                        time.sleep(0.4)
+                        trail_pct = get_dynamic_tier(sym, current_price)["ts"]
+                        self.client.submit_order(TrailingStopOrderRequest(
+                            symbol=sym, qty=abs(qty),
+                            side=OrderSide.SELL if is_long else OrderSide.BUY,
+                            type=AlpacaOrderType.TRAILING_STOP,
+                            time_in_force=TimeInForce.GTC,
+                            trail_percent=trail_pct,
+                        ))
+                    except Exception as protection_error:
+                        log.error(
+                            f"LIVE PROBE {sym}: premarket scale-in filled but protection replacement "
+                            f"failed: {protection_error}"
+                        )
+                        continue
+                    pending_scale_ins.pop(sym, None)
+                    self._live_probe_scaled_in.add(sym)
+                    state_changed = True
+                    log.info(f"LIVE PROBE {sym}: premarket scale-in filled; protection replaced for {abs(qty)} shares")
+                    continue
+                pending_order_id = pending_scale_in.get("order_id")
+                if pending_order_id:
+                    try:
+                        self.client.cancel_order_by_id(pending_order_id)
+                    except Exception as cancel_error:
+                        log.warning(f"LIVE PROBE {sym}: could not cancel unfilled scale-in limit order: {cancel_error}")
+                        continue
+                pending_scale_ins.pop(sym, None)
+                log.info(f"LIVE PROBE {sym}: unfilled premarket scale-in canceled; retrying in regular hours")
             gain_pct = ((current_price - entry_price) / entry_price * 100) * (1 if is_long else -1)
             if gain_pct < LIVE_PROBE_SCALE_IN_MIN_GAIN_PCT:
                 log.info(
@@ -406,7 +448,7 @@ class EnhancedExecutor:
                 continue
 
             margin = 1.0 if is_long else 2.0
-            usable_bp = max(0.0, account.buying_power - self._options_cost_reserve)
+            usable_bp = max(0.0, account.buying_power - self._options_cost_reserve - cumulative_scale_cost)
             current_exposure = abs(qty) * current_price
             max_total_exposure = usable_bp * LIVE_PROBE_MAX_TOTAL_BUYING_POWER_PCT / 100
             remaining_exposure = max(0.0, max_total_exposure - current_exposure)
@@ -423,42 +465,125 @@ class EnhancedExecutor:
                 continue
 
             side = OrderSide.BUY if is_long else OrderSide.SELL
-            try:
-                self.client.submit_order(MarketOrderRequest(
-                    symbol=sym, qty=add_shares, side=side,
-                    time_in_force=TimeInForce.DAY,
-                ))
-                stop_side = OrderSide.SELL if is_long else OrderSide.BUY
-                trail_pct = get_dynamic_tier(sym, current_price)["ts"]
+            if not market_state.is_regular_hours:
+                limit, quote_reason = self._after_hours_limit_price(sym, current_price, side)
+                if quote_reason is not None:
+                    log.info(
+                        f"LIVE PROBE {sym}: premarket scale-in skipped; {quote_reason}; "
+                        "no executable quote"
+                    )
+                    continue
                 try:
+                    order = self.client.submit_order(LimitOrderRequest(
+                        symbol=sym, qty=add_shares, side=side,
+                        time_in_force=TimeInForce.DAY,
+                        limit_price=limit, extended_hours=True,
+                        client_order_id=f"apex-probe-scale-{sym}-{int(time.time())}",
+                    ))
+                    pending_scale_ins[sym] = {
+                        "qty": abs(qty),
+                        "order_id": str(getattr(order, "id", "") or ""),
+                    }
+                    log.info(
+                        f"LIVE PROBE SCALE-IN LIMIT {sym}: +{add_shares} shares @ ${limit:.2f} "
+                        "(extended hours; existing protection retained until fill)"
+                    )
+                except Exception as scale_error:
+                    log.warning(f"LIVE PROBE {sym}: premarket scale-in limit order failed: {scale_error}")
+                continue
+            try:
+                open_orders = [
+                    order for order in (self.client.get_orders() or [])
+                    if order.symbol == sym
+                ]
+                for order in open_orders:
+                    self.client.cancel_order_by_id(str(order.id))
+                if open_orders:
+                    time.sleep(0.4)
+                    log.info(
+                        f"LIVE PROBE {sym}: replaced {len(open_orders)} existing order(s) "
+                        "before scale-in"
+                    )
+            except Exception as cancel_error:
+                log.warning(
+                    f"LIVE PROBE {sym}: scale-in skipped; could not replace existing "
+                    f"protective order ({cancel_error})"
+                )
+                continue
+            
+            # ── Session 3 Post-Market Check: 16:00+ ET requires LIMIT orders ──
+            import pytz
+            _now_et = datetime.datetime.now(pytz.timezone("America/New_York"))
+            _is_post_market = _now_et.hour >= 16  # After 4:00 PM ET
+            
+            try:
+                if _is_post_market:
+                    # Post-market (16:00–20:00 ET): use LIMIT order, not market
+                    limit, quote_reason = self._after_hours_limit_price(sym, current_price, side)
+                    if quote_reason is not None:
+                        log.info(
+                            f"LIVE PROBE {sym}: post-market scale-in skipped; {quote_reason}; "
+                            "no executable quote"
+                        )
+                        continue
+                    self.client.submit_order(LimitOrderRequest(
+                        symbol=sym, qty=add_shares, side=side,
+                        time_in_force=TimeInForce.DAY,
+                        limit_price=limit, extended_hours=True,
+                        client_order_id=f"apex-probe-scale-{sym}-{int(time.time())}",
+                    ))
+                    log.info(
+                        f"LIVE PROBE SCALE-IN LIMIT (post-market) {sym}: +{add_shares} shares @ ${limit:.2f} "
+                        "(16:00+ ET; existing protection retained)"
+                    )
+                else:
+                    # Regular market hours (9:30–16:00 ET): use MARKET order
+                    self.client.submit_order(MarketOrderRequest(
+                        symbol=sym, qty=add_shares, side=side,
+                        time_in_force=TimeInForce.DAY,
+                    ))
+                    # Add combined trailing stop for scaled position
+                    stop_side = OrderSide.SELL if is_long else OrderSide.BUY
+                    trail_pct = get_dynamic_tier(sym, current_price)["ts"]
                     self.client.submit_order(TrailingStopOrderRequest(
-                        symbol=sym, qty=add_shares, side=stop_side,
+                        symbol=sym, qty=abs(qty) + add_shares, side=stop_side,
                         type=AlpacaOrderType.TRAILING_STOP,
                         time_in_force=TimeInForce.GTC,
                         trail_percent=trail_pct,
                     ))
-                except Exception as stop_error:
-                    log.warning(
-                        f"LIVE PROBE {sym}: scale-in trailing stop rejected ({stop_error}); "
-                        "unwinding added shares"
+                    log.info(
+                        f"LIVE PROBE SCALE-IN {sym}: +{add_shares} shares "
+                        f"at {gain_pct:+.2f}% | used {LIVE_PROBE_SCALE_IN_BUYING_POWER_PCT:.1f}% available buying power"
                     )
-                    unwind_side = OrderSide.SELL if is_long else OrderSide.BUY
-                    try:
-                        self.client.submit_order(MarketOrderRequest(
-                            symbol=sym, qty=add_shares, side=unwind_side,
-                            time_in_force=TimeInForce.DAY,
-                        ))
-                    except Exception as unwind_error:
-                        log.error(
-                            f"LIVE PROBE {sym}: failed to unwind unprotected scale-in: {unwind_error}"
-                        )
+                    cumulative_scale_cost += add_shares * current_price * margin
+                    self._live_probe_scaled_in.add(sym)
+                    state_changed = True
                     continue
-                self._live_probe_scaled_in.add(sym)
+                
+                # Post-market limit order: don't add to _live_probe_scaled_in yet (pending fill)
+                pending_scale_ins[sym] = {
+                    "qty": abs(qty),
+                    "order_id": f"apex-probe-scale-{sym}-{int(time.time())}",
+                    "post_market": True,
+                }
+                cumulative_scale_cost += add_shares * current_price * margin
                 state_changed = True
-                log.info(
-                    f"LIVE PROBE SCALE-IN {sym}: +{add_shares} shares "
-                    f"at {gain_pct:+.2f}% | used {LIVE_PROBE_SCALE_IN_BUYING_POWER_PCT:.1f}% available buying power"
+            except Exception as stop_error:
+                log.warning(
+                    f"LIVE PROBE {sym}: scale-in trailing stop rejected ({stop_error}); "
+                    "unwinding added shares"
                 )
+                unwind_side = OrderSide.SELL if is_long else OrderSide.BUY
+                try:
+                    self.client.submit_order(MarketOrderRequest(
+                        symbol=sym, qty=add_shares, side=unwind_side,
+                        time_in_force=TimeInForce.DAY,
+                    ))
+                except Exception as unwind_error:
+                    log.error(
+                        f"LIVE PROBE {sym}: failed to unwind unprotected scale-in: {unwind_error}"
+                    )
+                continue
             except Exception as e:
                 log.warning(f"LIVE PROBE scale-in failed {sym}: {e}")
 
@@ -1286,10 +1411,26 @@ class EnhancedExecutor:
 
         qty = abs(int(float(positions.positions_dict[signal.symbol].qty)))
         try:
-            req = MarketOrderRequest(
-                symbol=signal.symbol, qty=qty,
-                side=OrderSide.SELL, time_in_force=TimeInForce.DAY,
-            )
+            if EXTENDED_HOURS and not self._current_market_state().is_regular_hours:
+                limit, quote_reason = self._after_hours_limit_price(
+                    signal.symbol, float(signal.price or 0), OrderSide.SELL
+                )
+                if quote_reason is not None:
+                    log.info(
+                        f"SELL LIMIT SKIP {signal.symbol}: {quote_reason}; "
+                        "no executable quote for after-hours order"
+                    )
+                    return False
+                req = LimitOrderRequest(
+                    symbol=signal.symbol, qty=qty, side=OrderSide.SELL,
+                    time_in_force=TimeInForce.DAY,
+                    limit_price=limit, extended_hours=True,
+                )
+            else:
+                req = MarketOrderRequest(
+                    symbol=signal.symbol, qty=qty,
+                    side=OrderSide.SELL, time_in_force=TimeInForce.DAY,
+                )
             self.client.submit_order(req)
             # NOTE: closing an existing position is NOT a new day trade.
             # Alpaca counts the round-trip (open+close same day) as one trade;
@@ -1569,11 +1710,16 @@ class EnhancedExecutor:
         self._flatten_failed = failed
         self._flatten_ignored = ignored
         remaining = close_symbols & (requested | failed)
-        if remaining:
-            log.warning(f"{reason}: waiting for flat account; remaining={sorted(remaining)}")
+        if failed:
+            log.warning(f"{reason}: close submissions failed; remaining={sorted(failed)}")
+        elif requested:
+            log.info(
+                f"{reason}: close requests submitted; continuing without waiting for "
+                f"confirmation: {sorted(requested)}"
+            )
         else:
             log.info(f"{reason}: flatten complete; ignored_inactive={sorted(ignored)}")
-        return not remaining
+        return not failed
 
     # ── Legacy EOD Close ─────────────────────────────────────────────────────
     def close_eod_positions(self) -> Optional[dict]:
