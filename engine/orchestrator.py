@@ -542,6 +542,8 @@ def _manage_intraday_window(ctx: AppContext) -> bool:
 
     current = now.hour * 60 + now.minute
     start = minutes(cfg.INTRADAY_WINDOW_START)
+    morning_cutoff = minutes(cfg.INTRADAY_MORNING_CUTOFF)
+    morning_reset = minutes(cfg.INTRADAY_MORNING_RESET)
     reset = minutes(cfg.INTRADAY_RESET_TIME)
     cutoff = minutes(cfg.INTRADAY_FINAL_CUTOFF)
     final_reset = minutes(cfg.INTRADAY_FINAL_RESET)
@@ -558,6 +560,12 @@ def _manage_intraday_window(ctx: AppContext) -> bool:
                 return False
             _save_intraday_state(today, "final_reset")
         return False
+    
+    # ── Morning cutoff: 10:55 - 11:00 ──
+    if morning_cutoff <= current < morning_reset:
+        return False
+    
+    # ── Afternoon cutoff: 14:58 - 15:03 ──
     if cutoff <= current < final_reset:
         return False
 
@@ -582,7 +590,7 @@ def _manage_intraday_window(ctx: AppContext) -> bool:
         _save_intraday_state(today, "session_1")
     elif phase == "second" and phase_state == "session_1":
         if not ctx.executor.flatten_portfolio(
-            f"INTRADAY {cfg.INTRADAY_RESET_TIME} ET RESET",
+            f"INTRADAY {cfg.INTRADAY_MORNING_RESET} ET RESET",
             allow_momentum_exemptions=True,
         ):
             return False
