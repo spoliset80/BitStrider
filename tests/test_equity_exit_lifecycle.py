@@ -5,7 +5,7 @@ import threading
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from engine.execution import enhanced
 from engine.execution.enhanced import EnhancedExecutor
@@ -63,6 +63,7 @@ def build_executor(client, state_path):
     executor._intermediate_targets = {}
     executor._tightened = set()
     executor._live_probe_scaled_in = set()
+    executor._live_probe_scale_in_pending = {}
     executor._exit_state_path = state_path
     executor._exit_state_lock = threading.Lock()
     executor._probe_journal_path = state_path.with_name("probe_journal.jsonl")
@@ -71,6 +72,21 @@ def build_executor(client, state_path):
 
 
 class EquityExitLifecycleTests(unittest.TestCase):
+    def test_scan_and_trade_keeps_live_probe_scale_checks_during_cutoff(self):
+        executor = object.__new__(EnhancedExecutor)
+        executor.check_live_probe_scale_ins = Mock()
+        ctx = SimpleNamespace(client=None, executor=executor, options_executor=None, crypto_trader=None)
+
+        with patch("engine.orchestrator._manage_intraday_window", return_value=False), patch(
+            "engine.orchestrator.log"
+        ) as mock_log:
+            from engine.orchestrator import scan_and_trade
+
+            scan_and_trade(ctx)
+
+        executor.check_live_probe_scale_ins.assert_called_once()
+        mock_log.info.assert_any_call("[SYSTEM] Outside an active intraday window or waiting for portfolio flatten")
+
     def test_flatten_ignores_inactive_assets(self):
         client = FlattenClient(
             [MockPosition("AVNS", "10", 5.0)],
@@ -84,6 +100,15 @@ class EquityExitLifecycleTests(unittest.TestCase):
         self.assertEqual(executor._flatten_failed, set())
         self.assertTrue(executor.flatten_portfolio("INTRADAY FINAL RESET"))
         self.assertEqual(client.close_attempts, ["AVNS"])
+
+    def test_flatten_proceeds_after_close_requests_are_submitted(self):
+        client = FlattenClient([MockPosition("AAPL", "10", 100.0)])
+        executor = build_executor(client, Path(tempfile.gettempdir()) / "unused_flatten_state.json")
+
+        self.assertTrue(executor.flatten_portfolio("INTRADAY FINAL RESET"))
+        self.assertEqual(client.close_attempts, ["AAPL"])
+        self.assertEqual(executor._flatten_in_progress, {"AAPL"})
+        self.assertEqual(executor._flatten_failed, set())
 
     def test_flatten_still_waits_for_active_close_failure(self):
         client = FlattenClient(
@@ -188,7 +213,90 @@ class EquityExitLifecycleTests(unittest.TestCase):
 
         self.assertEqual(len(client.orders), 2)
         self.assertEqual(client.orders[0].qty, 23)
-        self.assertEqual(client.orders[1].qty, 23)
+        self.assertEqual(client.orders[1].qty, 24)
+
+    def test_live_probe_scale_in_replaces_existing_protective_order(self):
+        class WashTradeClient(MockClient):
+            def __init__(self):
+                super().__init__([MockPosition("AAPL", "1", 101.0, avg_entry_price=100.0)])
+                self.open_orders = [SimpleNamespace(symbol="AAPL", id="existing-trailing-stop")]
+                self.cancelled_orders = []
+
+            def get_orders(self):
+                return self.open_orders
+
+            def cancel_order_by_id(self, order_id):
+                self.cancelled_orders.append(order_id)
+                self.open_orders = [order for order in self.open_orders if order.id != order_id]
+
+            def submit_order(self, order):
+                if self.open_orders and order.side == enhanced.OrderSide.SELL:
+                    raise RuntimeError("potential wash trade detected")
+                self.orders.append(order)
+
+        client = WashTradeClient()
+        executor = build_executor(client, Path(tempfile.gettempdir()) / "unused_probe_state.json")
+        executor._options_cost_reserve = 0.0
+        executor._get_account = lambda **_kwargs: SimpleNamespace(equity=10_000.0, buying_power=10_000.0)
+        executor._current_market_state = lambda: SimpleNamespace(
+            is_regular_hours=True,
+            now=datetime.datetime(2026, 8, 20, 10, 30),
+            resolve_regime=lambda: True,
+        )
+        executor._entry_log["AAPL"] = {"entry_price": 100.0}
+
+        with patch.object(enhanced, "LIVE_PROBE_MODE", True), patch.object(
+            enhanced, "LIVE_PROBE_SCALE_IN_ENABLED", True
+        ), patch.object(enhanced, "LIVE_PROBE_SCALE_IN_MIN_GAIN_PCT", 0.5), patch.object(
+            enhanced, "get_dynamic_tier", return_value={"ts": 6.0}
+        ), patch.object(enhanced.time, "sleep"):
+            executor.check_live_probe_scale_ins()
+
+        self.assertEqual(client.cancelled_orders, ["existing-trailing-stop"])
+        self.assertEqual(len(client.orders), 2)
+        self.assertEqual(client.orders[1].qty, 24)
+        self.assertIn("AAPL", executor._live_probe_scaled_in)
+
+    def test_live_probe_scale_in_uses_limit_order_premarket(self):
+        client = MockClient([MockPosition("AAPL", "1", 101.0, avg_entry_price=100.0)])
+        executor = build_executor(client, Path(tempfile.gettempdir()) / "unused_probe_state.json")
+        executor._options_cost_reserve = 0.0
+        executor._get_account = lambda **_kwargs: SimpleNamespace(equity=10_000.0, buying_power=10_000.0)
+        executor._current_market_state = lambda: SimpleNamespace(
+            is_regular_hours=False,
+            resolve_regime=lambda: True,
+        )
+        executor._after_hours_limit_price = lambda *_args: (101.1, None)
+        executor._entry_log["AAPL"] = {"entry_price": 100.0}
+
+        with patch.object(enhanced, "LIVE_PROBE_MODE", True), patch.object(
+            enhanced, "LIVE_PROBE_SCALE_IN_ENABLED", True
+        ), patch.object(enhanced, "LIVE_PROBE_SCALE_IN_MIN_GAIN_PCT", 0.5
+        ):
+            executor.check_live_probe_scale_ins()
+
+        self.assertEqual(len(client.orders), 1)
+        self.assertIsInstance(client.orders[0], enhanced.LimitOrderRequest)
+        self.assertTrue(client.orders[0].extended_hours)
+        self.assertIn("AAPL", executor._live_probe_scale_in_pending)
+
+    def test_close_long_uses_limit_order_premarket(self):
+        client = MockClient([MockPosition("AAPL", "10", 100.0)])
+        executor = build_executor(client, Path(tempfile.gettempdir()) / "unused_exit_state.json")
+        executor._get_positions = lambda **_kwargs: SimpleNamespace(
+            has_position=lambda symbol: symbol == "AAPL",
+            positions_dict={"AAPL": SimpleNamespace(qty="10")},
+        )
+        executor._current_market_state = lambda: SimpleNamespace(is_regular_hours=False)
+        executor._after_hours_limit_price = lambda *_args: (99.5, None)
+        signal = SimpleNamespace(symbol="AAPL", price=100.0, strategy="Momentum")
+
+        self.assertTrue(executor._close_long_position(signal, 10_000.0))
+
+        self.assertEqual(len(client.orders), 1)
+        self.assertIsInstance(client.orders[0], enhanced.LimitOrderRequest)
+        self.assertEqual(client.orders[0].limit_price, 99.5)
+        self.assertTrue(client.orders[0].extended_hours)
 
     def test_short_probe_does_not_scale_in(self):
         client = MockClient([MockPosition("AAPL", "-1", 99.0)])

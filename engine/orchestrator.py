@@ -530,6 +530,15 @@ def _save_intraday_state(today: datetime.date, phase: str) -> None:
         log.warning(f"Could not save intraday session state: {e}")
 
 
+def _run_live_probe_scale_check(ctx: AppContext, reason: str) -> None:
+    """Keep live-probe scale-ins active even while the bot is paused during cutoffs."""
+    try:
+        if ctx.executor is not None:
+            ctx.executor.check_live_probe_scale_ins()
+    except Exception as exc:
+        log.warning(f"[{reason}] live probe scale check skipped: {exc}")
+
+
 def _manage_intraday_window(ctx: AppContext) -> bool:
     """Allow three ET trading windows and flatten at each session boundary."""
     now = datetime.datetime.now(pytz.timezone("America/New_York"))
@@ -628,6 +637,7 @@ def scan_and_trade(ctx: AppContext) -> None:
     _session.reset_daily(ctx.client)
 
     if not _manage_intraday_window(ctx):
+        _run_live_probe_scale_check(ctx, "SYSTEM")
         log.info("[SYSTEM] Outside an active intraday window or waiting for portfolio flatten")
         return
 

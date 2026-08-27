@@ -363,6 +363,21 @@ class EnhancedExecutor:
             return False
         return True
 
+    def _resolve_scale_in_order(self, symbol: str, current_price: float, side: OrderSide, market_state: MarketState) -> tuple[str, float, str | None]:
+        """Return (order_kind, price, reason) for the current probe scale-in window."""
+        now = getattr(market_state, "now", None)
+        if now is not None and hasattr(now, "hour"):
+            is_post_market = now.weekday() < 5 and now.hour >= 16
+        else:
+            is_post_market = False
+        if is_post_market:
+            limit_price, reason = self._after_hours_limit_price(symbol, current_price, side)
+            return "limit", limit_price, reason
+        if getattr(market_state, "is_regular_hours", False):
+            return "market", current_price, None
+        limit_price, reason = self._after_hours_limit_price(symbol, current_price, side)
+        return "limit", limit_price, reason
+
     def check_live_probe_scale_ins(self) -> None:
         """Add once to a profitable live probe after the strategy scan completes."""
         if not (LIVE_PROBE_MODE and LIVE_PROBE_SCALE_IN_ENABLED):
@@ -381,7 +396,7 @@ class EnhancedExecutor:
         state_changed = False
         is_bull = market_state.resolve_regime()
         pending_scale_ins = getattr(self, "_live_probe_scale_in_pending", {})
-        cumulative_scale_cost = 0.0  # Track buying power used across iterations
+        cumulative_scale_cost = 0.0
         for sym, info in list(self._entry_log.items()):
             if sym in self._live_probe_scaled_in or sym in self._tightened:
                 continue
@@ -399,7 +414,7 @@ class EnhancedExecutor:
             is_long = qty > 0
             pending_scale_in = pending_scale_ins.get(sym)
             if pending_scale_in is not None:
-                if not market_state.is_regular_hours:
+                if not market_state.is_regular_hours and not (market_state.now.weekday() < 5 and market_state.now.hour >= 16):
                     log.info(f"LIVE PROBE {sym}: premarket scale-in limit order still pending")
                     continue
                 if abs(qty) > pending_scale_in["qty"]:
@@ -436,12 +451,10 @@ class EnhancedExecutor:
                         continue
                 pending_scale_ins.pop(sym, None)
                 log.info(f"LIVE PROBE {sym}: unfilled premarket scale-in canceled; retrying in regular hours")
+
             gain_pct = ((current_price - entry_price) / entry_price * 100) * (1 if is_long else -1)
             if gain_pct < LIVE_PROBE_SCALE_IN_MIN_GAIN_PCT:
-                log.info(
-                    f"LIVE PROBE {sym}: scale-in skipped; gain {gain_pct:+.2f}% "
-                    f"< {LIVE_PROBE_SCALE_IN_MIN_GAIN_PCT:.2f}%"
-                )
+                log.info(f"LIVE PROBE {sym}: scale-in skipped; gain {gain_pct:+.2f}% < {LIVE_PROBE_SCALE_IN_MIN_GAIN_PCT:.2f}%")
                 continue
             if not (is_long and is_bull):
                 log.info(f"LIVE PROBE {sym}: scale-in skipped; requires long position in bullish regime")
@@ -465,84 +478,37 @@ class EnhancedExecutor:
                 continue
 
             side = OrderSide.BUY if is_long else OrderSide.SELL
-            if not market_state.is_regular_hours:
-                limit, quote_reason = self._after_hours_limit_price(sym, current_price, side)
-                if quote_reason is not None:
-                    log.info(
-                        f"LIVE PROBE {sym}: premarket scale-in skipped; {quote_reason}; "
-                        "no executable quote"
-                    )
-                    continue
-                try:
-                    order = self.client.submit_order(LimitOrderRequest(
-                        symbol=sym, qty=add_shares, side=side,
-                        time_in_force=TimeInForce.DAY,
-                        limit_price=limit, extended_hours=True,
-                        client_order_id=f"apex-probe-scale-{sym}-{int(time.time())}",
-                    ))
-                    pending_scale_ins[sym] = {
-                        "qty": abs(qty),
-                        "order_id": str(getattr(order, "id", "") or ""),
-                    }
-                    log.info(
-                        f"LIVE PROBE SCALE-IN LIMIT {sym}: +{add_shares} shares @ ${limit:.2f} "
-                        "(extended hours; existing protection retained until fill)"
-                    )
-                except Exception as scale_error:
-                    log.warning(f"LIVE PROBE {sym}: premarket scale-in limit order failed: {scale_error}")
+            order_kind, order_price, quote_reason = self._resolve_scale_in_order(sym, current_price, side, market_state)
+            if quote_reason is not None:
+                log.info(f"LIVE PROBE {sym}: scale-in skipped; {quote_reason}; no executable quote")
                 continue
+
             try:
-                open_orders = [
-                    order for order in (self.client.get_orders() or [])
-                    if order.symbol == sym
-                ]
+                open_orders = [order for order in (self.client.get_orders() or []) if order.symbol == sym]
                 for order in open_orders:
                     self.client.cancel_order_by_id(str(order.id))
                 if open_orders:
                     time.sleep(0.4)
-                    log.info(
-                        f"LIVE PROBE {sym}: replaced {len(open_orders)} existing order(s) "
-                        "before scale-in"
-                    )
+                    log.info(f"LIVE PROBE {sym}: replaced {len(open_orders)} existing order(s) before scale-in")
             except Exception as cancel_error:
-                log.warning(
-                    f"LIVE PROBE {sym}: scale-in skipped; could not replace existing "
-                    f"protective order ({cancel_error})"
-                )
+                log.warning(f"LIVE PROBE {sym}: scale-in skipped; could not replace existing protective order ({cancel_error})")
                 continue
-            
-            # ── Session 3 Post-Market Check: 16:00+ ET requires LIMIT orders ──
-            import pytz
-            _now_et = datetime.datetime.now(pytz.timezone("America/New_York"))
-            _is_post_market = _now_et.hour >= 16  # After 4:00 PM ET
-            
+
             try:
-                if _is_post_market:
-                    # Post-market (16:00–20:00 ET): use LIMIT order, not market
-                    limit, quote_reason = self._after_hours_limit_price(sym, current_price, side)
-                    if quote_reason is not None:
-                        log.info(
-                            f"LIVE PROBE {sym}: post-market scale-in skipped; {quote_reason}; "
-                            "no executable quote"
-                        )
-                        continue
-                    self.client.submit_order(LimitOrderRequest(
+                if order_kind == "limit":
+                    order = self.client.submit_order(LimitOrderRequest(
                         symbol=sym, qty=add_shares, side=side,
                         time_in_force=TimeInForce.DAY,
-                        limit_price=limit, extended_hours=True,
+                        limit_price=order_price, extended_hours=True,
                         client_order_id=f"apex-probe-scale-{sym}-{int(time.time())}",
                     ))
-                    log.info(
-                        f"LIVE PROBE SCALE-IN LIMIT (post-market) {sym}: +{add_shares} shares @ ${limit:.2f} "
-                        "(16:00+ ET; existing protection retained)"
-                    )
+                    pending_scale_ins[sym] = {"qty": abs(qty), "order_id": str(getattr(order, "id", "") or ""), "post_market": True}
+                    log.info(f"LIVE PROBE SCALE-IN LIMIT {sym}: +{add_shares} shares @ ${order_price:.2f} ({'post-market' if market_state.now.hour >= 16 else 'extended-hours'})")
                 else:
-                    # Regular market hours (9:30–16:00 ET): use MARKET order
                     self.client.submit_order(MarketOrderRequest(
                         symbol=sym, qty=add_shares, side=side,
                         time_in_force=TimeInForce.DAY,
                     ))
-                    # Add combined trailing stop for scaled position
                     stop_side = OrderSide.SELL if is_long else OrderSide.BUY
                     trail_pct = get_dynamic_tier(sym, current_price)["ts"]
                     self.client.submit_order(TrailingStopOrderRequest(
@@ -551,41 +517,17 @@ class EnhancedExecutor:
                         time_in_force=TimeInForce.GTC,
                         trail_percent=trail_pct,
                     ))
-                    log.info(
-                        f"LIVE PROBE SCALE-IN {sym}: +{add_shares} shares "
-                        f"at {gain_pct:+.2f}% | used {LIVE_PROBE_SCALE_IN_BUYING_POWER_PCT:.1f}% available buying power"
-                    )
+                    log.info(f"LIVE PROBE SCALE-IN {sym}: +{add_shares} shares at {gain_pct:+.2f}% | used {LIVE_PROBE_SCALE_IN_BUYING_POWER_PCT:.1f}% available buying power")
                     cumulative_scale_cost += add_shares * current_price * margin
                     self._live_probe_scaled_in.add(sym)
                     state_changed = True
                     continue
-                
-                # Post-market limit order: don't add to _live_probe_scaled_in yet (pending fill)
-                pending_scale_ins[sym] = {
-                    "qty": abs(qty),
-                    "order_id": f"apex-probe-scale-{sym}-{int(time.time())}",
-                    "post_market": True,
-                }
+
                 cumulative_scale_cost += add_shares * current_price * margin
                 state_changed = True
-            except Exception as stop_error:
-                log.warning(
-                    f"LIVE PROBE {sym}: scale-in trailing stop rejected ({stop_error}); "
-                    "unwinding added shares"
-                )
-                unwind_side = OrderSide.SELL if is_long else OrderSide.BUY
-                try:
-                    self.client.submit_order(MarketOrderRequest(
-                        symbol=sym, qty=add_shares, side=unwind_side,
-                        time_in_force=TimeInForce.DAY,
-                    ))
-                except Exception as unwind_error:
-                    log.error(
-                        f"LIVE PROBE {sym}: failed to unwind unprotected scale-in: {unwind_error}"
-                    )
+            except Exception as scale_error:
+                log.warning(f"LIVE PROBE {sym}: scale-in order failed: {scale_error}")
                 continue
-            except Exception as e:
-                log.warning(f"LIVE PROBE scale-in failed {sym}: {e}")
 
         if state_changed:
             self._save_exit_state()
