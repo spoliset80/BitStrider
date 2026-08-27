@@ -65,15 +65,22 @@ class Broker:
         except Exception:
             return None
 
-    def find_option_position_for_ticker(self, ticker: str):
-        """Scan open positions for any OCC whose root matches ticker."""
+    def find_option_positions_for_ticker(self, ticker: str) -> list:
+        """All open option positions whose OCC root matches `ticker` exactly."""
+        import re
+        pattern = re.compile(rf"^{re.escape(ticker.upper())}\d{{6}}[CP]\d{{8}}$")
         try:
-            for p in self._client.get_all_positions():
-                sym = p.symbol
-                if sym.upper().startswith(ticker.upper()) and len(sym) > 6:
-                    return sym, p
-        except Exception:
-            pass
+            return [p for p in self._client.get_all_positions()
+                    if pattern.match(p.symbol.upper())]
+        except Exception as e:
+            logger.warning(f"  [POS] lookup failed for {ticker}: {e}")
+            return []
+
+    def find_option_position_for_ticker(self, ticker: str):
+        """First open option position for `ticker`, or (None, None)."""
+        positions = self.find_option_positions_for_ticker(ticker)
+        if positions:
+            return positions[0].symbol, positions[0]
         return None, None
 
     def get_latest_price(self, symbol: str) -> Optional[float]:
@@ -92,6 +99,71 @@ class Broker:
         except Exception as e:
             logger.warning(f"  [PRICE] {symbol} fetch failed: {e}")
             return None
+
+    def get_option_quote(self, occ: str) -> Optional[dict]:
+        """Latest bid/ask/mid for an option contract, or None if unavailable."""
+        try:
+            from alpaca.data.historical.option import OptionHistoricalDataClient
+            from alpaca.data.requests import OptionLatestQuoteRequest
+            c = self._client
+            data_client = OptionHistoricalDataClient(
+                c._api_key, c._secret_key  # type: ignore[attr-defined]
+            )
+            req = OptionLatestQuoteRequest(symbol_or_symbols=occ)
+            q = data_client.get_option_latest_quote(req).get(occ)
+            if q is None:
+                return None
+            bid, ask = float(q.bid_price), float(q.ask_price)
+            if bid <= 0 or ask <= 0:
+                return None
+            return {"bid": bid, "ask": ask, "mid": round((bid + ask) / 2, 2)}
+        except Exception as e:
+            logger.warning(f"  [QUOTE] {occ} fetch failed: {e}")
+            return None
+
+    def get_option_last_trade_price(self, occ: str) -> Optional[float]:
+        """Latest traded price for an option contract, or None if unavailable."""
+        try:
+            from alpaca.data.historical.option import OptionHistoricalDataClient
+            from alpaca.data.requests import OptionLatestTradeRequest
+            c = self._client
+            data_client = OptionHistoricalDataClient(
+                c._api_key, c._secret_key  # type: ignore[attr-defined]
+            )
+            req = OptionLatestTradeRequest(symbol_or_symbols=occ)
+            t = data_client.get_option_latest_trade(req).get(occ)
+            if t is None:
+                return None
+            price = float(t.price)
+            return price if price > 0 else None
+        except Exception as e:
+            logger.warning(f"  [LAST TRADE] {occ} fetch failed: {e}")
+            return None
+
+    def get_daily_bars(self, symbol: str, lookback: int = 120) -> list:
+        """Daily OHLCV bars for the last `lookback` calendar days (oldest first)."""
+        try:
+            from datetime import datetime, timedelta, timezone
+            from alpaca.data.historical import StockHistoricalDataClient
+            from alpaca.data.requests import StockBarsRequest
+            from alpaca.data.timeframe import TimeFrame
+            c = self._client
+            data_client = StockHistoricalDataClient(
+                c._api_key, c._secret_key  # type: ignore[attr-defined]
+            )
+            # End a day back so we never request an incomplete/unavailable session.
+            end = datetime.now(timezone.utc) - timedelta(minutes=20)
+            req = StockBarsRequest(
+                symbol_or_symbols=symbol,
+                timeframe=TimeFrame.Day,
+                start=end - timedelta(days=lookback),
+                end=end,
+            )
+            bars = data_client.get_stock_bars(req)
+            return list(bars[symbol]) if symbol in bars.data else []
+        except Exception as e:
+            logger.warning(f"  [BARS] {symbol} fetch failed: {e}")
+            return []
 
     # ── Order placement ───────────────────────────────────────────────────────
 
@@ -269,21 +341,37 @@ class Broker:
             logger.error(f"  [SPX] Contract lookup error: {e}")
             return None
 
-    def find_swing_call(self, ticker: str, near_price: float,
-                        target_dte: int = 45, min_dte: int = 30) -> Optional[dict]:
+    def find_option_contract(self, ticker: str, near_price: float,
+                             opt_type: str = "call", target_dte: int = 45,
+                             min_dte: int = 30, moneyness: str = "ATM",
+                             moneyness_pct: float = 5.0,
+                             target_date=None) -> Optional[dict]:
         """
-        Find an ATM-ish call for a swing trade.
+        Find a tradable option contract for `ticker`.
 
-        Picks the expiration closest to `target_dte` (but >= `min_dte` out),
-        then the strike closest to `near_price`. Returns the contract dict
-        (with 'symbol', 'strike_price', 'expiration_date', 'close_price') or None.
+        Picks the expiration closest to `target_date` (if given) else `target_dte`,
+        but never sooner than `min_dte`. Then the strike closest to a target derived
+        from `moneyness` ("ITM" | "ATM" | "OTM") offset `moneyness_pct` from
+        `near_price`. Returns the contract dict or None.
         """
         import requests as req_lib
         from datetime import date, timedelta
 
+        opt_type = opt_type.lower()
         today    = date.today()
+        target_exp = target_date or (today + timedelta(days=target_dte))
         gte_date = (today + timedelta(days=min_dte)).strftime("%Y-%m-%d")
-        lte_date = (today + timedelta(days=max(target_dte * 2, min_dte + 30))).strftime("%Y-%m-%d")
+        # Search a window around the target so the closest expiry is always reachable.
+        span     = max((target_exp - today).days * 2, min_dte + 30)
+        lte_date = (today + timedelta(days=span)).strftime("%Y-%m-%d")
+
+        # ITM calls sit below spot, ITM puts above; OTM is the inverse.
+        m = moneyness.upper()
+        if m == "ATM":
+            target_strike = near_price
+        else:
+            direction = 1 if (m == "OTM") == (opt_type == "call") else -1
+            target_strike = near_price * (1 + direction * moneyness_pct / 100)
 
         c = self._client
         headers = {
@@ -297,7 +385,7 @@ class Broker:
                 headers=headers,
                 params={
                     "underlying_symbols":   ticker.upper(),
-                    "type":                 "call",
+                    "type":                 opt_type,
                     "expiration_date_gte":  gte_date,
                     "expiration_date_lte":  lte_date,
                     "limit":                1000,
@@ -305,26 +393,32 @@ class Broker:
                 timeout=10,
             )
             if not r.ok:
-                logger.warning(f"  [BREAKOUT] Contract search failed {r.status_code} for {ticker}")
+                logger.warning(f"  [OPT] Contract search failed {r.status_code} for {ticker}")
                 return None
             contracts = [c for c in r.json().get("option_contracts", []) if c.get("tradable")]
             if not contracts:
-                logger.warning(f"  [BREAKOUT] No tradable {ticker} calls {gte_date}..{lte_date}")
+                logger.warning(f"  [OPT] No tradable {ticker} {opt_type}s {gte_date}..{lte_date}")
                 return None
 
-            # Choose expiration closest to target_dte
-            target_exp = today + timedelta(days=target_dte)
             def exp_key(c):
                 ed = date.fromisoformat(c["expiration_date"])
                 return abs((ed - target_exp).days)
             best_exp = min(contracts, key=exp_key)["expiration_date"]
             same_exp = [c for c in contracts if c["expiration_date"] == best_exp]
 
-            # Among that expiry, strike closest to near_price (ATM)
-            best = min(same_exp, key=lambda c: abs(float(c["strike_price"]) - near_price))
-            logger.info(f"  [BREAKOUT] Selected {ticker} call {best['symbol']} "
-                        f"strike={best['strike_price']} exp={best['expiration_date']}")
+            best = min(same_exp, key=lambda c: abs(float(c["strike_price"]) - target_strike))
+            logger.info(f"  [OPT] Selected {ticker} {m} {opt_type} {best['symbol']} "
+                        f"strike={best['strike_price']} exp={best['expiration_date']} "
+                        f"(spot≈{near_price}, target≈{round(target_strike, 2)})")
             return best
         except Exception as e:
-            logger.error(f"  [BREAKOUT] Contract lookup error for {ticker}: {e}")
+            logger.error(f"  [OPT] Contract lookup error for {ticker}: {e}")
             return None
+
+    def find_swing_call(self, ticker: str, near_price: float,
+                        target_dte: int = 45, min_dte: int = 30) -> Optional[dict]:
+        """ATM-ish swing call — thin wrapper over find_option_contract."""
+        return self.find_option_contract(
+            ticker, near_price, opt_type="call",
+            target_dte=target_dte, min_dte=min_dte, moneyness="ATM",
+        )

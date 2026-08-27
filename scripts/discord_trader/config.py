@@ -30,6 +30,17 @@ class Config:
     alloc_low_pct:  float = 1.0    # conf 70-79 %
     alloc_med_pct:  float = 2.0    # conf 80-89 %
     alloc_high_pct: float = 3.0    # conf 90+  %
+    price_above_last_pct: float = 2.0  # limit price = last trade (or mid) * (1 + this/100), overrides chat-alerted price
+    use_technical_score: bool = True   # backtested as no better than random — see notes before relying on it
+    max_hold_days: int = 1             # force-close positions older than this (0 = wait for 'Out' only)
+
+    # Equity alerts → options conversion (cheaper than buying shares outright)
+    equity_as_options:      bool  = True
+    equity_opt_moneyness:   str   = "ATM"   # ITM | ATM | OTM
+    equity_opt_moneyness_pct: float = 5.0   # % offset from spot for ITM/OTM
+    equity_opt_expiry_mode: str   = "week"  # "week" = this week's Friday | "dte" = use equity_opt_dte
+    equity_opt_dte:         int   = 7
+    equity_opt_min_dte:     int   = 1
 
     # Polling
     poll_secs:     int = 60
@@ -66,8 +77,50 @@ class Config:
         return self.mode != "live"
 
 
+def _as_bool(raw: str) -> bool:
+    return raw.strip().lower() in ("true", "1", "yes", "on")
+
+
+# env var -> (Config field, converter). Defaults live on the dataclass only.
+_ENV_MAP = {
+    "DISCORD_CONFIDENCE_MIN":           ("confidence_min", int),
+    "DISCORD_ORDER_NOTIONAL":           ("order_notional", float),
+    "DISCORD_MAX_POSITIONS":            ("max_positions", int),
+    "DISCORD_MAX_DAILY_SPEND":          ("max_daily_spend", float),
+    "DISCORD_DEDUPE_TICKER":            ("dedupe_ticker", _as_bool),
+    "DISCORD_ALLOC_LOW_PCT":            ("alloc_low_pct", float),
+    "DISCORD_ALLOC_MED_PCT":            ("alloc_med_pct", float),
+    "DISCORD_ALLOC_HIGH_PCT":           ("alloc_high_pct", float),
+    "DISCORD_PRICE_ABOVE_LAST_PCT":     ("price_above_last_pct", float),
+    "DISCORD_USE_TECHNICAL_SCORE":      ("use_technical_score", _as_bool),
+    "DISCORD_MAX_HOLD_DAYS":            ("max_hold_days", int),
+    "DISCORD_EQUITY_AS_OPTIONS":        ("equity_as_options", _as_bool),
+    "DISCORD_EQUITY_OPT_MONEYNESS":     ("equity_opt_moneyness", lambda s: s.strip().upper()),
+    "DISCORD_EQUITY_OPT_MONEYNESS_PCT": ("equity_opt_moneyness_pct", float),
+    "DISCORD_EQUITY_OPT_EXPIRY_MODE":   ("equity_opt_expiry_mode", lambda s: s.strip().lower()),
+    "DISCORD_EQUITY_OPT_DTE":           ("equity_opt_dte", int),
+    "DISCORD_EQUITY_OPT_MIN_DTE":       ("equity_opt_min_dte", int),
+    "DISCORD_SPX_NOTIONAL":             ("spx_notional", float),
+    "DISCORD_SPX_STOP_PCT":             ("spx_stop_pct", float),
+    "DISCORD_SPX_TARGET_PCT":           ("spx_target_pct", float),
+    "DISCORD_SPX_BP_PCT":               ("spx_bp_pct", float),
+    "DISCORD_BREAKOUT_NOTIONAL":        ("breakout_notional", float),
+    "DISCORD_BREAKOUT_DTE":             ("breakout_dte", int),
+    "DISCORD_BREAKOUT_MIN_DTE":         ("breakout_min_dte", int),
+    "DISCORD_BREAKOUT_TRAIL_PCT":       ("breakout_trail_pct", float),
+    "DISCORD_MARKET_HOURS_ONLY":        ("market_hours_only", _as_bool),
+    "DISCORD_MARKET_OPEN":              ("market_open", str),
+    "DISCORD_MARKET_CLOSE":             ("market_close", str),
+    "DISCORD_MARKET_TZ":                ("market_tz", str),
+}
+
+
 def load_config() -> Config:
-    """Build Config from environment variables."""
+    """Build Config from environment variables.
+
+    Only env vars that are actually set override the dataclass defaults, so a
+    default is never defined in two places.
+    """
     raw_ids   = os.getenv("DISCORD_CHANNEL_IDS",
                           "753377655532945558,752750381918060589,"
                           "769046364738289734,744643208973254726")
@@ -88,6 +141,16 @@ def load_config() -> Config:
         if cid and cid not in channel_types:
             channel_types[cid] = "options"
 
+    overrides = {}
+    for env_key, (field_name, convert) in _ENV_MAP.items():
+        raw = os.getenv(env_key)
+        if raw is None or raw.strip() == "":
+            continue
+        try:
+            overrides[field_name] = convert(raw)
+        except (TypeError, ValueError):
+            raise ValueError(f"{env_key}={raw!r} is not a valid {field_name}") from None
+
     return Config(
         mode         = os.getenv("DISCORD_OPTIONS_MODE", "paper"),
         user_token   = os.getenv("DISCORD_USER_TOKEN", ""),
@@ -96,24 +159,5 @@ def load_config() -> Config:
         live_key     = os.getenv("LIVE_ALPACA_API_KEY", ""),
         live_secret  = os.getenv("LIVE_ALPACA_API_SECRET", ""),
         channel_types = channel_types,
-        confidence_min  = int(os.getenv("DISCORD_CONFIDENCE_MIN", "70")),
-        order_notional  = float(os.getenv("DISCORD_ORDER_NOTIONAL", "500")),
-        max_positions   = int(os.getenv("DISCORD_MAX_POSITIONS", "70")),
-        max_daily_spend = float(os.getenv("DISCORD_MAX_DAILY_SPEND", "5000")),
-        dedupe_ticker   = os.getenv("DISCORD_DEDUPE_TICKER", "true").lower() == "true",
-        alloc_low_pct   = float(os.getenv("DISCORD_ALLOC_LOW_PCT", "1.0")),
-        alloc_med_pct   = float(os.getenv("DISCORD_ALLOC_MED_PCT", "2.0")),
-        alloc_high_pct  = float(os.getenv("DISCORD_ALLOC_HIGH_PCT", "3.0")),
-        spx_notional    = float(os.getenv("DISCORD_SPX_NOTIONAL", "300")),
-        spx_stop_pct    = float(os.getenv("DISCORD_SPX_STOP_PCT", "50")),
-        spx_target_pct  = float(os.getenv("DISCORD_SPX_TARGET_PCT", "100")),
-        spx_bp_pct      = float(os.getenv("DISCORD_SPX_BP_PCT", "80")),
-        breakout_notional  = float(os.getenv("DISCORD_BREAKOUT_NOTIONAL", "400")),
-        breakout_dte       = int(os.getenv("DISCORD_BREAKOUT_DTE", "45")),
-        breakout_min_dte   = int(os.getenv("DISCORD_BREAKOUT_MIN_DTE", "30")),
-        breakout_trail_pct = float(os.getenv("DISCORD_BREAKOUT_TRAIL_PCT", "40")),
-        market_hours_only = os.getenv("DISCORD_MARKET_HOURS_ONLY", "true").lower() == "true",
-        market_open       = os.getenv("DISCORD_MARKET_OPEN", "09:30"),
-        market_close      = os.getenv("DISCORD_MARKET_CLOSE", "16:00"),
-        market_tz         = os.getenv("DISCORD_MARKET_TZ", "America/New_York"),
+        **overrides,
     )

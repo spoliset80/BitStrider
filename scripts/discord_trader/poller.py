@@ -174,6 +174,14 @@ def run(config: Config, loop: bool = False,
         if cursor_changed:
             _save_cursors(last)
 
+        # Force-close anything held past the max-hold window (orphaned entries
+        # that never received an 'Out' alert).
+        if market_open:
+            try:
+                router.close_stale_positions()
+            except Exception as e:
+                logger.warning(f"max-hold sweep failed: {e}")
+
         if not loop:
             break
 

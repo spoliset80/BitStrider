@@ -2,7 +2,7 @@
 from __future__ import annotations
 import json
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timezone, date
 from pathlib import Path
 from typing import Dict, Optional
 
@@ -12,6 +12,7 @@ from .risk     import RiskManager
 from .parsers  import parse_trade
 from .parsers.spx import SpxStateMachine
 from .parsers.breakout import parse_breakout
+from .strategy import score_signal
 from .strategies import handle_equity, handle_options, handle_spx_action, handle_breakout
 
 logger = logging.getLogger(__name__)
@@ -108,17 +109,26 @@ class ChannelRouter:
 
         is_buy = trade.action == "BUY"
 
-        # Confidence gate — BUYs on options channels only
-        # (equity messages never have strike/expiry so scoring is structurally lower)
-        if ctype == "options" and is_buy and trade.confidence < self.config.confidence_min:
+        # Technical gate — BUYs are graded on price action, not on parse completeness.
+        if is_buy and self.config.use_technical_score:
+            score, reasons = score_signal(trade, self.broker)
+            for r in reasons:
+                logger.info(f"      · {r}")
+            logger.info(f"    [SCORE] {trade.ticker} technical={score}% "
+                        f"(parse={trade.confidence}%)")
+            trade.confidence = score
+
+        if is_buy and trade.confidence < self.config.confidence_min:
             logger.info(f"    -> {trade.action} {trade.ticker} skipped: "
-                        f"conf {trade.confidence}% < min {self.config.confidence_min}%")
+                        f"score {trade.confidence}% < min {self.config.confidence_min}%")
             return None
 
         if ctype == "equity":
-            result = handle_equity(trade, self.broker, self.risk, bp)
+            result = handle_equity(trade, self.broker, self.risk, bp, config=self.config)
         else:  # options (default)
-            result = handle_options(trade, self.broker, self.risk, bp)
+            result = handle_options(trade, self.broker, self.risk, bp,
+                                     price_above_last_pct=self.config.price_above_last_pct,
+                                     config=self.config)
 
         if result and result.get("status") == "submitted":
             label = f"{trade.action} {trade.ticker}"
@@ -146,3 +156,66 @@ class ChannelRouter:
         }
         with open(self.log_dir / f"discord_trades_{today}.jsonl", "a") as f:
             f.write(json.dumps(entry) + "\n")
+        self._track_position(label, result)
+
+    # ── Entry-date tracking (drives the max-hold exit) ────────────────────────
+
+    def _entry_file(self) -> Path:
+        return self.log_dir / "open_entries.json"
+
+    def _load_entries(self) -> dict:
+        try:
+            return json.loads(self._entry_file().read_text())
+        except Exception:
+            return {}
+
+    def _save_entries(self, data: dict):
+        try:
+            self._entry_file().write_text(json.dumps(data, indent=2))
+        except Exception as e:
+            logger.warning(f"could not write entry file: {e}")
+
+    def _track_position(self, label: str, result: dict):
+        """Record open date on BUY, clear it on SELL, so age can be measured later."""
+        symbol = result.get("occ") or result.get("ticker")
+        if not symbol:
+            return
+        entries = self._load_entries()
+        if label.startswith("BUY") or label.startswith("BREAKOUT"):
+            entries.setdefault(symbol, datetime.now(timezone.utc).date().isoformat())
+        else:
+            entries.pop(symbol, None)
+            for leg in result.get("legs", []):
+                entries.pop(leg.get("occ", ""), None)
+        self._save_entries(entries)
+
+    def close_stale_positions(self) -> int:
+        """Close positions older than config.max_hold_days. Returns count closed."""
+        max_days = self.config.max_hold_days
+        if not max_days or max_days <= 0:
+            return 0
+
+        entries = self._load_entries()
+        if not entries:
+            return 0
+
+        today  = datetime.now(timezone.utc).date()
+        closed = 0
+        for p in (self.broker.get_all_positions() or []):
+            opened = entries.get(p.symbol)
+            if not opened:
+                continue
+            age = (today - date.fromisoformat(opened)).days
+            if age < max_days:
+                continue
+            qty = max(1, int(float(p.qty)))
+            is_option = len(p.symbol) > 6 and p.symbol[-9] in "CP"
+            logger.info(f"  [MAX HOLD] {p.symbol} open {age}d >= {max_days}d — closing")
+            result = (self.broker.sell_option(p.symbol, qty) if is_option
+                      else self.broker.sell_equity(p.symbol))
+            if result.get("status") == "submitted":
+                entries.pop(p.symbol, None)
+                closed += 1
+        if closed:
+            self._save_entries(entries)
+        return closed

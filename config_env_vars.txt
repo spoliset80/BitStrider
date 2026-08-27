@@ -14,7 +14,9 @@ DISCORD_CHANNEL_IDS=1119663300909731910,1087572272052715602,753377655532945558
 DISCORD_CHANNEL_TYPES=1119663300909731910:spx,1087572272052715602:breakout,753377655532945558:options
 
 # ── Risk limits ───────────────────────────────────────────────────
-DISCORD_CONFIDENCE_MIN=70        # minimum parse confidence to trade (0–100)
+DISCORD_CONFIDENCE_MIN=70        # minimum score to trade (0–100)
+DISCORD_USE_TECHNICAL_SCORE=false # trend/RSI/volume scoring — backtested as no better than random, leave off
+DISCORD_MAX_HOLD_DAYS=0          # force-close positions older than N days (0 = only exit on an 'Out' alert)
 DISCORD_MAX_POSITIONS=70         # max open positions at once
 DISCORD_MAX_DAILY_SPEND=5000     # hard daily $ cap across all trades
 DISCORD_DEDUPE_TICKER=true       # skip repeat buys of same ticker per day
@@ -24,6 +26,16 @@ DISCORD_ALLOC_LOW_PCT=1.0        # conf 70–79 % → 1 % of BP
 DISCORD_ALLOC_MED_PCT=2.0        # conf 80–89 % → 2 % of BP
 DISCORD_ALLOC_HIGH_PCT=3.0       # conf 90 %+   → 3 % of BP
 DISCORD_ORDER_NOTIONAL=500       # fallback $ per trade when BP unavailable
+DISCORD_PRICE_ABOVE_LAST_PCT=2.0 # options channel: limit = last trade price (or mid fallback) * (1 + this/100), overrides chat-alerted price
+
+# ── Equity alerts → options conversion ────────────────────────────
+# Buy a call instead of shares when an alert has no strike/expiry (cheaper for small accounts)
+DISCORD_EQUITY_AS_OPTIONS=false     # true to convert share alerts into call options
+DISCORD_EQUITY_OPT_MONEYNESS=ATM    # ITM | ATM | OTM
+DISCORD_EQUITY_OPT_MONEYNESS_PCT=5.0 # % offset from spot when ITM/OTM
+DISCORD_EQUITY_OPT_EXPIRY_MODE=week # week = this week's Friday | dte = use DISCORD_EQUITY_OPT_DTE
+DISCORD_EQUITY_OPT_DTE=7            # target days-to-expiry (only used when EXPIRY_MODE=dte)
+DISCORD_EQUITY_OPT_MIN_DTE=1        # never pick an expiry closer than this
 
 # ── SPX / SPY 0DTE settings ───────────────────────────────────────
 DISCORD_SPX_NOTIONAL=300         # $ fallback notional when BP unavailable

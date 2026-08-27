@@ -57,23 +57,20 @@ def handle_spx_action(action: SpxAction, broker, config) -> Optional[dict]:
             return None
 
         # ── Size by real buying power ─────────────────────────────────────────
-        # Fetch current ask/close price for the contract
+        # Price off the last trade (fallback to live mid) + configured buffer
         limit_px = None
-        try:
-            import requests as req_lib
-            c = broker._client
-            headers = {
-                "APCA-API-KEY-ID":     c._api_key,
-                "APCA-API-SECRET-KEY": c._secret_key,
-            }
-            base = "https://paper-api.alpaca.markets" if broker._paper else "https://api.alpaca.markets"
-            r = req_lib.get(f"{base}/v2/options/contracts/{occ}", headers=headers, timeout=5)
-            if r.ok:
-                close_px = r.json().get("close_price")
-                if close_px:
-                    limit_px = round(float(close_px) * 1.05, 2)  # 5% over last close
-        except Exception as e:
-            logger.warning(f"  [SPX] Could not get contract price: {e}")
+        last_price = broker.get_option_last_trade_price(occ)
+        if last_price:
+            limit_px = round(last_price * (1 + config.price_above_last_pct / 100), 2)
+            logger.info(f"  [SPX] {occ} last trade={last_price} → limit={limit_px}")
+        else:
+            quote = broker.get_option_quote(occ)
+            if quote:
+                limit_px = round(quote["mid"] * (1 + config.price_above_last_pct / 100), 2)
+                logger.info(f"  [SPX] {occ}: last trade unavailable, using mid "
+                            f"bid={quote['bid']} ask={quote['ask']} → limit={limit_px}")
+            else:
+                logger.warning(f"  [SPX] Could not get contract price for {occ}")
 
         # Use real BP, fall back to config.spx_notional
         bp = broker.buying_power()

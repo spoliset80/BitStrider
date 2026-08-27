@@ -41,17 +41,29 @@ def handle_breakout(signal, broker, risk, config) -> Optional[dict]:
     if not contract:
         return {"status": "skip", "reason": "no swing call contract found"}
 
-    occ      = contract["symbol"]
-    est_prem = contract.get("close_price")
-    try:
-        est_prem = float(est_prem) if est_prem else None
-    except (TypeError, ValueError):
-        est_prem = None
+    occ = contract["symbol"]
 
-    # Size by notional using last close as premium estimate (fallback qty=1)
+    # Price off the last trade (fallback to live mid, then last close) + configured buffer
+    last_price = broker.get_option_last_trade_price(occ)
+    if last_price:
+        est_prem = last_price
+        logger.info(f"  [BREAKOUT] {occ} last trade={last_price}")
+    else:
+        quote = broker.get_option_quote(occ)
+        if quote:
+            est_prem = quote["mid"]
+            logger.info(f"  [BREAKOUT] {occ}: last trade unavailable, using mid "
+                        f"bid={quote['bid']} ask={quote['ask']}")
+        else:
+            try:
+                est_prem = float(contract["close_price"]) if contract.get("close_price") else None
+            except (TypeError, ValueError):
+                est_prem = None
+
+    # Size by notional using premium estimate (fallback qty=1)
     if est_prem and est_prem > 0:
         qty = max(1, int(notional // (est_prem * 100)))
-        limit_px = round(est_prem * 1.05, 2)  # 5% over last close to improve fill
+        limit_px = round(est_prem * (1 + config.price_above_last_pct / 100), 2)
     else:
         qty = 1
         limit_px = None

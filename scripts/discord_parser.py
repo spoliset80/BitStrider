@@ -21,6 +21,8 @@ class Trade:
     occ:         Optional[str]    # e.g. PANW  270115C00265000
     entry_price: Optional[float]
     confidence:  int
+    stop:        Optional[float] = None
+    targets:     list[float] = field(default_factory=list)
     notes:       list[str] = field(default_factory=list)  # reasoning trace
 
     @property
@@ -56,6 +58,14 @@ def _next_monthly() -> date:
     yr  = today.year if mon >= today.month else today.year + 1
     return _third_friday(yr, mon)
 
+def this_week_friday() -> date:
+    """Nearest upcoming Friday (today if today is Friday)."""
+    today = date.today()
+    days_ahead = (4 - today.weekday()) % 7
+    return today + timedelta(days=days_ahead)
+
+_this_week_friday = this_week_friday
+
 # Natural: "July 24th", "Jan-2027", "Mar 2027", "Dec-2027"
 _RE_NAT = re.compile(
     r"\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*[.\-]?\s*"
@@ -65,7 +75,20 @@ _RE_NAT = re.compile(
 # Slash: 7/24, 7/24/26
 _RE_SLASH = re.compile(r"\b(\d{1,2})/(\d{1,2})(?:/(\d{2,4}))?\b")
 
+_RE_RELATIVE = re.compile(r"\b(this\s+week|next\s+week|eow|end\s+of\s+week|tomorrow)\b", re.I)
+
 def resolve_expiry(text: str) -> Optional[date]:
+    m = _RE_RELATIVE.search(text)
+    if m:
+        phrase = re.sub(r"\s+", " ", m.group(1).lower())
+        today = date.today()
+        if phrase == "tomorrow":
+            return today + timedelta(days=1)
+        if phrase == "next week":
+            return _this_week_friday() + timedelta(weeks=1)
+        # "this week", "eow", "end of week"
+        return _this_week_friday()
+
     m = _RE_NAT.search(text)
     if m:
         mon    = _MONTHS[m.group(1).lower()[:3]]
@@ -139,7 +162,7 @@ _RE_OPT_WORD   = re.compile(r"\b(CALLS?|PUTS?|CSP|LEAPS?)\b", re.I)         # CA
 # Expiry phrase regex engines
 _RE_EXPIRY = re.compile(
     r"(?:expiring?(?:\s+in)?|exp\.?)\s*"
-    r"((?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*[.\-]?\s*\d{1,4}(?:[,\s]+\d{2,4})?|\d{1,2}/\d{1,2}(?:/\d{2,4})?)",
+    r"((?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*[.\-]?\s*\d{1,4}(?:[,\s]+\d{2,4})?|\d{1,2}/\d{1,2}(?:/\d{2,4})?|this\s+week|next\s+week|eow|end\s+of\s+week|tomorrow)",
     re.I,
 ) 
 _RE_MON_YEAR   = re.compile(
@@ -152,6 +175,12 @@ _RE_DATE_LONG  = re.compile(
 )
 
 _RE_PRICE = re.compile(r"(?:@|\bat)\s*\$?(\d+(?:\.\d+)?)\b", re.I)
+
+_RE_STOP = re.compile(
+    r"\bstops?\b[:\s]*(?:below|under|above|over|@|at)?\s*\$?(\d+(?:[.,]\d+)?)", re.I
+)
+_RE_TARGETS = re.compile(r"\btargets?\b[:\s]*(.{0,60})", re.I | re.S)
+_RE_NUM = re.compile(r"\$?(\d+(?:\.\d+)?)")
 
 _SKIP = {
     "THE","AND","FOR","ARE","BUT","NOT","YOU","ALL","CAN","WAS","ONE","OUR",
@@ -320,7 +349,25 @@ def parse_trade(raw: str) -> Optional[Trade]:
         entry_price = float(m.group(1))
         notes.append(f"price → {entry_price}")
 
-    # 8. Confidence score
+    # 8. Extract stop / targets (used for risk-reward scoring)
+    stop = None
+    m = _RE_STOP.search(text)
+    if m:
+        raw = m.group(1).replace(",", "")
+        try:
+            stop = float(raw)
+            notes.append(f"stop → {stop}")
+        except ValueError:
+            pass
+
+    targets: list[float] = []
+    m = _RE_TARGETS.search(text)
+    if m:
+        targets = [float(n) for n in _RE_NUM.findall(m.group(1))][:3]
+        if targets:
+            notes.append(f"targets → {targets}")
+
+    # 9. Confidence score
     score = 50
     if strike:      score += 20
     if expiry_date: score += 15
@@ -338,5 +385,7 @@ def parse_trade(raw: str) -> Optional[Trade]:
         occ=occ,
         entry_price=entry_price,
         confidence=score,
+        stop=stop,
+        targets=targets,
         notes=notes,
     )
