@@ -802,11 +802,29 @@ class OptionsExecutor:
             log.warning(f"[OPTIONS] Could not verify account tradeable status: {e}")
             return True  # allow attempt; the order itself will catch any restriction
 
+    @staticmethod
+    def _is_permitted_probe_cap_bypass(signal: OptionSignal) -> bool:
+        """Allow the portfolio-count exception only for the fixed probe ATM call."""
+        return (
+            signal.strategy == "LiveProbeATMScaleIn"
+            and signal.option_type == "call"
+            and signal.action == "buy_to_open"
+            and signal.contract_cap == 1
+            and signal.force_single_leg
+        )
+
     def place_option_order(self, signal: OptionSignal, market_state: MarketState) -> bool:
         """
         Production-ready order placement for ApexTrader.
         Fixes communications with Alpaca API and internal state tracking.
         """
+        permitted_probe_bypass = self._is_permitted_probe_cap_bypass(signal)
+        if signal.bypass_portfolio_cap and not permitted_probe_bypass:
+            log.warning(
+                f"[OPTIONS] Rejected unauthorized portfolio-cap bypass for {signal.symbol} "
+                f"({signal.strategy})"
+            )
+            return False
         try:
             portfolio_count = len(self.client.get_all_positions())
             if portfolio_count >= MAX_POSITIONS and not signal.bypass_portfolio_cap:

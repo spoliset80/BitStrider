@@ -11,8 +11,10 @@ Trading strategy implementations:
 """
 
 import datetime
+import logging
 import time
 import pytz
+import numpy as np
 import pandas as pd
 from dataclasses import dataclass, field
 from typing import Optional
@@ -24,10 +26,12 @@ from engine.config import (
     SWEEPEA, TECHNICAL, MOMENTUM, GAP_BREAKOUT, ORB, VWAP_RECLAIM, FLOAT_ROTATION, LONG_ONLY_MODE,
     ATR_STOP_MULTIPLIER, ATR_TP_RATIO, HIGH_SHORT_FLOAT_STOCKS, is_high_short_float,
     PRE_MARKET_MOMENTUM, OPENING_BELL_SURGE, PM_HIGH_BREAKOUT, EARLY_SQUEEZE, BEAR_BREAKDOWN,
-    SENTIMENT_STRATEGY,
+    SENTIMENT_STRATEGY, TRENDLINE_BREAKOUT,
 )
+from scripts.trendline_breakout import detect_trendline_breakouts
 
 ET = pytz.timezone("America/New_York")
+log = logging.getLogger("ApexTrader")
 
 # Inverse ETFs profit from market declines — treat as LONG buys in bear regime
 _INVERSE_ETFS: frozenset = frozenset({
@@ -315,6 +319,44 @@ def _near_52w_high(symbol: str, within_pct: float = 15.0) -> bool:
     return pct_from_high <= within_pct
 
 
+def _sweepea_liquidity_ok(symbol: str, price: float, daily: Optional[pd.DataFrame] = None) -> bool:
+    if price <= 0:
+        return False
+
+    min_price = float(SWEEPEA.get("min_price", 0.0) or 0.0)
+    if min_price > 0 and price < min_price:
+        log.debug("Sweepea reject %s: price %.2f below %.2f", symbol, price, min_price)
+        return False
+
+    lookback = max(1, int(SWEEPEA.get("liquidity_lookback_days", 20) or 20))
+    if daily is None or daily.empty or "volume" not in daily.columns:
+        daily = get_bars(symbol, f"{max(lookback + 5, 30)}d", "1d")
+    if daily.empty or "volume" not in daily.columns:
+        log.debug("Sweepea reject %s: missing daily volume history", symbol)
+        return False
+
+    recent_volume = daily["volume"].dropna().tail(lookback)
+    if recent_volume.empty:
+        log.debug("Sweepea reject %s: empty daily volume history", symbol)
+        return False
+
+    avg_volume = float(recent_volume.mean())
+    min_avg_volume = float(SWEEPEA.get("min_avg_volume", 0.0) or 0.0)
+    min_avg_dollar_volume = float(SWEEPEA.get("min_avg_dollar_volume", 0.0) or 0.0)
+    if min_avg_volume > 0 and avg_volume < min_avg_volume:
+        log.debug("Sweepea reject %s: avg volume %.0f below %.0f", symbol, avg_volume, min_avg_volume)
+        return False
+    if min_avg_dollar_volume > 0 and avg_volume * price < min_avg_dollar_volume:
+        log.debug(
+            "Sweepea reject %s: avg dollar volume %.0f below %.0f",
+            symbol,
+            avg_volume * price,
+            min_avg_dollar_volume,
+        )
+        return False
+    return True
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Sweepea Strategy
 # ──────────────────────────────────────────────────────────────────────────────
@@ -323,6 +365,7 @@ class SweepeaStrategy:
     Also fires on daily 8/20-EMA pullback after an initial squeeze (secondary move)."""
 
     def scan(self, symbol: str, open_position: Optional[dict] = None) -> Optional[Signal]:
+        daily = pd.DataFrame()
         try:
             # Daily bar only meaningful after 10 AM ET — skip pre-market noise
             if datetime.datetime.now(ET).hour >= 10:
@@ -335,6 +378,8 @@ class SweepeaStrategy:
                 daily["ema20"] = daily["close"].ewm(span=20, adjust=False).mean()
                 cur  = daily.iloc[-1]
                 prev = daily.iloc[-2]
+                if not _sweepea_liquidity_ok(symbol, float(cur["close"]), daily):
+                    return None
                 # Price touched or slightly undercut EMA and recovered above it
                 pb8  = (cur["low"] <= float(cur["ema8"])  * 1.005
                         and cur["close"] >= float(cur["ema8"]) * 0.995)
@@ -436,6 +481,8 @@ class SweepeaStrategy:
         cur = bars.iloc[-2]  # Last closed candle
         range_val = cur["high"] - cur["low"]
         if range_val == 0:
+            return None
+        if not _sweepea_liquidity_ok(symbol, float(cur["close"]), daily):
             return None
 
         # Liquidity sweep detection with volatility-aware threshold.
@@ -1598,6 +1645,63 @@ class PowerOf3Strategy:
         )
 
 
+# ──────────────────────────────────────────────────────────────
+# Regression Trendline Breakout
+# ──────────────────────────────────────────────────────────────
+class TrendlineBreakoutStrategy:
+    """Trade confirmed, high-volume breaks of pivot-regression trendlines."""
+
+    def scan(self, symbol: str) -> Optional[Signal]:
+        bars = get_bars(symbol, "1d", "1m")
+        minimum_bars = (
+            TRENDLINE_BREAKOUT["left_bars"]
+            + TRENDLINE_BREAKOUT["right_bars"]
+            + 1
+        )
+        if bars.empty or len(bars) < max(20, minimum_bars):
+            return None
+
+        try:
+            analysis = detect_trendline_breakouts(
+                bars,
+                left_bars=TRENDLINE_BREAKOUT["left_bars"],
+                right_bars=TRENDLINE_BREAKOUT["right_bars"],
+                pivot_count=TRENDLINE_BREAKOUT["pivot_count"],
+                volume_multiplier=TRENDLINE_BREAKOUT["volume_multiplier"],
+                atr_offset=TRENDLINE_BREAKOUT["atr_offset"],
+                risk_reward_ratio=TRENDLINE_BREAKOUT["risk_reward_ratio"],
+            )
+        except (TypeError, ValueError) as error:
+            log.warning(f"Trendline breakout skipped for {symbol}: {error}")
+            return None
+
+        latest = analysis.iloc[-1]
+        direction = str(latest["signal"])
+        if direction not in ("buy", "sell") or pd.isna(latest["atr"]):
+            return None
+
+        price = float(latest["close"])
+        trendline = float(latest["resistance_line"] if direction == "buy" else latest["support_line"])
+        stop_loss = float(latest["stop_loss"])
+        take_profit = float(latest["take_profit"])
+        stop_distance = abs(price - stop_loss)
+        if not np.isfinite(trendline) or stop_distance <= 0:
+            return None
+
+        volume_sma = float(latest["volume_sma"])
+        volume_ratio = float(latest["volume"]) / volume_sma if volume_sma > 0 else 0.0
+        confidence = min(0.75 + max(volume_ratio - 1.5, 0.0) * 0.05, 0.92)
+        line_name = "resistance" if direction == "buy" else "support"
+        action = "buy" if direction == "buy" else "short"
+        return Signal(
+            symbol, action, price, round(confidence, 2),
+            f"Trendline {direction} breakout {line_name} ${trendline:.2f} | "
+            f"vol x{volume_ratio:.1f} | stop ${stop_loss:.2f} | target ${take_profit:.2f}",
+            "TrendlineBreakout",
+            atr_stop=stop_distance,
+        )
+
+
 def get_strategy_instances(bull_regime: bool = True):
     """Return instantiated strategy objects for the current market regime."""
     strategies = [
@@ -1615,6 +1719,7 @@ def get_strategy_instances(bull_regime: bool = True):
         PMHighBreakoutStrategy(),
         EarlySqueezeDetector(),
         PowerOf3Strategy(),
+        TrendlineBreakoutStrategy(),
     ]
 
     # Only add bear-regime strategies when we are actually in a bear regime

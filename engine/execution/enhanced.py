@@ -220,11 +220,19 @@ class EnhancedExecutor:
 
         try:
             with self._exit_state_lock:
-                if not entries:
+                pending_scale_ins = {
+                    sym: pending
+                    for sym, pending in self._live_probe_scale_in_pending.items()
+                    if sym in entries
+                }
+                if not entries and not pending_scale_ins:
                     self._exit_state_path.unlink(missing_ok=True)
                     return
                 temp_path = self._exit_state_path.with_suffix(".tmp")
-                temp_path.write_text(json.dumps({"entries": entries}), encoding="utf-8")
+                temp_path.write_text(
+                    json.dumps({"entries": entries, "live_probe_scale_in_pending": pending_scale_ins}),
+                    encoding="utf-8",
+                )
                 temp_path.replace(self._exit_state_path)
         except Exception as e:
             log.warning(f"Could not save position exit state: {e}")
@@ -234,7 +242,8 @@ class EnhancedExecutor:
         try:
             if not self._exit_state_path.exists():
                 return
-            raw_entries = json.loads(self._exit_state_path.read_text(encoding="utf-8")).get("entries", {})
+            saved_state = json.loads(self._exit_state_path.read_text(encoding="utf-8"))
+            raw_entries = saved_state.get("entries", {})
             open_symbols = {p.symbol for p in self.client.get_all_positions()}
             for sym, saved in raw_entries.items():
                 if sym not in open_symbols:
@@ -257,6 +266,11 @@ class EnhancedExecutor:
                     self._tightened.add(sym)
                 if saved.get("scaled_in"):
                     self._live_probe_scaled_in.add(sym)
+            self._live_probe_scale_in_pending = {
+                sym: pending
+                for sym, pending in saved_state.get("live_probe_scale_in_pending", {}).items()
+                if sym in self._entry_log
+            }
             self._save_exit_state()
             if self._entry_log:
                 log.info(f"Restored position exit state: {', '.join(self._entry_log)}")
@@ -300,6 +314,11 @@ class EnhancedExecutor:
             if getattr(self, "_live_probe_count_date", None) != today:
                 self._live_probe_count_date = today
             self._live_probe_entries_today = int(getattr(self, "_live_probe_entries_today", 0)) + 1
+
+    @staticmethod
+    def _is_option_market_open(market_state: MarketState) -> bool:
+        """Return whether regular-session single-stock option orders are permitted."""
+        return bool(getattr(market_state, "is_regular_hours", False))
 
     def _record_probe_outcome(self, sym: str, pos, exit_reason: str) -> None:
         """Append a secret-free mark-to-market outcome for a bot-managed live probe exit."""
@@ -398,6 +417,9 @@ class EnhancedExecutor:
         """Submit one ATM call only after a qualifying long probe scale-in succeeds."""
         if not LIVE_PROBE_SCALE_IN_ATM_OPTION_ENABLED or options_executor is None:
             return
+        if not self._is_option_market_open(market_state):
+            log.info(f"LIVE PROBE {symbol}: ATM option deferred; options market is closed")
+            return
         try:
             from engine.options.strategies import OptionSignal, _get_options_chain, _pick_strike, get_dynamic_option_filters
 
@@ -449,8 +471,6 @@ class EnhancedExecutor:
         pending_scale_ins = getattr(self, "_live_probe_scale_in_pending", {})
         cumulative_scale_cost = 0.0
         for sym, info in list(self._entry_log.items()):
-            if sym in self._live_probe_scaled_in or sym in self._tightened:
-                continue
             pos = positions.get(sym)
             entry_price = float(getattr(pos, "avg_entry_price", 0) or 0) if pos is not None else 0
             if entry_price <= 0 or pos is None:
@@ -464,11 +484,16 @@ class EnhancedExecutor:
                 continue
             is_long = qty > 0
             pending_scale_in = pending_scale_ins.get(sym)
+            if sym in self._tightened:
+                continue
             if pending_scale_in is not None:
-                if not market_state.is_regular_hours and not (market_state.now.weekday() < 5 and market_state.now.hour >= 16):
-                    log.info(f"LIVE PROBE {sym}: premarket scale-in limit order still pending")
+                if pending_scale_in.get("atm_option_deferred"):
+                    if self._is_option_market_open(market_state):
+                        self._place_live_probe_atm_option(sym, current_price, market_state, options_executor)
+                        pending_scale_ins.pop(sym, None)
+                        state_changed = True
                     continue
-                if abs(qty) > pending_scale_in["qty"]:
+                if abs(qty) > pending_scale_in["prior_qty"]:
                     try:
                         for order in self.client.get_orders() or []:
                             if order.symbol == sym:
@@ -488,22 +513,20 @@ class EnhancedExecutor:
                             f"failed: {protection_error}"
                         )
                         continue
-                    pending_scale_ins.pop(sym, None)
-                    self._live_probe_scaled_in.add(sym)
-                    self._place_live_probe_atm_option(sym, current_price, market_state, options_executor)
                     self._mark_live_probe_scaled_in(sym)
+                    if self._is_option_market_open(market_state):
+                        self._place_live_probe_atm_option(sym, current_price, market_state, options_executor)
+                        pending_scale_ins.pop(sym, None)
+                    else:
+                        pending_scale_in["atm_option_deferred"] = True
                     state_changed = True
-                    log.info(f"LIVE PROBE {sym}: premarket scale-in filled; protection replaced for {abs(qty)} shares")
+                    log.info(f"LIVE PROBE {sym}: scale-in filled; protection replaced for {abs(qty)} shares")
                     continue
-                pending_order_id = pending_scale_in.get("order_id")
-                if pending_order_id:
-                    try:
-                        self.client.cancel_order_by_id(pending_order_id)
-                    except Exception as cancel_error:
-                        log.warning(f"LIVE PROBE {sym}: could not cancel unfilled scale-in limit order: {cancel_error}")
-                        continue
-                pending_scale_ins.pop(sym, None)
-                log.info(f"LIVE PROBE {sym}: unfilled premarket scale-in canceled; retrying in regular hours")
+                log.info(f"LIVE PROBE {sym}: scale-in order still pending fill confirmation")
+                continue
+
+            if sym in self._live_probe_scaled_in:
+                continue
 
             gain_pct = ((current_price - entry_price) / entry_price * 100) * (1 if is_long else -1)
             if gain_pct < LIVE_PROBE_SCALE_IN_MIN_GAIN_PCT:
@@ -537,45 +560,31 @@ class EnhancedExecutor:
                 continue
 
             try:
-                open_orders = [order for order in (self.client.get_orders() or []) if order.symbol == sym]
-                for order in open_orders:
-                    self.client.cancel_order_by_id(str(order.id))
-                if open_orders:
-                    time.sleep(0.4)
-                    log.info(f"LIVE PROBE {sym}: replaced {len(open_orders)} existing order(s) before scale-in")
-            except Exception as cancel_error:
-                log.warning(f"LIVE PROBE {sym}: scale-in skipped; could not replace existing protective order ({cancel_error})")
-                continue
-
-            try:
+                client_order_id = f"apex-probe-scale-{sym}-{int(time.time())}"
                 if order_kind == "limit":
                     order = self.client.submit_order(LimitOrderRequest(
                         symbol=sym, qty=add_shares, side=side,
                         time_in_force=TimeInForce.DAY,
                         limit_price=order_price, extended_hours=True,
-                        client_order_id=f"apex-probe-scale-{sym}-{int(time.time())}",
+                        client_order_id=client_order_id,
                     ))
-                    pending_scale_ins[sym] = {"qty": abs(qty), "order_id": str(getattr(order, "id", "") or ""), "post_market": True}
-                    log.info(f"LIVE PROBE SCALE-IN LIMIT {sym}: +{add_shares} shares @ ${order_price:.2f} ({'post-market' if market_state.now.hour >= 16 else 'extended-hours'})")
+                    pending_scale_ins[sym] = {
+                        "prior_qty": abs(qty), "order_id": str(getattr(order, "id", "") or ""),
+                    }
+                    log.info(
+                        f"LIVE PROBE SCALE-IN LIMIT {sym}: +{add_shares} shares @ "
+                        f"${order_price:.2f} (extended-hours)"
+                    )
                 else:
-                    self.client.submit_order(MarketOrderRequest(
+                    order = self.client.submit_order(MarketOrderRequest(
                         symbol=sym, qty=add_shares, side=side,
                         time_in_force=TimeInForce.DAY,
+                        client_order_id=client_order_id,
                     ))
-                    stop_side = OrderSide.SELL if is_long else OrderSide.BUY
-                    trail_pct = get_dynamic_tier(sym, current_price)["ts"]
-                    self.client.submit_order(TrailingStopOrderRequest(
-                        symbol=sym, qty=abs(qty) + add_shares, side=stop_side,
-                        type=AlpacaOrderType.TRAILING_STOP,
-                        time_in_force=TimeInForce.GTC,
-                        trail_percent=trail_pct,
-                    ))
-                    log.info(f"LIVE PROBE SCALE-IN {sym}: +{add_shares} shares at {gain_pct:+.2f}% | used {LIVE_PROBE_SCALE_IN_BUYING_POWER_PCT:.1f}% available buying power")
-                    cumulative_scale_cost += add_shares * current_price * margin
-                    self._place_live_probe_atm_option(sym, current_price, market_state, options_executor)
-                    self._mark_live_probe_scaled_in(sym)
-                    state_changed = True
-                    continue
+                    pending_scale_ins[sym] = {
+                        "prior_qty": abs(qty), "order_id": str(getattr(order, "id", "") or ""),
+                    }
+                    log.info(f"LIVE PROBE SCALE-IN {sym}: +{add_shares} shares at {gain_pct:+.2f}% pending fill confirmation")
 
                 cumulative_scale_cost += add_shares * current_price * margin
                 state_changed = True

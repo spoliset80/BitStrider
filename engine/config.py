@@ -596,11 +596,22 @@ EOD_CLOSE_STRATEGIES = {         # Strategy names that must be closed same day
     "FloatRotation",
     "GapBreakout",
     "ORB",
+    "TrendlineBreakout",
     "VWAPReclaim",
     "PreMarketMomentum",
     "OpeningBellSurge",
     "PMHighBreakout",
     "EarlySqueeze",
+}
+
+# Regression trendline breakout: confirmed swing pivots + ATR/volume confirmation.
+TRENDLINE_BREAKOUT = {
+    "left_bars": int(os.getenv("TRENDLINE_BREAKOUT_LEFT_BARS", "5")),
+    "right_bars": int(os.getenv("TRENDLINE_BREAKOUT_RIGHT_BARS", "5")),
+    "pivot_count": int(os.getenv("TRENDLINE_BREAKOUT_PIVOT_COUNT", "3")),
+    "atr_offset": float(os.getenv("TRENDLINE_BREAKOUT_ATR_OFFSET", "0.5")),
+    "volume_multiplier": float(os.getenv("TRENDLINE_BREAKOUT_VOLUME_MULTIPLIER", "1.5")),
+    "risk_reward_ratio": float(os.getenv("TRENDLINE_BREAKOUT_RISK_REWARD_RATIO", "2.0")),
 }
 
 # Stale order upgrade: unfilled orders older than this get re-submitted as market/limit
@@ -658,6 +669,10 @@ SWEEPEA = {
     "pinbar_threshold": 80.0,
     "sweep_bars":       1,
     "min_sweep":        0.10,
+    "min_price":        float(os.getenv("SWEEPEA_MIN_PRICE", "8.0")),
+    "min_avg_volume":   float(os.getenv("SWEEPEA_MIN_AVG_VOLUME", "500000")),
+    "min_avg_dollar_volume": float(os.getenv("SWEEPEA_MIN_AVG_DOLLAR_VOLUME", "5000000")),
+    "liquidity_lookback_days": int(os.getenv("SWEEPEA_LIQUIDITY_LOOKBACK_DAYS", "20")),
     "use_ma":           True,
     "ma_fast":          20,
     "ma_slow":          50,

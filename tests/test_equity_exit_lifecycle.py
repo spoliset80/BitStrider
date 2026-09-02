@@ -9,6 +9,8 @@ from unittest.mock import Mock, patch
 
 from engine.execution import enhanced
 from engine.execution.enhanced import EnhancedExecutor
+from engine.options.executor import OptionsExecutor
+from engine.options.strategies import OptionSignal
 
 
 class MockPosition:
@@ -135,7 +137,9 @@ class EquityExitLifecycleTests(unittest.TestCase):
         ), patch("engine.options.strategies._pick_strike", return_value=strike_row), patch(
             "engine.options.strategies.get_dynamic_option_filters", return_value={}
         ):
-            executor._place_live_probe_atm_option("AAPL", 100.0, Mock(), options_executor)
+            executor._place_live_probe_atm_option(
+                "AAPL", 100.0, SimpleNamespace(is_regular_hours=True), options_executor
+            )
 
         signal = options_executor.place_option_order.call_args.args[0]
         self.assertEqual(signal.symbol, "AAPL")
@@ -143,6 +147,56 @@ class EquityExitLifecycleTests(unittest.TestCase):
         self.assertEqual(signal.contract_cap, 1)
         self.assertTrue(signal.force_single_leg)
         self.assertTrue(signal.bypass_portfolio_cap)
+
+    def test_atm_option_is_not_submitted_outside_regular_hours(self):
+        executor = object.__new__(EnhancedExecutor)
+        options_executor = Mock()
+
+        with patch("engine.execution.enhanced.LIVE_PROBE_SCALE_IN_ATM_OPTION_ENABLED", True):
+            executor._place_live_probe_atm_option(
+                "AAPL", 100.0, SimpleNamespace(is_regular_hours=False), options_executor
+            )
+
+        options_executor.place_option_order.assert_not_called()
+
+    def test_atm_option_waits_for_confirmed_scale_in_fill(self):
+        client = MockClient([MockPosition("AAPL", "1", 101.0, avg_entry_price=100.0)])
+        executor = build_executor(client, Path(tempfile.gettempdir()) / "unused_probe_state.json")
+        executor._options_cost_reserve = 0.0
+        executor._get_account = lambda **_kwargs: SimpleNamespace(equity=10_000.0, buying_power=10_000.0)
+        executor._current_market_state = lambda: SimpleNamespace(
+            is_regular_hours=True, now=datetime.datetime(2026, 8, 20, 10, 30), resolve_regime=lambda: True,
+        )
+        executor._entry_log["AAPL"] = {"entry_price": 100.0}
+        executor._place_live_probe_atm_option = Mock()
+        options_executor = Mock()
+
+        with patch.object(enhanced, "LIVE_PROBE_MODE", True), patch.object(
+            enhanced, "LIVE_PROBE_SCALE_IN_ENABLED", True
+        ), patch.object(enhanced, "LIVE_PROBE_SCALE_IN_MIN_GAIN_PCT", 0.5), patch.object(
+            enhanced, "get_dynamic_tier", return_value={"ts": 6.0}
+        ):
+            executor.check_live_probe_scale_ins(options_executor)
+            executor._place_live_probe_atm_option.assert_not_called()
+            client.positions[0].qty = "24"
+            executor.check_live_probe_scale_ins(options_executor)
+
+        executor._place_live_probe_atm_option.assert_called_once()
+
+    def test_probe_cap_bypass_requires_the_fixed_single_call_contract(self):
+        valid_signal = OptionSignal(
+            "AAPL", "call", "buy_to_open", 100.0, datetime.date(2026, 9, 18), 2.5,
+            1.0, "test", "LiveProbeATMScaleIn", contract_cap=1, force_single_leg=True,
+            bypass_portfolio_cap=True,
+        )
+        invalid_signal = OptionSignal(
+            "AAPL", "put", "buy_to_open", 100.0, datetime.date(2026, 9, 18), 2.5,
+            1.0, "test", "LiveProbeATMScaleIn", contract_cap=1, force_single_leg=True,
+            bypass_portfolio_cap=True,
+        )
+
+        self.assertTrue(OptionsExecutor._is_permitted_probe_cap_bypass(valid_signal))
+        self.assertFalse(OptionsExecutor._is_permitted_probe_cap_bypass(invalid_signal))
 
     def test_flatten_still_waits_for_active_close_failure(self):
         client = FlattenClient(
@@ -258,6 +312,7 @@ class EquityExitLifecycleTests(unittest.TestCase):
         ), patch.object(enhanced, "LIVE_PROBE_SCALE_IN_BUYING_POWER_PCT", 25.0):
             with patch.object(enhanced, "get_dynamic_tier", return_value={"ts": 6.0}):
                 executor.check_live_probe_scale_ins()
+                client.positions[0].qty = "24"
                 executor.check_live_probe_scale_ins()
 
         self.assertEqual(len(client.orders), 2)
@@ -299,6 +354,8 @@ class EquityExitLifecycleTests(unittest.TestCase):
         ), patch.object(enhanced, "LIVE_PROBE_SCALE_IN_MIN_GAIN_PCT", 0.5), patch.object(
             enhanced, "get_dynamic_tier", return_value={"ts": 6.0}
         ), patch.object(enhanced.time, "sleep"):
+            executor.check_live_probe_scale_ins()
+            client.positions[0].qty = "24"
             executor.check_live_probe_scale_ins()
 
         self.assertEqual(client.cancelled_orders, ["existing-trailing-stop"])
