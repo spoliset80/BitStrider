@@ -202,6 +202,9 @@ class OptionSignal:
     open_interest: int   = 0
     rr_ratio:      float = 0.0  # R/R: ATR expected move / premium
     breakeven:     float = 0.0  # breakeven price at expiry
+    contract_cap: Optional[int] = None
+    force_single_leg: bool = False
+    bypass_portfolio_cap: bool = False
     
     # Debit spread fields (TrendPullbackSpread: 2-leg; None = single-leg)
     spread_sell_strike: Optional[float] = None   # short leg strike

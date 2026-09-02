@@ -12,13 +12,14 @@ from engine.execution.enhanced import EnhancedExecutor
 
 
 class MockPosition:
-    def __init__(self, symbol, qty, current_price, market_value=None, avg_entry_price=None):
+    def __init__(self, symbol, qty, current_price, market_value=None, avg_entry_price=None, asset_class="us_equity"):
         self.symbol = symbol
         self.qty = qty
         self.current_price = current_price
         self.avg_entry_price = current_price if avg_entry_price is None else avg_entry_price
         self.unrealized_pl = 0.0
         self.market_value = market_value if market_value is not None else float(qty) * current_price
+        self.asset_class = asset_class
 
 
 class MockClient:
@@ -110,6 +111,39 @@ class EquityExitLifecycleTests(unittest.TestCase):
         self.assertEqual(executor._flatten_in_progress, {"AAPL"})
         self.assertEqual(executor._flatten_failed, set())
 
+    def test_flatten_retains_options_positions(self):
+        client = FlattenClient([
+            MockPosition("AAPL", "10", 100.0),
+            MockPosition("AAPL260918C00200000", "1", 5.0, asset_class="us_option"),
+        ])
+        executor = build_executor(client, Path(tempfile.gettempdir()) / "unused_flatten_state.json")
+
+        self.assertTrue(executor.flatten_portfolio("INTRADAY FINAL RESET"))
+        self.assertEqual(client.close_attempts, ["AAPL"])
+
+    def test_live_probe_scale_in_submits_one_atm_call_when_available(self):
+        executor = object.__new__(EnhancedExecutor)
+        options_executor = Mock()
+        options_executor.place_option_order.return_value = True
+        chain = SimpleNamespace(
+            calls=Mock(), expiry=datetime.date(2026, 9, 18), hv_30=25.0, iv_rank=20.0,
+        )
+        strike_row = {"strike": 100.0, "mid": 2.5, "iv_pct": 25.0, "delta": 0.5, "openinterest": 1_000}
+
+        with patch("engine.execution.enhanced.LIVE_PROBE_SCALE_IN_ATM_OPTION_ENABLED", True), patch(
+            "engine.options.strategies._get_options_chain", return_value=chain
+        ), patch("engine.options.strategies._pick_strike", return_value=strike_row), patch(
+            "engine.options.strategies.get_dynamic_option_filters", return_value={}
+        ):
+            executor._place_live_probe_atm_option("AAPL", 100.0, Mock(), options_executor)
+
+        signal = options_executor.place_option_order.call_args.args[0]
+        self.assertEqual(signal.symbol, "AAPL")
+        self.assertEqual(signal.strike, 100.0)
+        self.assertEqual(signal.contract_cap, 1)
+        self.assertTrue(signal.force_single_leg)
+        self.assertTrue(signal.bypass_portfolio_cap)
+
     def test_flatten_still_waits_for_active_close_failure(self):
         client = FlattenClient(
             [MockPosition("AAPL", "10", 100.0)],
@@ -185,6 +219,21 @@ class EquityExitLifecycleTests(unittest.TestCase):
             enhanced, "LIVE_PROBE_MODE", True
         ), patch.object(enhanced, "LIVE_PROBE_MAX_ENTRIES_PER_DAY", 10):
             self.assertFalse(executor._can_submit_live_probe())
+
+    def test_live_probe_initial_validation_does_not_count_as_entry(self):
+        executor = object.__new__(EnhancedExecutor)
+        executor._live_probe_entries_today = 0
+        executor._live_probe_count_date = datetime.date.today()
+        executor._save_exit_state = lambda: None
+        executor._current_market_state = lambda: SimpleNamespace(resolve_regime=lambda: True)
+        signal = SimpleNamespace(symbol="AAPL", strategy="Momentum", confidence=0.9, atr_stop=0.0)
+
+        with patch.object(enhanced, "LIVE_PROBE_MODE", True), patch.object(
+            enhanced, "LIVE_PROBE_SHARES", 1
+        ):
+            executor._record_entry(signal, 100.0)
+
+        self.assertEqual(executor._live_probe_entries_today, 0)
 
     def test_profitable_live_probe_scales_in_once_to_cap(self):
         client = MockClient([MockPosition("AAPL", "1", 101.0, avg_entry_price=100.0)])

@@ -59,6 +59,7 @@ from engine.config import (
     LIVE_PROBE_SCALE_IN_ENABLED,
     LIVE_PROBE_SCALE_IN_MIN_GAIN_PCT, LIVE_PROBE_SCALE_IN_BUYING_POWER_PCT,
     LIVE_PROBE_MAX_TOTAL_BUYING_POWER_PCT,
+    LIVE_PROBE_SCALE_IN_ATM_OPTION_ENABLED,
     INTRADAY_MOMENTUM_EXEMPTIONS, INTRADAY_MOMENTUM_MIN_GAIN_PCT,
     INTRADAY_MOMENTUM_MIN_RVOL, INTRADAY_MOMENTUM_MIN_5M_RETURN_PCT,
     CONF_SCALE_MIN_MULT, CONF_SCALE_FULL_CONF,
@@ -264,15 +265,20 @@ class EnhancedExecutor:
 
     def _record_entry(self, signal: Signal, fallback_price: float) -> None:
         """Track an entry using the broker-reported fill price when immediately available."""
-        order = self._submitted_entry_orders.pop(signal.symbol, None)
+        submitted_orders = getattr(self, "_submitted_entry_orders", {})
+        order = submitted_orders.pop(signal.symbol, None) if isinstance(submitted_orders, dict) else None
         entry_price = float(getattr(order, "filled_avg_price", 0) or 0)
         if entry_price <= 0:
             entry_price = fallback_price
+        entry_log = getattr(self, "_entry_log", None)
+        if entry_log is None:
+            entry_log = {}
+            self._entry_log = entry_log
         try:
             regime_at_entry = "bull" if self._current_market_state().resolve_regime() else "bear"
         except Exception:
             regime_at_entry = "unknown"
-        self._entry_log[signal.symbol] = {
+        entry_log[signal.symbol] = {
             "strategy": signal.strategy,
             "date": datetime.date.today(),
             "confidence": signal.confidence,
@@ -281,9 +287,19 @@ class EnhancedExecutor:
             "atr_stop": float(getattr(signal, "atr_stop", 0) or 0),
             "regime_at_entry": regime_at_entry,
         }
+        if hasattr(self, "_save_exit_state"):
+            self._save_exit_state()
+
+    def _mark_live_probe_scaled_in(self, sym: str) -> None:
+        """Count only realized scale-ins as actual live-probe entries."""
+        if sym in self._live_probe_scaled_in:
+            return
+        self._live_probe_scaled_in.add(sym)
         if LIVE_PROBE_MODE:
-            self._live_probe_entries_today += 1
-        self._save_exit_state()
+            today = datetime.date.today()
+            if getattr(self, "_live_probe_count_date", None) != today:
+                self._live_probe_count_date = today
+            self._live_probe_entries_today = int(getattr(self, "_live_probe_entries_today", 0)) + 1
 
     def _record_probe_outcome(self, sym: str, pos, exit_reason: str) -> None:
         """Append a secret-free mark-to-market outcome for a bot-managed live probe exit."""
@@ -334,7 +350,7 @@ class EnhancedExecutor:
             orders = self.client.get_orders(filter=GetOrdersRequest(status=QueryOrderStatus.ALL, after=today_start))
             self._live_probe_entries_today = sum(
                 1 for order in orders
-                if str(getattr(order, "client_order_id", "")).startswith("apex-")
+                if str(getattr(order, "client_order_id", "")).startswith("apex-probe-scale-")
                 and str(getattr(order, "side", "")).lower() in ("buy", "sell")
             )
             self._live_probe_count_date = today
@@ -378,7 +394,42 @@ class EnhancedExecutor:
         limit_price, reason = self._after_hours_limit_price(symbol, current_price, side)
         return "limit", limit_price, reason
 
-    def check_live_probe_scale_ins(self) -> None:
+    def _place_live_probe_atm_option(self, symbol: str, spot: float, market_state: MarketState, options_executor) -> None:
+        """Submit one ATM call only after a qualifying long probe scale-in succeeds."""
+        if not LIVE_PROBE_SCALE_IN_ATM_OPTION_ENABLED or options_executor is None:
+            return
+        try:
+            from engine.options.strategies import OptionSignal, _get_options_chain, _pick_strike, get_dynamic_option_filters
+
+            chain = _get_options_chain(symbol)
+            if chain is None:
+                log.info(f"LIVE PROBE {symbol}: ATM option skipped; no usable option chain")
+                return
+            strike_row = _pick_strike(chain.calls, spot, 0.50, get_dynamic_option_filters())
+            if strike_row is None:
+                log.info(f"LIVE PROBE {symbol}: ATM option skipped; no liquid ATM call")
+                return
+            mid_price = float(strike_row.get("mid", strike_row.get("lastprice", 0)) or 0)
+            if mid_price <= 0:
+                log.info(f"LIVE PROBE {symbol}: ATM option skipped; no executable call price")
+                return
+            option_signal = OptionSignal(
+                symbol=symbol, option_type="call", action="buy_to_open",
+                strike=float(strike_row["strike"]), expiry=chain.expiry,
+                mid_price=mid_price, confidence=1.0,
+                reason="Profitable live-probe equity scale-in; ATM call confirmation",
+                strategy="LiveProbeATMScaleIn",
+                iv_pct=float(strike_row.get("iv_pct", chain.hv_30)),
+                iv_rank=chain.iv_rank, delta=float(strike_row.get("delta", 0.50)),
+                open_interest=int(strike_row.get("openinterest", 0)),
+                contract_cap=1, force_single_leg=True, bypass_portfolio_cap=True,
+            )
+            if options_executor.place_option_order(option_signal, market_state):
+                log.info(f"LIVE PROBE ATM OPTION {symbol}: 1x ${option_signal.strike:.2f} call submitted")
+        except Exception as option_error:
+            log.warning(f"LIVE PROBE {symbol}: ATM option scale-in skipped: {option_error}")
+
+    def check_live_probe_scale_ins(self, options_executor=None) -> None:
         """Add once to a profitable live probe after the strategy scan completes."""
         if not (LIVE_PROBE_MODE and LIVE_PROBE_SCALE_IN_ENABLED):
             return
@@ -439,6 +490,8 @@ class EnhancedExecutor:
                         continue
                     pending_scale_ins.pop(sym, None)
                     self._live_probe_scaled_in.add(sym)
+                    self._place_live_probe_atm_option(sym, current_price, market_state, options_executor)
+                    self._mark_live_probe_scaled_in(sym)
                     state_changed = True
                     log.info(f"LIVE PROBE {sym}: premarket scale-in filled; protection replaced for {abs(qty)} shares")
                     continue
@@ -519,7 +572,8 @@ class EnhancedExecutor:
                     ))
                     log.info(f"LIVE PROBE SCALE-IN {sym}: +{add_shares} shares at {gain_pct:+.2f}% | used {LIVE_PROBE_SCALE_IN_BUYING_POWER_PCT:.1f}% available buying power")
                     cumulative_scale_cost += add_shares * current_price * margin
-                    self._live_probe_scaled_in.add(sym)
+                    self._place_live_probe_atm_option(sym, current_price, market_state, options_executor)
+                    self._mark_live_probe_scaled_in(sym)
                     state_changed = True
                     continue
 
@@ -1594,17 +1648,23 @@ class EnhancedExecutor:
         return retained
 
     def flatten_portfolio(self, reason: str, allow_momentum_exemptions: bool = False) -> bool:
-        """Cancel orders and close positions, optionally retaining strong equities."""
+        """Cancel equity orders and close equity positions, optionally retaining strong equities."""
         try:
             positions = self.client.get_all_positions()
         except Exception as e:
             log.error(f"{reason}: position fetch failed: {e}")
             return False
 
+        option_symbols = {
+            p.symbol for p in positions
+            if str(getattr(p, "asset_class", "")).lower() == "us_option"
+        }
         active = {
             p.symbol for p in positions
-            if float(getattr(p, "qty", 0) or 0) != 0
+            if float(getattr(p, "qty", 0) or 0) != 0 and p.symbol not in option_symbols
         }
+        if option_symbols:
+            log.info(f"{reason}: retaining options positions: {sorted(option_symbols)}")
         if not active:
             self._flatten_in_progress = set()
             self._flatten_failed = set()

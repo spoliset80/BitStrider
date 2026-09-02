@@ -809,12 +809,17 @@ class OptionsExecutor:
         """
         try:
             portfolio_count = len(self.client.get_all_positions())
-            if portfolio_count >= MAX_POSITIONS:
+            if portfolio_count >= MAX_POSITIONS and not signal.bypass_portfolio_cap:
                 log.info(
                     f"[OPTIONS] Portfolio position cap reached "
                     f"({portfolio_count}/{MAX_POSITIONS}) — skipping {signal.symbol}"
                 )
                 return False
+            if portfolio_count >= MAX_POSITIONS:
+                log.info(
+                    f"[OPTIONS] Portfolio position cap bypassed for live-probe scale-in "
+                    f"{signal.symbol} ({portfolio_count}/{MAX_POSITIONS})"
+                )
         except Exception as e:
             log.warning(f"[OPTIONS] Could not verify portfolio position count: {e} — skipping entry")
             return False
@@ -838,6 +843,8 @@ class OptionsExecutor:
                 1.0, max(0.0, (signal.confidence - MIN_SIGNAL_CONFIDENCE) / (CONF_SCALE_FULL_CONF - MIN_SIGNAL_CONFIDENCE))
             )
             contracts = max(1, int(round(raw_contracts * _conf_mult)))
+            if signal.contract_cap is not None:
+                contracts = min(contracts, signal.contract_cap)
             # Build legs for the pending order
             if is_condor:
                 legs = [
@@ -963,6 +970,8 @@ class OptionsExecutor:
             1.0, max(0.0, (signal.confidence - MIN_SIGNAL_CONFIDENCE) / (CONF_SCALE_FULL_CONF - MIN_SIGNAL_CONFIDENCE))
         )
         contracts = max(1, int(round(raw_contracts * _conf_mult)))
+        if signal.contract_cap is not None:
+            contracts = min(contracts, signal.contract_cap)
         log.debug(f"[OPTIONS] {signal.symbol} conf={signal.confidence:.0%} → scale={_conf_mult:.2f}× → {contracts}c")
 
         # 4. Determine Strategy Type
@@ -996,7 +1005,9 @@ class OptionsExecutor:
         _net_entry_price = signal.mid_price   # overridden below if auto-spread net debit is computed
 
         if not is_butterfly and not is_condor:
-            if _in_open_window:
+            if signal.force_single_leg:
+                _force_spread = False
+            elif _in_open_window:
                 # Higher confidence bar — only cleanest signals at the open
                 if signal.confidence < 0.85:
                     log.debug(

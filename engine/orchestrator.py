@@ -534,7 +534,7 @@ def _run_live_probe_scale_check(ctx: AppContext, reason: str) -> None:
     """Keep live-probe scale-ins active even while the bot is paused during cutoffs."""
     try:
         if ctx.executor is not None:
-            ctx.executor.check_live_probe_scale_ins()
+            ctx.executor.check_live_probe_scale_ins(ctx.options_executor)
     except Exception as exc:
         log.warning(f"[{reason}] live probe scale check skipped: {exc}")
 
@@ -736,7 +736,7 @@ def scan_and_trade(ctx: AppContext) -> None:
 
     scan_targets, excluded = _build_scan_targets(ctx)
     if not scan_targets:
-        ctx.executor.check_live_probe_scale_ins()
+        ctx.executor.check_live_probe_scale_ins(ctx.options_executor)
         log.info("[SCAN] No targets after filtering — skipping scan")
         return
 
@@ -762,7 +762,7 @@ def scan_and_trade(ctx: AppContext) -> None:
         log.info(f"[SCAN] TOP5_RAW #{idx}: {s.symbol} {s.action.upper()} ${s.price:.2f} conf={s.confidence:.0%} [{s.strategy}] — {s.reason}")
 
     if not signals:
-        ctx.executor.check_live_probe_scale_ins()
+        ctx.executor.check_live_probe_scale_ins(ctx.options_executor)
         log.info("[SCAN] No signals this cycle")
         return
 
@@ -780,12 +780,12 @@ def scan_and_trade(ctx: AppContext) -> None:
     notify_scan_results(eligible[:5], datetime.date.today(), sentiment, regime)
 
     if not eligible:
-        ctx.executor.check_live_probe_scale_ins()
+        ctx.executor.check_live_probe_scale_ins(ctx.options_executor)
         log.info("[SCAN] No eligible signals after filtering")
         return
 
     # Fresh strategy evaluation is complete; now validate existing probes for scale-in.
-    ctx.executor.check_live_probe_scale_ins()
+    ctx.executor.check_live_probe_scale_ins(ctx.options_executor)
 
     if regime == "bear":
         _execute_bear_plan(ctx, eligible, daily_loss_limit, loss_pct)
