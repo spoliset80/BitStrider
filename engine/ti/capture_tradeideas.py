@@ -86,15 +86,21 @@ SCANS: dict[str, dict] = {
         "label":  "market_scope_360",
         "target": "PRIORITY_1_MOMENTUM",      # momentum leaders
     },
+    "momentumscanner": {
+        "url":    "https://www.trade-ideas.com/momentum-scanner/",
+        "label":  "momentum_scanner",
+        "target": "PRIORITY_1_MOMENTUM",      # public momentum candidates
+    },
     "unusualoptionsvolume": {
         "url":    "https://www.trade-ideas.com/TIPro/unusualoptionsvolume/",
         "label":  "unusual_options_volume",
         "target": "PRIORITY_1_MOMENTUM",   # directional-conviction tickers → tier 1
     },
     "toplists": {
-        "url":    "https://www.trade-ideas.com/TIPro/toplists/",
-        "label":  "toplists",
-        "target": "PRIORITY_1_MOMENTUM",   # Explore Stock Groups top list tickers
+        "url":    "https://www.trade-ideas.com/momentum-scanner/",
+        "label":  "momentum_scanner_races",
+        "target": "PRIORITY_1_MOMENTUM",   # public momentum candidates
+        "interaction": "stock_races",
     },
 }
 
@@ -311,7 +317,18 @@ def _create_edge_driver(chrome_profile: Optional[str] = None, remote_debug_port:
                 service.creation_flags = _sp.CREATE_NO_WINDOW
             driver = webdriver.Edge(service=service, options=opts)
         else:
-            raise e
+            # A prior interrupted run can leave the persistent scraper profile
+            # unusable. Retry once with a fresh profile before failing the scan.
+            retry_opts = EdgeOptions()
+            for arg in opts.arguments:
+                if "--user-data-dir" not in arg:
+                    retry_opts.add_argument(arg)
+            for key, value in (opts.experimental_options or {}).items():
+                retry_opts.add_experimental_option(key, value)
+            clean_profile = _tf.mkdtemp(prefix="edge_ti_scraper_")
+            retry_opts.add_argument(f"--user-data-dir={clean_profile}")
+            log.warning("Persistent Edge scraper profile failed; retrying with a clean profile.")
+            driver = webdriver.Edge(service=service, options=retry_opts)
 
     driver.set_page_load_timeout(45)
     driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
@@ -682,6 +699,54 @@ def _scrape_toplists(
     return results
 
 
+_MOMENTUM_SCANNER_RACES = (
+    "Relative Volume",
+    "FANG and Friends",
+    "SP500 Moving Up",
+    "SP500 Moving Down",
+)
+
+
+def _scrape_momentum_scanner_races(driver: "webdriver.Edge") -> dict[str, list[str]]:
+    """Drag requested Stock Race tiles into the Momentum Scanner and capture each result."""
+    WebDriverWait(driver, TABLE_WAIT_SEC).until(
+        EC.presence_of_element_located((By.CSS_SELECTOR, "#race-selector-card-div"))
+    )
+    results: dict[str, list[str]] = {}
+
+    for label in _MOMENTUM_SCANNER_RACES:
+        selector = (
+            ".race-setup-div img[data-bs-original-title="
+            f"'{label}'"
+            "]"
+        )
+        try:
+            source = WebDriverWait(driver, TABLE_WAIT_SEC).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, selector))
+            )
+            target = driver.find_element(By.CSS_SELECTOR, "#ssw-race-div-1")
+            driver.execute_script("arguments[0].scrollIntoView({block:'center'});", source)
+            driver.execute_script("arguments[0].scrollIntoView({block:'center'});", target)
+            ActionChains(driver).click_and_hold(source).pause(0.2).move_to_element(target).pause(0.4).release().perform()
+        except Exception as exc:
+            print(f"[WARN ] Unable to select Momentum Scanner race {label}: {exc}")
+            continue
+
+        time.sleep(RENDER_GRACE_SEC + 1)
+        race_text = target.text
+        tickers = [
+            match.group(1)
+            for match in _TICKER_RE.finditer(race_text)
+            if _is_valid_ti_ticker(match.group(1))
+        ]
+        tickers = list(dict.fromkeys(tickers))
+        key = f"momentum_{re.sub(r'[^a-z0-9]+', '_', label.lower()).strip('_')}"
+        results[key] = tickers
+        print(f"[OK   ] {label}: {len(tickers)} tickers — {tickers[:10]}{'…' if len(tickers) > 10 else ''}")
+
+    return results
+
+
 # ── Stock Race Central: leaders vs laggards extraction ───────────
 def _extract_race_sides(driver: "webdriver.Chrome") -> tuple[list[str], list[str]]:
     """
@@ -845,7 +910,7 @@ def scrape_tradeideas(
             # Short grace period for React heatmap to render.
             time.sleep(RENDER_GRACE_SEC)
 
-            if scan_key == "toplists":
+            if scan.get("interaction") == "drag_drop":
                 local_select_minutes = 15 if select_minutes is None else select_minutes
                 toplist_results = _scrape_toplists(
                     driver,
@@ -854,6 +919,10 @@ def scrape_tradeideas(
                 )
                 results.update(toplist_results)
                 tickers = [t for lst in toplist_results.values() for t in lst]
+            elif scan.get("interaction") == "stock_races":
+                race_results = _scrape_momentum_scanner_races(driver)
+                results.update(race_results)
+                tickers = [t for lst in race_results.values() for t in lst]
             else:
                 # Optionally select a timeframe dropdown before scraping.
                 if select_minutes is not None:
