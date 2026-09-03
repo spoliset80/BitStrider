@@ -161,6 +161,7 @@ class EnhancedExecutor:
         self._account_cache:  Optional[AccountSnapshot] = None
         self._account_ttl:    float = 2.0   # tight TTL — buying power must be fresh between orders
         self._htb_cache:      set   = set()   # hard-to-borrow symbols — skip shorts this session
+        self._halted_symbols: set   = set()   # broker-reported halts — skip entries for this session
         self._entry_log:   Dict[str, dict] = {}  # {symbol: {"strategy": str, "date": date}}
         self._swap_cycle_closed: set = set()     # positions already swapped this scan cycle
         self._tp_targets:          Dict[str, float] = {}  # {symbol: final close price (+10%)}
@@ -896,6 +897,9 @@ class EnhancedExecutor:
         if order_type == OrderType.SHORT and signal.symbol in self._htb_cache:
             return False, f"{signal.symbol} hard-to-borrow (cached)"
 
+        if signal.symbol in getattr(self, "_halted_symbols", set()):
+            return False, f"{signal.symbol} halted (cached for this session)"
+
         # Asset tradability check: skip halted or suspended symbols
         try:
             asset = self.client.get_asset(signal.symbol)
@@ -1131,7 +1135,12 @@ class EnhancedExecutor:
 
         except Exception as e:
             err = str(e).lower()
-            if order_type == OrderType.SHORT and ("cannot be sold short" in err or "40310000" in err or "account is not allowed to short" in err):
+            if "trading halt" in err or "halted" in err:
+                if not hasattr(self, "_halted_symbols"):
+                    self._halted_symbols = set()
+                self._halted_symbols.add(signal.symbol)
+                log.warning(f"Bracket skip {signal.symbol}: broker reports trading halt; cached for this session")
+            elif order_type == OrderType.SHORT and ("cannot be sold short" in err or "40310000" in err or "account is not allowed to short" in err):
                 # Symbol-level HTB: block only this ticker for the session
                 self._htb_cache.add(signal.symbol)
                 if "account is not allowed to short" in err:
@@ -1418,6 +1427,8 @@ class EnhancedExecutor:
                 self._get_positions(force_refresh=True)
                 self._get_account(force_refresh=True)
                 return True
+            if signal.symbol in getattr(self, "_halted_symbols", set()):
+                return False
 
         if self._create_simple_order(market_signal, shares, order_type):
             self.pdt.add(datetime.date.today())

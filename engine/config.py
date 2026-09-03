@@ -206,11 +206,6 @@ PAPER      = TRADE_MODE == "paper"
 LIVE       = not PAPER
 _MODE      = "PAPER" if PAPER else "LIVE"
 
-# Paper mode: lift options position caps so all strategies can be tested freely
-if PAPER:
-    OPTIONS_MAX_POSITIONS      = int(os.getenv("OPTIONS_MAX_POSITIONS",      "999"))
-    OPTIONS_MAX_MLEG_POSITIONS = int(os.getenv("OPTIONS_MAX_MLEG_POSITIONS", "999"))
-
 API_KEY    = os.getenv(f"{_MODE}_ALPACA_API_KEY", "")
 API_SECRET = os.getenv(f"{_MODE}_ALPACA_API_SECRET", "")
 # SDK picks the correct endpoint automatically via paper=True/False — no URL override needed

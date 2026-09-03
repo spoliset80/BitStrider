@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 import os
+from datetime import date
 from typing import List, Tuple
 
 # ── Finnhub SDK availability ──────────────────────────────────────────────────
@@ -45,8 +46,6 @@ def setup_logging() -> logging.Logger:
     Level is driven by APEXTRADER_LOG_LEVEL env var (default INFO).
     Safe to call multiple times — duplicate handlers are removed first.
     """
-    from logging.handlers import TimedRotatingFileHandler
-
     fmt       = "%(asctime)s [%(levelname)s] %(message)s"
     formatter = logging.Formatter(fmt)
     root      = logging.getLogger()
@@ -60,13 +59,12 @@ def setup_logging() -> logging.Logger:
     console = logging.StreamHandler()
     console.setFormatter(formatter)
 
-    file_h = TimedRotatingFileHandler(
-        filename="apextrader.log",
-        when="midnight", interval=1, backupCount=14,
-        encoding="utf-8", delay=True, utc=False,
+    file_h = logging.FileHandler(
+        filename=f"apextrader.log.{date.today().isoformat()}",
+        mode="a",
+        encoding="utf-8",
     )
     file_h.setFormatter(formatter)
-    file_h.suffix = "%Y-%m-%d"
 
     root.addHandler(console)
     root.addHandler(file_h)

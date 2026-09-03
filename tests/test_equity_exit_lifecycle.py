@@ -721,6 +721,33 @@ class EquityExitLifecycleTests(unittest.TestCase):
         self.assertLessEqual(client.last_order.limit_price, 99.2)
         self.assertLess(client.last_order.limit_price, 100.0)
 
+    def test_halted_bracket_entry_is_cached_without_market_order_fallback(self):
+        class HaltedClient:
+            def __init__(self):
+                self.submit_calls = 0
+
+            def submit_order(self, order):
+                self.submit_calls += 1
+                raise RuntimeError('market order rejected due to trading halt on symbol: "APGE"')
+
+        client = HaltedClient()
+        executor = object.__new__(EnhancedExecutor)
+        executor.client = client
+        executor.order_cache = {}
+        executor._submitted_entry_orders = {}
+        executor._halted_symbols = set()
+        executor._intermediate_targets = {}
+        executor._tp_targets = {}
+        executor.use_bracket_orders = True
+        executor._current_market_state = lambda: SimpleNamespace(is_regular_hours=True)
+        signal = SimpleNamespace(symbol="APGE", price=135.07, strategy="Sweepea")
+
+        self.assertFalse(executor._create_bracket_order(
+            signal, 1, {"stop_loss_pct": 5.0}, enhanced.OrderType.LONG
+        ))
+        self.assertEqual(client.submit_calls, 1)
+        self.assertEqual(executor._halted_symbols, {"APGE"})
+
     def test_after_hours_eod_close_uses_executable_limit_order(self):
         class FixedDateTime(datetime.datetime):
             @classmethod
