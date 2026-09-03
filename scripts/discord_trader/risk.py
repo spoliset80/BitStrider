@@ -11,13 +11,16 @@ class RiskManager:
     def __init__(self, max_positions: int, max_daily_spend: float,
                  dedupe_ticker: bool, confidence_min: int,
                  alloc_low_pct: float, alloc_med_pct: float, alloc_high_pct: float,
-                 order_notional: float):
+                 order_notional: float, min_notional: float = 0.0,
+                 max_bp_pct: float = 100.0):
         self.max_positions   = max_positions
         self.max_daily_spend = max_daily_spend
         self.dedupe_ticker   = dedupe_ticker
         self.confidence_min  = confidence_min
         self._alloc = [(90, alloc_high_pct), (80, alloc_med_pct), (70, alloc_low_pct)]
         self._base_notional  = order_notional
+        self._min_notional   = min_notional
+        self._max_bp_pct     = max_bp_pct
 
         self._daily_spent: float = 0.0
         self._bought_today: Set[str] = set()
@@ -39,9 +42,20 @@ class RiskManager:
 
     def notional_for(self, conf: int, buying_power: Optional[float] = None) -> float:
         pct = self.alloc_pct(conf)
-        if buying_power and buying_power > 0:
-            return round(buying_power * pct / 100, 2)
-        return round(self._base_notional * pct / self._alloc[-1][1], 2)
+        if not buying_power or buying_power <= 0:
+            return round(self._base_notional * pct / self._alloc[-1][1], 2)
+
+        notional = buying_power * pct / 100
+        # Small accounts: a raw % of BP can be too small to afford a single
+        # contract, so lift it to the floor (never above the BP ceiling).
+        ceiling = buying_power * self._max_bp_pct / 100
+        if notional < self._min_notional:
+            notional = self._min_notional
+            logger.info(f"  [SIZE] conf={conf} {pct}% of ${buying_power:,.0f} below "
+                        f"${self._min_notional:,.0f} floor — raising to floor")
+        if notional > ceiling:
+            notional = ceiling
+        return round(notional, 2)
 
     def check_buy(self, ticker: str, notional: float, open_count: int, conf: int) -> tuple[bool, str]:
         """Returns (allowed, reason). Call before placing any BUY.

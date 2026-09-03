@@ -105,6 +105,8 @@ def run(config: Config, loop: bool = False,
         alloc_med_pct  = config.alloc_med_pct,
         alloc_high_pct = config.alloc_high_pct,
         order_notional = config.order_notional,
+        min_notional   = config.alloc_min_notional,
+        max_bp_pct     = config.alloc_max_bp_pct,
     )
     router = ChannelRouter(config, broker, risk, Path("logs"))
 

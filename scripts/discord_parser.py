@@ -124,7 +124,8 @@ def resolve_expiry(text: str) -> Optional[date]:
 def build_occ(ticker: str, expiry: date, opt_type: str, strike: float) -> str:
     cp = "C" if opt_type == "CALL" else "P"
     # Alpaca OCC format: no spaces — ticker immediately followed by date/type/strike
-    return f"{ticker.upper()}{expiry.strftime('%y%m%d')}{cp}{int(round(strike * 1000)):08d}"
+    yymmdd = f"{expiry.year % 100:02d}{expiry.month:02d}{expiry.day:02d}"
+    return f"{ticker.upper()}{yymmdd}{cp}{int(round(strike * 1000)):08d}"
 
 
 # ---------------------------------------------------------------------------

@@ -30,6 +30,8 @@ class Config:
     alloc_low_pct:  float = 1.0    # conf 70-79 %
     alloc_med_pct:  float = 2.0    # conf 80-89 %
     alloc_high_pct: float = 3.0    # conf 90+  %
+    alloc_min_notional: float = 250.0  # never size a trade below this (small accounts)
+    alloc_max_bp_pct: float = 25.0     # hard ceiling: % of BP a single trade may use
     price_above_last_pct: float = 2.0  # limit price = last trade (or mid) * (1 + this/100), overrides chat-alerted price
     use_technical_score: bool = True   # backtested as no better than random — see notes before relying on it
     max_hold_days: int = 1             # force-close positions older than this (0 = wait for 'Out' only)
@@ -91,6 +93,8 @@ _ENV_MAP = {
     "DISCORD_ALLOC_LOW_PCT":            ("alloc_low_pct", float),
     "DISCORD_ALLOC_MED_PCT":            ("alloc_med_pct", float),
     "DISCORD_ALLOC_HIGH_PCT":           ("alloc_high_pct", float),
+    "DISCORD_ALLOC_MIN_NOTIONAL":       ("alloc_min_notional", float),
+    "DISCORD_ALLOC_MAX_BP_PCT":         ("alloc_max_bp_pct", float),
     "DISCORD_PRICE_ABOVE_LAST_PCT":     ("price_above_last_pct", float),
     "DISCORD_USE_TECHNICAL_SCORE":      ("use_technical_score", _as_bool),
     "DISCORD_MAX_HOLD_DAYS":            ("max_hold_days", int),
