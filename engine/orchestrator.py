@@ -136,7 +136,7 @@ def _run_discovery(ctx: AppContext, market_state: MarketState) -> None:
         remote_debug_port=9222,
     )
     _discovery.scan_tradeideas_unusual_options(
-        enabled=cfg.USE_TRADEIDEAS_UNUSUAL_OPTIONS_DISCOVERY,
+        enabled=cfg.USE_TRADEIDEAS_UNUSUAL_OPTIONS_DISCOVERY and not cfg.USE_TRADEIDEAS_DISCOVERY,
         scan_interval_min=cfg.TRADEIDEAS_UNUSUAL_OPTIONS_SCAN_INTERVAL_MIN,
         headless=cfg.TRADEIDEAS_HEADLESS,
         chrome_profile=cfg.TRADEIDEAS_CHROME_PROFILE,
@@ -147,7 +147,7 @@ def _run_discovery(ctx: AppContext, market_state: MarketState) -> None:
         remote_debug_port=9222,
     )
     _discovery.scan_tradeideas_toplists(
-        enabled=cfg.USE_TRADEIDEAS_TOPLISTS_DISCOVERY,
+        enabled=cfg.USE_TRADEIDEAS_TOPLISTS_DISCOVERY and not cfg.USE_TRADEIDEAS_DISCOVERY,
         scan_interval_min=cfg.TRADEIDEAS_TOPLISTS_SCAN_INTERVAL_MIN,
         headless=cfg.TRADEIDEAS_HEADLESS,
         chrome_profile=cfg.TRADEIDEAS_CHROME_PROFILE,

@@ -28,6 +28,13 @@ from engine.ti.ti import get_scans, is_valid_ti_ticker, scrape_tradeideas
 log = logging.getLogger("ApexTrader")
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+TRADEIDEAS_ALL_SCAN_KEYS = [
+    "marketscope360",
+    "highshortfloat",
+    "momentumscanner",
+    "unusualoptionsvolume",
+    "toplists",
+]
 
 # ── Module-level state ─────────────────────────────────────────────────────
 trending_stocks:           List[Dict] = []
@@ -850,7 +857,7 @@ def scan_tradeideas_universe(
     browser: str = "edge",
     remote_debug_port: int = 9222,
 ) -> None:
-    """Submit or check a background TI scrape for core Trade Ideas pages."""
+    """Submit or check a background TI scrape for all configured Trade Ideas pages."""
     global last_ti_scan, _ti_future, _ti_started_at, _ti_warned_running
 
     if not enabled:
@@ -908,7 +915,7 @@ def scan_tradeideas_universe(
     ti_profile  = (chrome_profile or "").strip() or None
 
     log.info(
-        f"Scanning Trade Ideas core pages in background (browser=edge, profile={ti_profile or 'none'}) …"
+        f"Scanning all Trade Ideas pages in background (browser=edge, profile={ti_profile or 'none'}) …"
     )
     _ti_started_at     = now
     _ti_warned_running = False
@@ -917,7 +924,8 @@ def scan_tradeideas_universe(
         update_config=update_config,
         chrome_profile=ti_profile,
         select_minutes=15,
-        scan_keys=["marketscope360", "highshortfloat"],
+        include_toplists=True,
+        scan_keys=TRADEIDEAS_ALL_SCAN_KEYS,
         remote_debug_port=remote_debug_port,
     )
 

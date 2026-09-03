@@ -7,6 +7,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+import pandas as pd
+
 from engine.execution import enhanced
 from engine.execution.enhanced import EnhancedExecutor
 from engine.options.executor import OptionsExecutor
@@ -72,6 +74,18 @@ def build_executor(client, state_path):
     executor._probe_journal_path = state_path.with_name("probe_journal.jsonl")
     executor._probe_journal_lock = threading.Lock()
     return executor
+
+
+def make_probe_confirmation_bars(entry_time):
+    closes = [100.2, 100.4, 100.7, 100.9, 101.0, 101.3]
+    return pd.DataFrame({
+        "time": [entry_time + datetime.timedelta(minutes=i) for i in range(len(closes))],
+        "open": [close - 0.05 for close in closes],
+        "high": [100.4, 100.6, 100.9, 101.1, 101.2, 101.5],
+        "low": [close - 0.20 for close in closes],
+        "close": closes,
+        "volume": [10_000] * len(closes),
+    })
 
 
 class EquityExitLifecycleTests(unittest.TestCase):
@@ -164,10 +178,12 @@ class EquityExitLifecycleTests(unittest.TestCase):
         executor = build_executor(client, Path(tempfile.gettempdir()) / "unused_probe_state.json")
         executor._options_cost_reserve = 0.0
         executor._get_account = lambda **_kwargs: SimpleNamespace(equity=10_000.0, buying_power=10_000.0)
+        now = datetime.datetime(2026, 8, 20, 10, 30)
+        entry_time = now - datetime.timedelta(minutes=10)
         executor._current_market_state = lambda: SimpleNamespace(
-            is_regular_hours=True, now=datetime.datetime(2026, 8, 20, 10, 30), resolve_regime=lambda: True,
+            is_regular_hours=True, now=now, resolve_regime=lambda: True,
         )
-        executor._entry_log["AAPL"] = {"entry_price": 100.0}
+        executor._entry_log["AAPL"] = {"entry_price": 100.0, "entry_time": entry_time}
         executor._place_live_probe_atm_option = Mock()
         options_executor = Mock()
 
@@ -175,10 +191,11 @@ class EquityExitLifecycleTests(unittest.TestCase):
             enhanced, "LIVE_PROBE_SCALE_IN_ENABLED", True
         ), patch.object(enhanced, "LIVE_PROBE_SCALE_IN_MIN_GAIN_PCT", 0.5), patch.object(
             enhanced, "get_dynamic_tier", return_value={"ts": 6.0}
+        ), patch.object(enhanced, "get_bars", return_value=make_probe_confirmation_bars(entry_time)
         ):
             executor.check_live_probe_scale_ins(options_executor)
             executor._place_live_probe_atm_option.assert_not_called()
-            client.positions[0].qty = "24"
+            client.positions[0].qty = "2"
             executor.check_live_probe_scale_ins(options_executor)
 
         executor._place_live_probe_atm_option.assert_called_once()
@@ -295,13 +312,15 @@ class EquityExitLifecycleTests(unittest.TestCase):
         executor._options_cost_reserve = 0.0
         executor._pdt_stop_blocked = {}
         executor._get_account = lambda **_kwargs: SimpleNamespace(equity=10_000.0, buying_power=10_000.0)
+        now = datetime.datetime(2026, 8, 20, 10, 30)
+        entry_time = now - datetime.timedelta(minutes=31)
         executor._current_market_state = lambda: SimpleNamespace(
             is_regular_hours=True,
-            now=datetime.datetime(2026, 8, 20, 10, 30),
+            now=now,
             resolve_regime=lambda: True,
         )
         executor._entry_log["AAPL"] = {
-            "entry_time": datetime.datetime.now() - datetime.timedelta(minutes=31),
+            "entry_time": entry_time,
             "entry_price": 100.0,
         }
 
@@ -310,14 +329,64 @@ class EquityExitLifecycleTests(unittest.TestCase):
         ), patch.object(enhanced, "LIVE_PROBE_SCALE_IN_ENABLED", True), patch.object(
             enhanced, "LIVE_PROBE_SCALE_IN_MIN_GAIN_PCT", 0.5
         ), patch.object(enhanced, "LIVE_PROBE_SCALE_IN_BUYING_POWER_PCT", 25.0):
-            with patch.object(enhanced, "get_dynamic_tier", return_value={"ts": 6.0}):
+            with patch.object(enhanced, "get_dynamic_tier", return_value={"ts": 6.0}), patch.object(
+                enhanced, "get_bars", return_value=make_probe_confirmation_bars(entry_time)
+            ):
                 executor.check_live_probe_scale_ins()
-                client.positions[0].qty = "24"
+                client.positions[0].qty = "2"
                 executor.check_live_probe_scale_ins()
 
         self.assertEqual(len(client.orders), 2)
-        self.assertEqual(client.orders[0].qty, 23)
-        self.assertEqual(client.orders[1].qty, 24)
+        self.assertEqual(client.orders[0].qty, 1)
+        self.assertEqual(client.orders[1].qty, 2)
+
+    def test_live_probe_scale_in_waits_for_minimum_hold_time(self):
+        client = MockClient([MockPosition("AAPL", "1", 101.0, avg_entry_price=100.0)])
+        executor = build_executor(client, Path(tempfile.gettempdir()) / "unused_probe_state.json")
+        executor._options_cost_reserve = 0.0
+        executor._get_account = lambda **_kwargs: SimpleNamespace(equity=10_000.0, buying_power=10_000.0)
+        now = datetime.datetime(2026, 8, 20, 10, 30)
+        entry_time = now - datetime.timedelta(minutes=2)
+        executor._current_market_state = lambda: SimpleNamespace(
+            is_regular_hours=True,
+            now=now,
+            resolve_regime=lambda: True,
+        )
+        executor._entry_log["AAPL"] = {"entry_price": 100.0, "entry_time": entry_time}
+
+        with patch.object(enhanced, "LIVE_PROBE_MODE", True), patch.object(
+            enhanced, "LIVE_PROBE_SCALE_IN_ENABLED", True
+        ), patch.object(enhanced, "LIVE_PROBE_SCALE_IN_MIN_GAIN_PCT", 0.5), patch.object(
+            enhanced, "LIVE_PROBE_SCALE_IN_MIN_HOLD_MINUTES", 5
+        ), patch.object(enhanced, "get_bars", return_value=make_probe_confirmation_bars(entry_time)):
+            executor.check_live_probe_scale_ins()
+
+        self.assertEqual(client.orders, [])
+
+    def test_live_probe_scale_in_requires_new_post_entry_high(self):
+        client = MockClient([MockPosition("AAPL", "1", 101.0, avg_entry_price=100.0)])
+        executor = build_executor(client, Path(tempfile.gettempdir()) / "unused_probe_state.json")
+        executor._options_cost_reserve = 0.0
+        executor._get_account = lambda **_kwargs: SimpleNamespace(equity=10_000.0, buying_power=10_000.0)
+        now = datetime.datetime(2026, 8, 20, 10, 30)
+        entry_time = now - datetime.timedelta(minutes=10)
+        executor._current_market_state = lambda: SimpleNamespace(
+            is_regular_hours=True,
+            now=now,
+            resolve_regime=lambda: True,
+        )
+        bars = make_probe_confirmation_bars(entry_time)
+        bars.loc[bars.index[-1], "high"] = bars["high"].iloc[:-1].max()
+        executor._entry_log["AAPL"] = {"entry_price": 100.0, "entry_time": entry_time}
+
+        with patch.object(enhanced, "LIVE_PROBE_MODE", True), patch.object(
+            enhanced, "LIVE_PROBE_SCALE_IN_ENABLED", True
+        ), patch.object(enhanced, "LIVE_PROBE_SCALE_IN_MIN_GAIN_PCT", 0.5), patch.object(
+            enhanced, "get_bars", return_value=bars
+        ):
+            executor.check_live_probe_scale_ins()
+
+        self.assertEqual(client.orders, [])
 
     def test_live_probe_scale_in_replaces_existing_protective_order(self):
         class WashTradeClient(MockClient):
@@ -342,25 +411,28 @@ class EquityExitLifecycleTests(unittest.TestCase):
         executor = build_executor(client, Path(tempfile.gettempdir()) / "unused_probe_state.json")
         executor._options_cost_reserve = 0.0
         executor._get_account = lambda **_kwargs: SimpleNamespace(equity=10_000.0, buying_power=10_000.0)
+        now = datetime.datetime(2026, 8, 20, 10, 30)
+        entry_time = now - datetime.timedelta(minutes=10)
         executor._current_market_state = lambda: SimpleNamespace(
             is_regular_hours=True,
-            now=datetime.datetime(2026, 8, 20, 10, 30),
+            now=now,
             resolve_regime=lambda: True,
         )
-        executor._entry_log["AAPL"] = {"entry_price": 100.0}
+        executor._entry_log["AAPL"] = {"entry_price": 100.0, "entry_time": entry_time}
 
         with patch.object(enhanced, "LIVE_PROBE_MODE", True), patch.object(
             enhanced, "LIVE_PROBE_SCALE_IN_ENABLED", True
         ), patch.object(enhanced, "LIVE_PROBE_SCALE_IN_MIN_GAIN_PCT", 0.5), patch.object(
             enhanced, "get_dynamic_tier", return_value={"ts": 6.0}
+        ), patch.object(enhanced, "get_bars", return_value=make_probe_confirmation_bars(entry_time)
         ), patch.object(enhanced.time, "sleep"):
             executor.check_live_probe_scale_ins()
-            client.positions[0].qty = "24"
+            client.positions[0].qty = "2"
             executor.check_live_probe_scale_ins()
 
         self.assertEqual(client.cancelled_orders, ["existing-trailing-stop"])
         self.assertEqual(len(client.orders), 2)
-        self.assertEqual(client.orders[1].qty, 24)
+        self.assertEqual(client.orders[1].qty, 2)
         self.assertIn("AAPL", executor._live_probe_scaled_in)
 
     def test_live_probe_scale_in_uses_limit_order_premarket(self):
@@ -368,16 +440,19 @@ class EquityExitLifecycleTests(unittest.TestCase):
         executor = build_executor(client, Path(tempfile.gettempdir()) / "unused_probe_state.json")
         executor._options_cost_reserve = 0.0
         executor._get_account = lambda **_kwargs: SimpleNamespace(equity=10_000.0, buying_power=10_000.0)
+        entry_time = datetime.datetime.now() - datetime.timedelta(minutes=10)
         executor._current_market_state = lambda: SimpleNamespace(
             is_regular_hours=False,
+            now=datetime.datetime.now(),
             resolve_regime=lambda: True,
         )
         executor._after_hours_limit_price = lambda *_args: (101.1, None)
-        executor._entry_log["AAPL"] = {"entry_price": 100.0}
+        executor._entry_log["AAPL"] = {"entry_price": 100.0, "entry_time": entry_time}
 
         with patch.object(enhanced, "LIVE_PROBE_MODE", True), patch.object(
             enhanced, "LIVE_PROBE_SCALE_IN_ENABLED", True
         ), patch.object(enhanced, "LIVE_PROBE_SCALE_IN_MIN_GAIN_PCT", 0.5
+        ), patch.object(enhanced, "get_bars", return_value=make_probe_confirmation_bars(entry_time)
         ):
             executor.check_live_probe_scale_ins()
 

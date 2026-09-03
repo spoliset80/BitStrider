@@ -58,6 +58,9 @@ from engine.config import (
     LIVE_PROBE_MODE, LIVE_PROBE_SHARES, LIVE_PROBE_MAX_ENTRIES_PER_DAY,
     LIVE_PROBE_SCALE_IN_ENABLED,
     LIVE_PROBE_SCALE_IN_MIN_GAIN_PCT, LIVE_PROBE_SCALE_IN_BUYING_POWER_PCT,
+    LIVE_PROBE_SCALE_IN_MAX_MULTIPLE, LIVE_PROBE_SCALE_IN_MIN_HOLD_MINUTES,
+    LIVE_PROBE_SCALE_IN_REQUIRE_VWAP, LIVE_PROBE_SCALE_IN_REQUIRE_NEW_HIGH,
+    LIVE_PROBE_SCALE_IN_MAX_TOTAL_RISK_PCT,
     LIVE_PROBE_MAX_TOTAL_BUYING_POWER_PCT,
     LIVE_PROBE_SCALE_IN_ATM_OPTION_ENABLED,
     INTRADAY_MOMENTUM_EXEMPTIONS, INTRADAY_MOMENTUM_MIN_GAIN_PCT,
@@ -74,7 +77,7 @@ from engine.config import (
     LIVE,
 )
 from engine.equity.strategies import Signal
-from engine.utils import MarketState, calculate_risk_adjusted_size, check_vix_roc_filter, get_dynamic_tier
+from engine.utils import MarketState, calculate_risk_adjusted_size, check_vix_roc_filter, get_bars, get_dynamic_tier
 from engine.notifications.notifications import send_email
 
 log = logging.getLogger("ApexTrader")
@@ -320,6 +323,53 @@ class EnhancedExecutor:
         """Return whether regular-session single-stock option orders are permitted."""
         return bool(getattr(market_state, "is_regular_hours", False))
 
+    @staticmethod
+    def _entry_age_minutes(entry_time, market_state: MarketState) -> Optional[float]:
+        if entry_time is None:
+            return None
+        now = getattr(market_state, "now", datetime.datetime.now())
+        try:
+            if getattr(entry_time, "tzinfo", None) is not None and getattr(now, "tzinfo", None) is None:
+                now = now.replace(tzinfo=entry_time.tzinfo)
+            elif getattr(entry_time, "tzinfo", None) is None and getattr(now, "tzinfo", None) is not None:
+                entry_time = entry_time.replace(tzinfo=now.tzinfo)
+            return max(0.0, (now - entry_time).total_seconds() / 60)
+        except Exception:
+            return None
+
+    def _live_probe_scale_in_confirmation_ok(self, symbol: str, entry_time, current_price: float) -> tuple[bool, str | None]:
+        if not (LIVE_PROBE_SCALE_IN_REQUIRE_VWAP or LIVE_PROBE_SCALE_IN_REQUIRE_NEW_HIGH):
+            return True, None
+        try:
+            bars = get_bars(symbol, "1d", "1m")
+            if bars.empty or len(bars) < 6:
+                return False, "missing intraday bars for VWAP/new-high confirmation"
+            bars = bars.copy()
+            if "time" in bars.columns:
+                bars["time"] = bars["time"].apply(lambda value: value.to_pydatetime() if hasattr(value, "to_pydatetime") else value)
+                if entry_time is not None:
+                    bars = bars[bars["time"] >= entry_time]
+            elif entry_time is not None and hasattr(bars.index, "to_series"):
+                index_times = bars.index.to_series().apply(lambda value: value.to_pydatetime() if hasattr(value, "to_pydatetime") else value)
+                bars = bars[index_times >= entry_time]
+            if len(bars) < 6:
+                return False, "not enough post-entry bars for VWAP/new-high confirmation"
+
+            typical_price = (bars["high"] + bars["low"] + bars["close"]) / 3
+            cumulative_volume = bars["volume"].cumsum()
+            vwap = (typical_price * bars["volume"]).cumsum() / cumulative_volume.replace(0, float("nan"))
+            last_close = float(bars["close"].iloc[-1])
+            last_high = float(bars["high"].iloc[-1])
+            if LIVE_PROBE_SCALE_IN_REQUIRE_VWAP and last_close < float(vwap.iloc[-1]):
+                return False, f"price {last_close:.2f} below VWAP {float(vwap.iloc[-1]):.2f}"
+            if LIVE_PROBE_SCALE_IN_REQUIRE_NEW_HIGH:
+                prior_high = float(bars["high"].iloc[:-1].max())
+                if last_high <= prior_high and current_price <= prior_high:
+                    return False, f"no new post-entry high above {prior_high:.2f}"
+            return True, None
+        except Exception as confirmation_error:
+            return False, f"confirmation data error: {confirmation_error}"
+
     def _record_probe_outcome(self, sym: str, pos, exit_reason: str) -> None:
         """Append a secret-free mark-to-market outcome for a bot-managed live probe exit."""
         if not LIVE_PROBE_MODE:
@@ -535,6 +585,38 @@ class EnhancedExecutor:
             if not (is_long and is_bull):
                 log.info(f"LIVE PROBE {sym}: scale-in skipped; requires long position in bullish regime")
                 continue
+            entry_age_min = self._entry_age_minutes(info.get("entry_time"), market_state)
+            if entry_age_min is None or entry_age_min < LIVE_PROBE_SCALE_IN_MIN_HOLD_MINUTES:
+                log.info(
+                    f"LIVE PROBE {sym}: scale-in skipped; held "
+                    f"{entry_age_min if entry_age_min is not None else 0:.1f} min < "
+                    f"{LIVE_PROBE_SCALE_IN_MIN_HOLD_MINUTES} min"
+                )
+                continue
+            confirmed, confirm_reason = self._live_probe_scale_in_confirmation_ok(
+                sym, info.get("entry_time"), current_price
+            )
+            if not confirmed:
+                log.info(f"LIVE PROBE {sym}: scale-in skipped; {confirm_reason}")
+                continue
+
+            add_cap = int(abs(qty) * max(0.0, LIVE_PROBE_SCALE_IN_MAX_MULTIPLE))
+            if add_cap < 1:
+                log.info(f"LIVE PROBE {sym}: scale-in skipped; max multiple cap allows no additional shares")
+                continue
+
+            atr_stop = float(info.get("atr_stop") or 0.0)
+            if atr_stop > 0 and LIVE_PROBE_SCALE_IN_MAX_TOTAL_RISK_PCT > 0:
+                account_equity = float(getattr(account, "equity", 0.0) or 0.0)
+                max_risk_dollars = account_equity * LIVE_PROBE_SCALE_IN_MAX_TOTAL_RISK_PCT / 100
+                risk_cap = int(max(0.0, max_risk_dollars / atr_stop) - abs(qty))
+                add_cap = min(add_cap, risk_cap)
+                if add_cap < 1:
+                    log.info(
+                        f"LIVE PROBE {sym}: scale-in skipped; total risk cap "
+                        f"{LIVE_PROBE_SCALE_IN_MAX_TOTAL_RISK_PCT:.2f}% already reached"
+                    )
+                    continue
 
             margin = 1.0 if is_long else 2.0
             usable_bp = max(0.0, account.buying_power - self._options_cost_reserve - cumulative_scale_cost)
@@ -548,6 +630,7 @@ class EnhancedExecutor:
             add_shares = min(
                 int(scale_budget / (current_price * margin)),
                 int(usable_bp / (current_price * margin)),
+                add_cap,
             )
             if add_shares < 1:
                 log.info(f"LIVE PROBE {sym}: scale-in skipped; insufficient buying power")
