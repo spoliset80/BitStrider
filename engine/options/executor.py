@@ -270,7 +270,11 @@ class OptionsExecutor:
         if order is None:
             log.info(f"[OPTIONS][RETRY] Order {order_id} for {symbol} not found (likely filled or canceled externally), no retry needed.")
             return
-        filled_qty = getattr(order, "filled_qty", 0)
+        try:
+            filled_qty = int(float(getattr(order, "filled_qty", 0) or 0))
+        except (TypeError, ValueError):
+            filled_qty = 0
+            log.warning(f"[OPTIONS][RETRY] Invalid filled quantity for {symbol} order {order_id}; treating as unfilled")
         log.info(f"[OPTIONS][RETRY] Order {order_id} for {symbol} still open after timeout. Filled qty: {filled_qty}, Contracts: {contracts}")
         if filled_qty >= contracts:
             log.info(f"[OPTIONS][RETRY] Order {order_id} for {symbol} fully filled, no retry needed.")
@@ -660,6 +664,41 @@ class OptionsExecutor:
         position_budget = remaining_budget / max(1, OPTIONS_MAX_POSITIONS - self._count_open_options())
         contracts = int(position_budget // per_contract_cost)
         return max(0, min(contracts, 10))  # hard cap: never more than 10 contracts
+
+    def _get_alpaca_option_limit(self, occ_sym: str, is_buy: bool) -> Optional[float]:
+        """Return an Alpaca option limit using the latest executed trade when available."""
+        try:
+            from alpaca.data.requests import OptionSnapshotRequest
+
+            snapshots = self.data_client.get_option_snapshot(
+                OptionSnapshotRequest(symbol_or_symbols=[occ_sym])
+            )
+            snapshot = snapshots.get(occ_sym)
+            trade = getattr(snapshot, "latest_trade", None)
+            last_price = float(getattr(trade, "price", 0) or 0)
+            quote = getattr(snapshot, "latest_quote", None)
+            bid = float(getattr(quote, "bid_price", 0) or 0)
+            ask = float(getattr(quote, "ask_price", 0) or 0)
+            if last_price > 0:
+                log.info(
+                    f"[OPTIONS] {occ_sym} Alpaca pricing: last=${last_price:.2f} "
+                    f"bid=${bid:.2f} ask=${ask:.2f} limit=${last_price:.2f}"
+                )
+                return round(last_price, 2)
+
+            if bid <= 0 or ask <= 0 or ask < bid:
+                log.warning(f"[OPTIONS] {occ_sym} has no valid Alpaca last trade or bid/ask quote")
+                return None
+
+            limit = ask if is_buy else bid
+            log.info(
+                f"[OPTIONS] {occ_sym} Alpaca pricing: no last trade; bid=${bid:.2f} "
+                f"ask=${ask:.2f} limit=${limit:.2f}"
+            )
+            return round(limit, 2)
+        except Exception as e:
+            log.warning(f"[OPTIONS] {occ_sym} Alpaca pricing unavailable: {e}")
+            return None
 
     # ── Order Placement ────────────────────────────────────────────────────────
 
@@ -1278,65 +1317,12 @@ class OptionsExecutor:
             # ── CASE B: SINGLE OPTION (Standard) ─────────────────────────────
             else:
                 occ_sym = _alpaca_option_symbol(signal.symbol, signal.expiry, cp_type, signal.strike)
-                
-                # ── STEP 4b: Fetch Real-Time Schwab Pricing (Single-Leg) ─────────
-                try:
-                    from engine.broker.schwab_client import get_schwab_market_data_client
-                    
-                    client = get_schwab_market_data_client()
-                    chain_data = client.get_option_chains(signal.symbol, contract_type="ALL")
-                    
-                    if chain_data:
-                        exp_date_map = chain_data.get("callExpDateMap" if cp_type == "call" else "putExpDateMap", {})
-                        bid_price = None
-                        ask_price = None
-                        mark_price = None
-                        
-                        # Search for matching strike
-                        for exp_date_str, strikes_dict in exp_date_map.items():
-                            for strike_str, option_list in strikes_dict.items():
-                                try:
-                                    strike_num = float(strike_str)
-                                    if abs(strike_num - signal.strike) < 0.01:
-                                        if isinstance(option_list, list) and len(option_list) > 0:
-                                            option_data = option_list[0]
-                                            bid_price = float(option_data.get("bid", 0))
-                                            ask_price = float(option_data.get("ask", 0))
-                                            mark_price = float(option_data.get("mark", 0))
-                                            
-                                            if mark_price == 0 and bid_price and ask_price:
-                                                mark_price = (bid_price + ask_price) / 2.0
-                                            break
-                                except (ValueError, TypeError):
-                                    continue
-                            if bid_price is not None:
-                                break
-                        
-                        if bid_price is not None and ask_price is not None and mark_price is not None:
-                            # Use Schwab mark to set limit price (1% improvement)
-                            if "buy" in signal.action:
-                                _schwab_limit_override = round(mark_price * 0.99, 2)
-                            else:
-                                _schwab_limit_override = round(mark_price * 1.01, 2)
-                            
-                            log.info(
-                                f"[OPTIONS] {signal.symbol} {cp_type}@{signal.strike} Schwab pricing: "
-                                f"bid=${bid_price:.2f} mark=${mark_price:.2f} ask=${ask_price:.2f} | "
-                                f"estimated=${signal.mid_price:.2f} (diff={mark_price - signal.mid_price:+.2f})"
-                            )
-                            log.info(
-                                f"[OPTIONS] {signal.symbol} limit price: "
-                                f"estimated=${limit_price:.2f} → schwab_real=${_schwab_limit_override:.2f}"
-                            )
-                            limit_price = _schwab_limit_override
-                        else:
-                            log.warning(f"[OPTIONS] {occ_sym} no Schwab pricing found, using estimated limit=${limit_price:.2f}")
-                    else:
-                        log.warning(f"[OPTIONS] {signal.symbol} no chain data from Schwab, using estimated limit=${limit_price:.2f}")
-                except Exception as e:
-                    log.error(f"[OPTIONS] {occ_sym} Schwab pricing error: {e}, using estimated limit=${limit_price:.2f}")
-                
-                # Submit order with Schwab-based limit price
+                alpaca_limit = self._get_alpaca_option_limit(occ_sym, "buy" in signal.action)
+                if alpaca_limit is not None:
+                    limit_price = alpaca_limit
+                else:
+                    log.warning(f"[OPTIONS] {occ_sym} using estimated limit=${limit_price:.2f}")
+
                 order_req = LimitOrderRequest(
                     symbol=occ_sym,
                     qty=contracts,

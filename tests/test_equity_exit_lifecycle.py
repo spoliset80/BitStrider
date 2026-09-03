@@ -748,6 +748,43 @@ class EquityExitLifecycleTests(unittest.TestCase):
         self.assertEqual(client.submit_calls, 1)
         self.assertEqual(executor._halted_symbols, {"APGE"})
 
+    def test_option_retry_accepts_string_filled_quantity(self):
+        class RetryClient:
+            def __init__(self):
+                self.cancelled = []
+
+            def get_orders(self):
+                return [SimpleNamespace(id="option-order", filled_qty="1")]
+
+            def cancel_order_by_id(self, order_id):
+                self.cancelled.append(order_id)
+
+        executor = object.__new__(OptionsExecutor)
+        executor.client = RetryClient()
+
+        with patch.object(OptionsExecutor, "_ORDER_RETRY_TIMEOUT", 0):
+            executor._adaptive_limit_retry(
+                "option-order", "buy", 1.25, "SOFI", 1, "SOFI260918C00015000", False, None
+            )
+
+        self.assertEqual(executor.client.cancelled, [])
+
+    def test_single_option_limit_uses_alpaca_last_executed_trade(self):
+        executor = object.__new__(OptionsExecutor)
+        executor.data_client = SimpleNamespace(
+            get_option_snapshot=lambda _request: {
+                "SOFI260918C00019500": SimpleNamespace(
+                    latest_trade=SimpleNamespace(price="0.43"),
+                    latest_quote=SimpleNamespace(bid_price="0.39", ask_price="0.44"),
+                )
+            }
+        )
+
+        self.assertEqual(
+            executor._get_alpaca_option_limit("SOFI260918C00019500", is_buy=True),
+            0.43,
+        )
+
     def test_after_hours_eod_close_uses_executable_limit_order(self):
         class FixedDateTime(datetime.datetime):
             @classmethod
