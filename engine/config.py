@@ -606,12 +606,20 @@ EOD_CLOSE_STRATEGIES = {         # Strategy names that must be closed same day
 
 # Regression trendline breakout: confirmed swing pivots + ATR/volume confirmation.
 TRENDLINE_BREAKOUT = {
+    # "regression" preserves the original strategy; "adaptive" uses the
+    # replayable support/resistance engine in scripts.auto_trendline.
+    "engine": os.getenv("TRENDLINE_BREAKOUT_ENGINE", "regression").lower(),
     "left_bars": int(os.getenv("TRENDLINE_BREAKOUT_LEFT_BARS", "5")),
     "right_bars": int(os.getenv("TRENDLINE_BREAKOUT_RIGHT_BARS", "5")),
     "pivot_count": int(os.getenv("TRENDLINE_BREAKOUT_PIVOT_COUNT", "3")),
     "atr_offset": float(os.getenv("TRENDLINE_BREAKOUT_ATR_OFFSET", "0.5")),
     "volume_multiplier": float(os.getenv("TRENDLINE_BREAKOUT_VOLUME_MULTIPLIER", "1.5")),
     "risk_reward_ratio": float(os.getenv("TRENDLINE_BREAKOUT_RISK_REWARD_RATIO", "2.0")),
+    "primary_lookback": int(os.getenv("AUTO_TRENDLINE_PRIMARY_LOOKBACK", "35")),
+    "bars_from_edge": int(os.getenv("AUTO_TRENDLINE_BARS_FROM_EDGE", "8")),
+    "breakout_threshold": float(os.getenv("AUTO_TRENDLINE_BREAKOUT_THRESHOLD", "5.0")),
+    "breakout_confirm_bars": int(os.getenv("AUTO_TRENDLINE_CONFIRM_BARS", "1")),
+    "max_history_lines": int(os.getenv("AUTO_TRENDLINE_MAX_HISTORY_LINES", "3")),
 }
 
 # Stale order upgrade: unfilled orders older than this get re-submitted as market/limit

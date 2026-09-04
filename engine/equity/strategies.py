@@ -29,6 +29,7 @@ from engine.config import (
     SENTIMENT_STRATEGY, TRENDLINE_BREAKOUT,
 )
 from scripts.trendline_breakout import detect_trendline_breakouts
+from scripts.auto_trendline import AutoTrendline, TrendlineConfig
 
 ET = pytz.timezone("America/New_York")
 log = logging.getLogger("ApexTrader")
@@ -1653,6 +1654,8 @@ class TrendlineBreakoutStrategy:
 
     def scan(self, symbol: str) -> Optional[Signal]:
         bars = get_bars(symbol, "1d", "1m")
+        if TRENDLINE_BREAKOUT["engine"] == "adaptive":
+            return self._scan_adaptive(symbol, bars)
         minimum_bars = (
             TRENDLINE_BREAKOUT["left_bars"]
             + TRENDLINE_BREAKOUT["right_bars"]
@@ -1699,6 +1702,43 @@ class TrendlineBreakoutStrategy:
             f"vol x{volume_ratio:.1f} | stop ${stop_loss:.2f} | target ${take_profit:.2f}",
             "TrendlineBreakout",
             atr_stop=stop_distance,
+        )
+
+    @staticmethod
+    def _scan_adaptive(symbol: str, bars: pd.DataFrame) -> Optional[Signal]:
+        config = TrendlineConfig(
+            primary_lookback=TRENDLINE_BREAKOUT["primary_lookback"],
+            bars_from_edge=TRENDLINE_BREAKOUT["bars_from_edge"],
+            breakout_threshold=TRENDLINE_BREAKOUT["breakout_threshold"],
+            breakout_confirm_bars=TRENDLINE_BREAKOUT["breakout_confirm_bars"],
+            max_history_lines=TRENDLINE_BREAKOUT["max_history_lines"],
+        )
+        if bars.empty or len(bars) <= config.min_bars:
+            return None
+        try:
+            snapshot = AutoTrendline(config).latest(bars)
+        except (TypeError, ValueError):
+            return None
+
+        direction = "buy" if snapshot["resistance_break"] else (
+            "short" if snapshot["support_break"] else ""
+        )
+        if not direction:
+            return None
+        price = float(snapshot["close"])
+        line = snapshot["resistance"] if direction == "buy" else snapshot["support"]
+        line_price = (snapshot["resistance_price"] if direction == "buy"
+                      else snapshot["support_price"])
+        atr_stop = _calc_atr14(bars)
+        if line is None or not np.isfinite(atr_stop) or atr_stop <= 0:
+            return None
+        side = "resistance" if direction == "buy" else "support"
+        return Signal(
+            symbol, direction, price, 0.75,
+            f"Adaptive trendline {direction} breakout {side} ${line_price:.2f} | "
+            f"stop ${atr_stop:.2f}",
+            "TrendlineBreakout",
+            atr_stop=float(atr_stop),
         )
 
 

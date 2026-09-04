@@ -865,7 +865,8 @@ class OptionsExecutor:
             )
             return False
         try:
-            portfolio_count = len(self.client.get_all_positions())
+            broker_positions = self.client.get_all_positions()
+            portfolio_count = len(broker_positions)
             if portfolio_count >= MAX_POSITIONS and not signal.bypass_portfolio_cap:
                 log.info(
                     f"[OPTIONS] Portfolio position cap reached "
@@ -877,6 +878,17 @@ class OptionsExecutor:
                     f"[OPTIONS] Portfolio position cap bypassed for live-probe scale-in "
                     f"{signal.symbol} ({portfolio_count}/{MAX_POSITIONS})"
                 )
+                broker_option_count = sum(
+                    1
+                    for position in broker_positions
+                    if getattr(position, "asset_class", "") == "us_option"
+                )
+                if broker_option_count >= OPTIONS_MAX_POSITIONS:
+                    log.info(
+                        f"[OPTIONS] Broker option cap reached "
+                        f"({broker_option_count}/{OPTIONS_MAX_POSITIONS}) — skipping {signal.symbol}"
+                    )
+                    return False
         except Exception as e:
             log.warning(f"[OPTIONS] Could not verify portfolio position count: {e} — skipping entry")
             return False

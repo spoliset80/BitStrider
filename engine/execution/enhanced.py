@@ -20,6 +20,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 
+import pandas as pd
+
 from alpaca.trading.client import TradingClient
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockLatestQuoteRequest
@@ -346,13 +348,23 @@ class EnhancedExecutor:
             if bars.empty or len(bars) < 6:
                 return False, "missing intraday bars for VWAP/new-high confirmation"
             bars = bars.copy()
+            entry_timestamp = self._normalize_confirmation_timestamp(entry_time)
             if "time" in bars.columns:
-                bars["time"] = bars["time"].apply(lambda value: value.to_pydatetime() if hasattr(value, "to_pydatetime") else value)
-                if entry_time is not None:
-                    bars = bars[bars["time"] >= entry_time]
+                bar_times = pd.to_datetime(bars["time"])
+                if entry_timestamp is not None:
+                    if getattr(bar_times.dt, "tz", None) is not None:
+                        bar_times = bar_times.dt.tz_convert("UTC")
+                    else:
+                        bar_times = bar_times.dt.tz_localize("UTC")
+                    bars = bars[bar_times >= entry_timestamp]
             elif entry_time is not None and hasattr(bars.index, "to_series"):
-                index_times = bars.index.to_series().apply(lambda value: value.to_pydatetime() if hasattr(value, "to_pydatetime") else value)
-                bars = bars[index_times >= entry_time]
+                index_times = pd.to_datetime(bars.index.to_series())
+                if entry_timestamp is not None:
+                    if getattr(index_times.dt, "tz", None) is not None:
+                        index_times = index_times.dt.tz_convert("UTC")
+                    else:
+                        index_times = index_times.dt.tz_localize("UTC")
+                    bars = bars[index_times >= entry_timestamp]
             if len(bars) < 6:
                 return False, "not enough post-entry bars for VWAP/new-high confirmation"
 
@@ -370,6 +382,18 @@ class EnhancedExecutor:
             return True, None
         except Exception as confirmation_error:
             return False, f"confirmation data error: {confirmation_error}"
+
+    @staticmethod
+    def _normalize_confirmation_timestamp(value):
+        """Return a UTC-aware timestamp for safe comparisons with market bars."""
+        if value is None:
+            return None
+        timestamp = pd.Timestamp(value)
+        if timestamp.tzinfo is None:
+            timestamp = timestamp.tz_localize("UTC")
+        else:
+            timestamp = timestamp.tz_convert("UTC")
+        return timestamp
 
     def _record_probe_outcome(self, sym: str, pos, exit_reason: str) -> None:
         """Append a secret-free mark-to-market outcome for a bot-managed live probe exit."""
@@ -524,6 +548,10 @@ class EnhancedExecutor:
         for sym, info in list(self._entry_log.items()):
             pos = positions.get(sym)
             entry_price = float(getattr(pos, "avg_entry_price", 0) or 0) if pos is not None else 0
+            if entry_price <= 0 and pos is not None:
+                entry_price = float(info.get("entry_price") or 0)
+                if entry_price > 0:
+                    log.debug(f"LIVE PROBE {sym}: using tracked entry price; broker average unavailable")
             if entry_price <= 0 or pos is None:
                 log.info(f"LIVE PROBE {sym}: scale-in skipped; broker fill price unavailable")
                 continue

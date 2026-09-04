@@ -200,6 +200,57 @@ class EquityExitLifecycleTests(unittest.TestCase):
 
         executor._place_live_probe_atm_option.assert_called_once()
 
+    def test_live_probe_confirmation_normalizes_timezone_aware_bars(self):
+        executor = object.__new__(EnhancedExecutor)
+        entry_time = datetime.datetime(2026, 9, 4, 7, 45)
+        bars = pd.DataFrame({
+            "time": pd.date_range(
+                "2026-09-04 07:45", periods=6, freq="min",
+                tz="America/New_York",
+            ),
+            "high": [48.2, 48.3, 48.4, 48.5, 48.6, 48.8],
+            "low": [47.8] * 6,
+            "close": [48.1, 48.2, 48.3, 48.4, 48.5, 48.7],
+            "volume": [10_000] * 6,
+        })
+
+        with patch.object(enhanced, "LIVE_PROBE_SCALE_IN_REQUIRE_VWAP", True), patch.object(
+            enhanced, "LIVE_PROBE_SCALE_IN_REQUIRE_NEW_HIGH", True
+        ), patch.object(enhanced, "get_bars", return_value=bars):
+            confirmed, reason = executor._live_probe_scale_in_confirmation_ok(
+                "SOXS", entry_time, 48.7
+            )
+
+        self.assertTrue(confirmed)
+        self.assertIsNone(reason)
+
+    def test_live_probe_uses_tracked_entry_when_broker_average_is_unavailable(self):
+        client = MockClient([MockPosition("SOXS", "1", 101.0, avg_entry_price=0.0)])
+        executor = build_executor(client, Path(tempfile.gettempdir()) / "unused_probe_state.json")
+        executor._options_cost_reserve = 0.0
+        executor._get_account = lambda **_kwargs: SimpleNamespace(equity=10_000.0, buying_power=10_000.0)
+        now = datetime.datetime(2026, 8, 20, 10, 30)
+        executor._current_market_state = lambda: SimpleNamespace(
+            is_regular_hours=True, now=now, resolve_regime=lambda: True,
+        )
+        executor._entry_log["SOXS"] = {
+            "entry_time": now - datetime.timedelta(minutes=10),
+            "entry_price": 100.0,
+        }
+        executor._place_live_probe_atm_option = Mock()
+
+        with patch.object(enhanced, "LIVE_PROBE_MODE", True), patch.object(
+            enhanced, "LIVE_PROBE_SCALE_IN_ENABLED", True
+        ), patch.object(enhanced, "LIVE_PROBE_SCALE_IN_MIN_GAIN_PCT", 0.5), patch.object(
+            enhanced, "get_dynamic_tier", return_value={"ts": 6.0}
+        ), patch.object(enhanced, "get_bars", return_value=make_probe_confirmation_bars(
+            now - datetime.timedelta(minutes=10)
+        )):
+            executor.check_live_probe_scale_ins()
+
+        self.assertEqual(len(client.orders), 1)
+        self.assertEqual(client.orders[0].symbol, "SOXS")
+
     def test_probe_cap_bypass_requires_the_fixed_single_call_contract(self):
         valid_signal = OptionSignal(
             "AAPL", "call", "buy_to_open", 100.0, datetime.date(2026, 9, 18), 2.5,
