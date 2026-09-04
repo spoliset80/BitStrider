@@ -53,6 +53,8 @@ from engine.config import (
     OPTIONS_THETA_EXIT_DTE,
     OPTIONS_TRAIL_ACTIVATE_PCT,
     OPTIONS_TRAIL_DRAWDOWN_PCT,
+        OPTIONS_LIVE_PROBE_MODE,
+        OPTIONS_LIVE_PROBE_STOP_LOSS_PCT,
     API_KEY, API_SECRET, PAPER,
 )
 from engine.utils import MarketState
@@ -243,6 +245,9 @@ class OptionsPosition:
     scaled_out_qty: int = 0       # Number of contracts closed at tier1 target
     # Phase 2: Signal confidence at entry (for confidence-tiered profit targets)
     entry_confidence: float = 0.80  # Confidence score at entry (default 0.80)
+    is_live_probe: bool = False
+    probe_scale_in_pending: bool = False
+    probe_scaled_in: bool = False
 
 
 
@@ -878,17 +883,17 @@ class OptionsExecutor:
                     f"[OPTIONS] Portfolio position cap bypassed for live-probe scale-in "
                     f"{signal.symbol} ({portfolio_count}/{MAX_POSITIONS})"
                 )
-                broker_option_count = sum(
-                    1
-                    for position in broker_positions
-                    if getattr(position, "asset_class", "") == "us_option"
+            broker_option_count = sum(
+                1
+                for position in broker_positions
+                if getattr(position, "asset_class", "") == "us_option"
+            )
+            if broker_option_count >= OPTIONS_MAX_POSITIONS:
+                log.info(
+                    f"[OPTIONS] Broker option cap reached "
+                    f"({broker_option_count}/{OPTIONS_MAX_POSITIONS}) — skipping {signal.symbol}"
                 )
-                if broker_option_count >= OPTIONS_MAX_POSITIONS:
-                    log.info(
-                        f"[OPTIONS] Broker option cap reached "
-                        f"({broker_option_count}/{OPTIONS_MAX_POSITIONS}) — skipping {signal.symbol}"
-                    )
-                    return False
+                return False
         except Exception as e:
             log.warning(f"[OPTIONS] Could not verify portfolio position count: {e} — skipping entry")
             return False
@@ -1136,6 +1141,15 @@ class OptionsExecutor:
                 is_spread = True
                 is_mleg   = True
         # ── End 4b ───────────────────────────────────────────────────────────
+
+            is_live_probe = (
+                OPTIONS_LIVE_PROBE_MODE
+                and not is_mleg
+                and signal.action == "buy_to_open"
+                and signal.strategy != "LiveProbeATMScaleIn"
+            )
+            if is_live_probe:
+                contracts = 1
 
         try:
             # NO INTERNAL CALCULATIONS — all pricing from market data (Schwab)
@@ -1419,6 +1433,7 @@ class OptionsExecutor:
                 is_naked=_is_naked_entry,
                 open_stop_pct=_open_stop_pct,
                 entry_confidence=signal.confidence,  # NEW: Store confidence for tiered profit logic
+                    is_live_probe=is_live_probe,
             )
 
             leg_summary = ", ".join(
@@ -1670,6 +1685,15 @@ class OptionsExecutor:
                     f"mark=${current_mark:.2f} entry=${entry_mark:.2f} "
                     f"pnl={pnl_pct:+.1f}% peak={pos.peak_pnl_pct:.1f}%"
                 )
+
+                if pos.is_live_probe and not is_mleg and pnl_pct <= -OPTIONS_LIVE_PROBE_STOP_LOSS_PCT:
+                    log.warning(
+                        f"OPTIONS PROBE: {pos.symbol} stop hit ({pnl_pct:.1f}% <= "
+                        f"-{OPTIONS_LIVE_PROBE_STOP_LOSS_PCT:.0f}%) — closing"
+                    )
+                    to_close.append(occ_sym)
+                    stop_symbols.append(pos.symbol)
+                    continue
 
                 # 4. Exit decision  (same_day_entry / pdt_block computed at top of loop)
 

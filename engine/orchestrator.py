@@ -194,6 +194,9 @@ def _run_options_cycle(ctx: AppContext, market_state: MarketState) -> None:
 
     try:
         ctx.options_executor.monitor_positions()
+        if not cfg.OPTIONS_STANDALONE_ENTRIES_ENABLED:
+            log.info("[OPTIONS] Standalone entries disabled — monitoring only")
+            return
         if market_state.is_options_lull_hours:
             log.info("[OPTIONS] Lull period — monitoring only, no new entries")
             return

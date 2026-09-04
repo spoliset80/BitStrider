@@ -26,6 +26,7 @@ OPTIONS_BROKER = "alpaca"                               # Only Alpaca supports o
 # covered calls on held positions. Expiry: 7–21 DTE (near-term).
 # ─────────────────────────────────────────────────────────────────
 OPTIONS_ENABLED             = os.getenv("OPTIONS_ENABLED", "true").lower() in ("1", "true", "yes")
+OPTIONS_STANDALONE_ENTRIES_ENABLED = os.getenv("OPTIONS_STANDALONE_ENTRIES_ENABLED", "true").lower() in ("1", "true", "yes")
 OPTIONS_ALLOCATION_PCT      = float(os.getenv("OPTIONS_ALLOCATION_PCT", "15.0"))  # % of equity for all options (override via .env)
 OPTIONS_MAX_POSITIONS       = int(os.getenv("OPTIONS_MAX_POSITIONS", "4"))        # max open options positions total
 OPTIONS_MAX_MLEG_POSITIONS  = int(os.getenv("OPTIONS_MAX_MLEG_POSITIONS", "2"))   # hard limit: max open spreads/butterflies/condors
@@ -73,6 +74,8 @@ OPTIONS_EARNINGS_AVOID_DAYS = int(os.getenv("OPTIONS_EARNINGS_AVOID_DAYS", "15")
 # Trailing stop: locks in gains after big moves. Tight for aggressive no-PDT trading.
 OPTIONS_TRAIL_ACTIVATE_PCT  = float(os.getenv("OPTIONS_TRAIL_ACTIVATE_PCT", "15.0"))  # was 25% — trailing stop arms at +15% P&L (aggressive)
 OPTIONS_TRAIL_DRAWDOWN_PCT  = float(os.getenv("OPTIONS_TRAIL_DRAWDOWN_PCT", "10.0"))  # was 20% — close if drops 10pp from peak (tight exit)
+OPTIONS_LIVE_PROBE_MODE = os.getenv("OPTIONS_LIVE_PROBE_MODE", "false").lower() in ("1", "true", "yes")
+OPTIONS_LIVE_PROBE_STOP_LOSS_PCT = float(os.getenv("OPTIONS_LIVE_PROBE_STOP_LOSS_PCT", "10.0"))
 
 # Spread-Specific Stop-Loss Strategy (NEW)
 # ─────────────────────────────────────────────────────────────────
