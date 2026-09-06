@@ -5,7 +5,7 @@ ATR-based tier assignment (with 15-min cache) and risk-adjusted position sizing.
 
 Design notes:
   - get_dynamic_tier() is the single source of truth for TS/TP parameters.
-    The 15-min TTL means the tier is stable for a full scan cycle — no per-signal
+    The 15-min TTL means the tier is stable for a full scan cycle -- no per-signal
     Alpaca bar fetches on the hot execution path.
   - calculate_risk_adjusted_size() uses local effective_* variables instead of
     mutating imported config names, which was a silent source of confusion.
@@ -21,9 +21,9 @@ from typing import Dict
 
 _log = logging.getLogger("ApexTrader")
 
-# ── ATR tier cache ────────────────────────────────────────────────────────────
+# -- ATR tier cache ------------------------------------------------------------
 # Keyed by symbol. Each entry: {"result": dict, "ts": float (monotonic)}.
-# TTL of 900s (15 min) — ATR tiers are stable across a trading session and
+# TTL of 900s (15 min) -- ATR tiers are stable across a trading session and
 # only need refreshing after a major intraday vol regime shift.
 _tier_cache: Dict[str, dict] = {}
 _TIER_CACHE_TTL = 900
@@ -33,7 +33,7 @@ def get_dynamic_tier(symbol: str, price: float = None) -> dict:
     """Return ATR-based TP/TS tier info for *symbol*.
 
     Result is cached per symbol for _TIER_CACHE_TTL seconds to avoid repeated
-    Alpaca bar fetches during scan cycles (previously 8–15 calls per cycle).
+    Alpaca bar fetches during scan cycles (previously 8-15 calls per cycle).
 
     Returns a dict with keys: tier, tp, ts[, atr_pct]
     """
@@ -45,7 +45,7 @@ def get_dynamic_tier(symbol: str, price: float = None) -> dict:
         EXTREME_MOMENTUM_STOCKS, HIGH_MOMENTUM_STOCKS,
     )
 
-    # ── Static tier lists (when dynamic tiers disabled) ───────────────────────
+    # -- Static tier lists (when dynamic tiers disabled) -----------------------
     if not USE_DYNAMIC_TIERS:
         if symbol in EXTREME_MOMENTUM_STOCKS:
             return {"tier": "EXTREME", "tp": TAKE_PROFIT_EXTREME, "ts": TRAILING_STOP_EXTREME}
@@ -53,13 +53,13 @@ def get_dynamic_tier(symbol: str, price: float = None) -> dict:
             return {"tier": "HIGH", "tp": TAKE_PROFIT_HIGH, "ts": TRAILING_STOP_HIGH}
         return {"tier": "MEDIUM", "tp": TAKE_PROFIT_MEDIUM, "ts": TRAILING_STOP_MEDIUM}
 
-    # ── Cache hit ─────────────────────────────────────────────────────────────
+    # -- Cache hit -------------------------------------------------------------
     now = time.monotonic()
     cached = _tier_cache.get(symbol)
     if cached and (now - cached["ts"]) < _TIER_CACHE_TTL:
         return cached["result"]
 
-    # ── ATR calculation ───────────────────────────────────────────────────────
+    # -- ATR calculation -------------------------------------------------------
     _NORMAL = {"tier": "NORMAL", "tp": TAKE_PROFIT_NORMAL, "ts": TRAILING_STOP_NORMAL}
 
     try:
@@ -100,7 +100,7 @@ def calculate_risk_adjusted_size(account_balance: float, symbol: str, price: flo
     """Return position-sizing metadata for an entry.
 
     Uses local effective_* variables rather than reassigning imported config
-    constants — the original code's implicit local rebind was misleading.
+    constants -- the original code's implicit local rebind was misleading.
 
     Returns a dict with keys: tier, allocation_pct, dollar_amount,
                                stop_loss_pct, tp, atr_pct
@@ -131,7 +131,7 @@ def calculate_risk_adjusted_size(account_balance: float, symbol: str, price: flo
             "atr_pct":        tier_info.get("atr_pct", 0),
         }
 
-    # Risk-equalised sizing: scale position so that a 1× ATR move costs
+    # Risk-equalised sizing: scale position so that a 1x ATR move costs
     # exactly effective_risk_pct of account equity, capped at effective_pos_pct.
     calc_pos_size_pct  = (effective_risk_pct / stop_loss_pct) * 100
     final_pos_size_pct = min(calc_pos_size_pct, effective_pos_pct)

@@ -1,0 +1,8 @@
+# Tickers listed here are permanently excluded from ApexTrader.
+# They will never be scanned, never enter universe.json, and any
+# signal for them is rejected at order execution as a last resort.
+#
+# One ticker per symbol, uppercase. Lines starting with # are ignored.
+# Edits take effect on the next scan cycle -- no restart needed.
+TSLA
+GME

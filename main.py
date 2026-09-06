@@ -12,25 +12,18 @@ LOCK_FILE = Path(__file__).parent / ".mainbot.lock"
 def _is_pid_running(pid: int) -> bool:
     if pid <= 0:
         return False
-    if os.name == "nt":
-        try:
-            import ctypes
-            kernel32 = ctypes.windll.kernel32
-            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-            handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
-            if handle:
-                kernel32.CloseHandle(handle)
-                return True
-            return False
-        except Exception:
-            return False
     try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
+        import psutil
+        if not psutil.pid_exists(pid):
+            return False
+        proc = psutil.Process(pid)
+        if proc.status() == psutil.STATUS_ZOMBIE:
+            return False
+        cmdline = " ".join(proc.cmdline()).lower()
+        # Guard against pure PID-number reuse by an unrelated Python process.
+        return "python" in proc.name().lower() and str(Path(__file__).resolve()).lower() in cmdline
+    except Exception:
         return False
-    except PermissionError:
-        return True
-    return True
 
 
 def handle_lock():
@@ -65,11 +58,14 @@ def main():
     # 1. Load credentials
     load_dotenv()
 
-    # 1a. Ensure we are running under the repository virtualenv if it exists.
-    repo_venv = Path(__file__).parent / ".venv" / "Scripts" / "python.exe"
-    if repo_venv.exists() and Path(sys.executable).resolve() != repo_venv.resolve():
+    # 1a. Ensure we are running under the machine-local ApexTrader virtualenv,
+    # if it exists. Machine-local (not inside this OneDrive-synced repo) to
+    # match watchdog.py / run_local_ps.ps1 — see engine/watchdog.py's VENV_DIR
+    # comment for why a repo-local venv breaks across synced machines.
+    managed_venv = Path(os.environ.get("LOCALAPPDATA", str(Path.home() / "AppData" / "Local"))) / "ApexTrader" / "venv" / "Scripts" / "python.exe"
+    if managed_venv.exists() and Path(sys.executable).resolve() != managed_venv.resolve():
         print(
-            f"ERROR: Please run ApexTrader using {repo_venv}.\n"
+            f"ERROR: Please run ApexTrader using {managed_venv}.\n"
             f"Current interpreter: {sys.executable}"
         )
         sys.exit(1)

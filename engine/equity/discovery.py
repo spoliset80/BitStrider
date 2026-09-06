@@ -1,14 +1,16 @@
 """
-ApexTrader — Discovery
-Manages live trending-stock scans and Trade Ideas universe refresh.
-Extracted from main.py to keep the main entry point lean.
+ApexTrader -- Discovery
+Manages live trending-stock scans, EDGAR 8-K and Alpaca-movers universe
+refresh. Extracted from main.py to keep the main entry point lean.
 """
 
 from __future__ import annotations
 
 import concurrent.futures
 import datetime
+import json
 import logging
+import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -24,43 +26,110 @@ from engine.utils import (
     check_sentiment_gate,
 )
 from engine.config import PRIORITY_1_MOMENTUM as _P1, PRIORITY_2_ESTABLISHED as _P2
-from engine.ti.ti import get_scans, is_valid_ti_ticker, scrape_tradeideas
+from engine.ti.yahoo_universe import _is_valid_ti_ticker as is_valid_ti_ticker
 
 log = logging.getLogger("ApexTrader")
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
+REPO_ROOT = Path(__file__).resolve().parent.parent.parent  # engine/equity/discovery.py -> equity -> engine -> repo root
 
-# ── Module-level state ─────────────────────────────────────────────────────
+# -- Module-level state -----------------------------------------------------
 trending_stocks:           List[Dict] = []
 last_trending_scan:        float      = 0.0
-# Tickers discovered via trending feeds — kept separately so we never mutate
+# Tickers discovered via trending feeds -- kept separately so we never mutate
 # the imported config list (PRIORITY_1_MOMENTUM is a module-level constant).
 _discovered_trending:      List[str]  = []
-last_ti_scan:              float      = 0.0
-last_ti_options_scan:      float      = 0.0
-last_ti_toplists_scan:     float      = 0.0
-last_sympathy_scan:        float      = 0.0
 last_edgar_scan:           float      = 0.0
-# Sympathy + EDGAR tickers queued for the NEXT scan cycle.
-# get_scan_targets() pops these to the front so they are guaranteed to be scanned.
-_priority_scan_queue:      List[str]  = []
+# 2026-09-01: the sympathy/EDGAR/watchlist _priority_scan_queue was removed
+# with options trading -- its only consumer was the options scanner
+# (engine/options/strategies.py via get_priority_scan_queue). Equity scan
+# has used TI top-N + _alpaca_movers_queue only since 2026-08-26.
+# 2026-08-26, user request: Alpaca-movers tickers get their OWN queue so the
+# equity scan can include movers while still excluding EDGAR/sympathy/
+# watchlist (which used to share a single priority queue -- removed 2026-09-01,
+# see the note above).
+# 2026-08-27, user request ("the top 30 list seems to be not aligned with
+# the morning runners"): originally shared the old priority queue's 60-min
+# TTL -- confirmed live this evicted genuinely still-active
+# movers, not just dead ones (WKSP/WNW/BTCT/CRM: added 08:35 ET, aged out
+# 09:35, RE-QUALIFIED as movers again at 09:55 -- proving they were still
+# real, just absent from the scan universe for a ~20-min gap in between --
+# and NOWL's re-entry got explicitly blocked at 10:27 ET because the TTL had
+# dropped it from the top-30 at 10:14). Alpaca-movers entries are already
+# activity-confirmed at add time (trade_count >= 10K, real price/move bands)
+# unlike a one-off EDGAR/sympathy news trigger, and is_dead_ticker() (engine/
+# utils/bars.py, immediate-suppression as of last night) already prunes
+# genuinely inactive names on the very next fetch -- the TTL added no real
+# safety on top of that, just an unwanted eviction. Now reset once per
+# trading day (see _alpaca_movers_day below) instead of rolling-windowed.
+_alpaca_movers_queue:      Dict[str, float] = {}
+_alpaca_movers_day: Optional[datetime.date] = None  # date of the last reset -- see scan_alpaca_movers
+
+# 2026-08-27, user request ("I have lost most of my gains due to these
+# bugs"): _alpaca_movers_queue was pure in-memory with zero disk
+# persistence -- every one of today's several restarts silently wiped the
+# ENTIRE queue back to empty, independent of the TTL bug fixed just above.
+# CRM/CRWD and 13 other names confirmed as real movers earlier today
+# (DAIC, NCPL, OKTA, CELU, YJ, BRNX, NVDX, NVDL, NMTC, MERC, NOWL, AZIO,
+# WNW, PURR) were lost this way, not just by the TTL. Persisted the same
+# way universe.json/ti_primary.json already are (engine/equity/universe.py)
+# -- load once at import, save on every mutation (add + daily reset) --
+# so a restart mid-session no longer costs the day's confirmed movers.
+_MOVERS_QUEUE_FILE = REPO_ROOT / "data" / "alpaca_movers_queue.json"
+
+
+def _load_movers_queue_from_disk() -> None:
+    """Populate _alpaca_movers_queue/_alpaca_movers_day from disk at import
+    time. A file from a PRIOR trading day is intentionally ignored here
+    (left for scan_alpaca_movers's own date check to clear on its next
+    call) rather than special-cased twice -- same "only today's date
+    counts" rule, one place."""
+    global _alpaca_movers_queue, _alpaca_movers_day
+    if not _MOVERS_QUEUE_FILE.exists():
+        return
+    try:
+        raw = json.loads(_MOVERS_QUEUE_FILE.read_text(encoding="utf-8"))
+        saved_date = datetime.date.fromisoformat(raw["date"])
+        if saved_date != datetime.date.today():
+            return  # stale (yesterday or older) -- leave empty, don't restore
+        _alpaca_movers_queue = {str(k): float(v) for k, v in raw.get("tickers", {}).items()}
+        _alpaca_movers_day = saved_date
+        if _alpaca_movers_queue:
+            log.info(f"[ALPACA-MOVERS-QUEUE] Restored {len(_alpaca_movers_queue)} ticker(s) from disk after restart: {list(_alpaca_movers_queue.keys())}")
+    except Exception as e:
+        log.warning(f"[ALPACA-MOVERS-QUEUE] Failed to load {_MOVERS_QUEUE_FILE.name} (non-fatal, starting empty): {e}")
+
+
+def _save_movers_queue_to_disk() -> None:
+    """Write the current queue to disk. Best-effort -- a save failure must
+    never block the caller (an add or a daily reset) from completing."""
+    try:
+        _MOVERS_QUEUE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        _MOVERS_QUEUE_FILE.write_text(
+            json.dumps({"date": str(datetime.date.today()), "tickers": _alpaca_movers_queue}, indent=2),
+            encoding="utf-8",
+        )
+    except Exception as e:
+        log.warning(f"[ALPACA-MOVERS-QUEUE] Failed to save {_MOVERS_QUEUE_FILE.name} (non-fatal): {e}")
+
+_load_movers_queue_from_disk()
+
 last_alpaca_mover_scan:    float      = 0.0
-_ti_started_at:            float      = 0.0
-_ti_warned_running:        bool       = False
-_ti_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-_ti_future: Optional[concurrent.futures.Future] = None
 
 
-def get_priority_scan_queue() -> List[str]:
-    """Return the current sympathy/EDGAR/screener tickers (read-only peek).
+def get_alpaca_movers_queue() -> List[str]:
+    """Return current Alpaca-movers tickers (read-only peek).
 
-    Does NOT drain the queue — symbols remain until the next screener/discovery
-    refresh replaces them, so both equity and options scans see the same set.
+    2026-08-27: no longer TTL-pruned here -- see the module comment above
+    _alpaca_movers_queue's declaration. Reset once per trading day by
+    scan_alpaca_movers instead; is_dead_ticker (engine/utils/bars.py) prunes
+    genuinely inactive names.
     """
-    return list(_priority_scan_queue)
+    return list(_alpaca_movers_queue.keys())
 
 
 @dataclass
+
+
 class PreopenSignalProvider:
     name: str
     apply: Callable[["PreopenIntelligenceScanner", dict[str, dict], MarketState, list, list, int, "PreopenSignalProvider"], None]
@@ -82,37 +151,11 @@ class PreopenIntelligenceScanner:
     def get_watchlist(self) -> List[str]:
         return [item["symbol"] for item in self.watchlist]
 
-    def register_provider(self, provider: PreopenSignalProvider) -> None:
-        self.providers.append(provider)
-
-    def clear_providers(self) -> None:
-        self.providers.clear()
-
-    def set_providers(self, providers: List[PreopenSignalProvider]) -> None:
-        self.providers = list(providers)
-
-    def get_provider_metrics(self) -> Dict[str, Dict[str, float]]:
-        return {name: dict(metrics) for name, metrics in self.signal_performance.items()}
-
     def _get_provider_weight(self, name: str) -> float:
         for provider in self.providers:
             if provider.name == name:
                 return provider.weight
         return 1.0
-
-    def adjust_provider_weights(self) -> None:
-        for provider in self.providers:
-            metrics = self.signal_performance.get(provider.name, {})
-            hits = metrics.get("hits", 0.0)
-            contributions = metrics.get("contributions", 1.0)
-            if contributions > 0:
-                provider.weight = max(0.25, min(2.0, hits / contributions if contributions else 1.0))
-
-    def record_provider_outcome(self, provider_name: str, symbol: str, success: bool) -> None:
-        perf = self.signal_performance.setdefault(provider_name, {"runs": 0.0, "contributions": 0.0, "hits": 0.0})
-        perf["runs"] += 1.0
-        if success:
-            perf["hits"] += 1.0
 
     def scan(
         self,
@@ -150,7 +193,6 @@ class PreopenIntelligenceScanner:
         self._run_providers(scores, market_state, priority_1, priority_2, max_watchlist)
         self.watchlist = self._build_watchlist(scores, max_watchlist)
 
-        self._inject_watchlist_to_priority_queue(priority_1, priority_2)
         self._log_watchlist_summary(market_state)
 
     def _register_default_providers(self) -> None:
@@ -164,11 +206,6 @@ class PreopenIntelligenceScanner:
                 name="finnhub",
                 apply=self._provider_finnhub,
                 description="Finnhub trending and stock momentum candidates",
-            ),
-            PreopenSignalProvider(
-                name="priority_queue",
-                apply=self._provider_priority_queue,
-                description="Existing high-priority tickers from sympathy/EDGAR/scan backlog",
             ),
             PreopenSignalProvider(
                 name="universe_seed",
@@ -261,18 +298,6 @@ class PreopenIntelligenceScanner:
         for sym in finn_tickers:
             self._add_candidate(scores, sym, 0.8 * provider.weight, "finnhub", provider_name=provider.name)
 
-    def _provider_priority_queue(
-        self,
-        scores: dict[str, dict],
-        market_state: MarketState,
-        priority_1: list,
-        priority_2: list,
-        max_watchlist: int,
-        provider: PreopenSignalProvider,
-    ) -> None:
-        for sym in _priority_scan_queue:
-            self._add_candidate(scores, sym, 1.5 * provider.weight, "priority-queue", provider_name=provider.name)
-
     def _provider_universe_seed(
         self,
         scores: dict[str, dict],
@@ -298,14 +323,23 @@ class PreopenIntelligenceScanner:
         max_watchlist: int,
         provider: PreopenSignalProvider,
     ) -> None:
+        # check_sentiment_gate() is a per-symbol network call; fetch all of
+        # them concurrently (same pattern as scan_universe's ThreadPoolExecutor)
+        # instead of one-by-one, which was the dominant cost in this provider.
+        from engine.config import SCAN_WORKERS
+        symbols = list(scores.keys())
         sentiment_cache: dict[str, tuple[bool, float]] = {}
+        with concurrent.futures.ThreadPoolExecutor(max_workers=SCAN_WORKERS) as pool:
+            future_map = {pool.submit(check_sentiment_gate, s): s for s in symbols}
+            for future in concurrent.futures.as_completed(future_map):
+                s = future_map[future]
+                try:
+                    sentiment_cache[s] = future.result()
+                except Exception:
+                    sentiment_cache[s] = (True, 0.5)
 
-        for symbol in list(scores.keys()):
-            if symbol in sentiment_cache:
-                allow, bullish_pct = sentiment_cache[symbol]
-            else:
-                allow, bullish_pct = check_sentiment_gate(symbol)
-                sentiment_cache[symbol] = (allow, bullish_pct)
+        for symbol in symbols:
+            allow, bullish_pct = sentiment_cache[symbol]
 
             if allow:
                 self._add_candidate(scores, symbol, 0.25 * provider.weight, "news-bullish", provider_name=provider.name)
@@ -332,8 +366,25 @@ class PreopenIntelligenceScanner:
         max_watchlist: int,
         provider: PreopenSignalProvider,
     ) -> None:
+        from engine.config import SCAN_WORKERS
         ranked = sorted(scores.values(), key=lambda d: d["score"], reverse=True)
         premkt_candidates = [item["symbol"] for item in ranked[: max_watchlist * 2]]
+
+        # Pre-warm the bar cache concurrently -- _score_premarket's own
+        # get_premarket_bars()/get_bars() calls then hit cache instead of
+        # each doing its two network calls one-by-one in a serial loop.
+        def _prefetch(symbol: str) -> None:
+            get_premarket_bars(symbol)
+            get_bars(symbol, "2d", "1d")
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=SCAN_WORKERS) as pool:
+            futures = [pool.submit(_prefetch, s) for s in premkt_candidates]
+            for future in concurrent.futures.as_completed(futures):
+                try:
+                    future.result()
+                except Exception:
+                    pass  # _score_premarket has its own try/except and handles empty data
+
         for symbol in premkt_candidates:
             self._score_premarket(symbol, scores, provider)
 
@@ -375,19 +426,6 @@ class PreopenIntelligenceScanner:
         ranked = sorted(scores.values(), key=lambda d: d["score"], reverse=True)
         return ranked[:max_watchlist]
 
-    def _inject_watchlist_to_priority_queue(self, priority_1: list, priority_2: list) -> None:
-        added = []
-        qset = set(_priority_scan_queue)
-        for item in self.watchlist:
-            sym = item["symbol"]
-            if sym in qset or sym in priority_1 or sym in priority_2:
-                continue
-            _priority_scan_queue.append(sym)
-            qset.add(sym)
-            added.append(sym)
-        if added:
-            log.info(f"[PREOPEN] Injected {len(added)} pre-open watchlist tickers into priority queue")
-
     def _log_watchlist_summary(self, market_state: MarketState) -> None:
         sentiment_label = "bull" if market_state.resolve_sentiment() == "bull" else "bear"
         if not self.watchlist:
@@ -402,7 +440,7 @@ class PreopenIntelligenceScanner:
         log.info(
             f"[PREOPEN] Intelligence watchlist ({sentiment_label}, "
             f"regime={market_state.regime}): top {len(self.watchlist)} "
-            f"tickers → {', '.join(top_list)}"
+            f"tickers -> {', '.join(top_list)}"
         )
 
         if self.signal_performance:
@@ -412,15 +450,9 @@ class PreopenIntelligenceScanner:
                     f"{name}=w{self._get_provider_weight(name):.2f}/"
                     f"{int(metrics.get('hits', 0))}/{int(metrics.get('contributions', 0))}"
                 )
-            log.info(f"[PREOPEN] Provider performance → {', '.join(provider_stats)}")
-
+            log.info(f"[PREOPEN] Provider performance -> {', '.join(provider_stats)}")
 
 _preopen_intelligence_scanner = PreopenIntelligenceScanner()
-
-
-def get_preopen_watchlist() -> List[str]:
-    """Return the current pre-open intelligence watchlist."""
-    return _preopen_intelligence_scanner.get_watchlist()
 
 
 def scan_preopen_intelligence(
@@ -444,12 +476,6 @@ def scan_preopen_intelligence(
         use_regime_gating=use_regime_gating,
         use_sentiment_gating=use_sentiment_gating,
     )
-
-# ── Trending scan ──────────────────────────────────────────────────────────
-
-def get_discovered_trending() -> List[str]:
-    """Return tickers found by trending scans this session (read-only copy)."""
-    return list(_discovered_trending)
 
 
 def scan_trending_stocks(
@@ -483,7 +509,7 @@ def scan_trending_stocks(
     )
 
     try:
-        log.info("[SCAN] Scanning for live trending stocks…")
+        log.info("[SCAN] Scanning for live trending stocks...")
         all_tickers: List[str] = []
 
         if use_live_trending:
@@ -499,7 +525,7 @@ def scan_trending_stocks(
         unique = list(set(all_tickers))
 
         if not unique:
-            log.info("[SCAN] No trending tickers found — using existing universe")
+            log.info("[SCAN] No trending tickers found -- using existing universe")
             trending_stocks    = [{"symbol": s, "momentum_pct": 0, "current_price": 0}
                                    for s in priority_1[:trending_max]]
             last_trending_scan = now
@@ -508,7 +534,7 @@ def scan_trending_stocks(
         momentum_stocks = filter_trending_momentum(unique, trending_min_momentum)
 
         if not momentum_stocks:
-            log.info(f"[SCAN] No trending stocks with >{trending_min_momentum}% momentum — using universe")
+            log.info(f"[SCAN] No trending stocks with >{trending_min_momentum}% momentum -- using universe")
             trending_stocks    = [{"symbol": s, "momentum_pct": 0, "current_price": 0}
                                    for s in priority_1[:trending_max]]
             last_trending_scan = now
@@ -527,7 +553,7 @@ def scan_trending_stocks(
         new_stocks = [s for s in momentum_stocks if s["symbol"] not in priority_1]
         if new_stocks:
             log.info(f"[SCAN] Found {len(new_stocks)} new trending stocks: " + ", ".join(f"{s['symbol']} (+{s['momentum_pct']:.1f}% @ ${s['current_price']:.2f})" for s in new_stocks[:5]))
-            # Store in module-level set — never mutate the config list
+            # Store in module-level set -- never mutate the config list
             _discovered_syms = {s for s in _discovered_trending}
             for s in new_stocks:
                 if s["symbol"] not in _discovered_syms:
@@ -543,290 +569,19 @@ def scan_trending_stocks(
                            for s in priority_1[:trending_max]]
 
 
-# ── Trade Ideas universe refresh ───────────────────────────────────────────
-
-def _apply_tradeideas_results(results: dict, scans: dict, priority_1: list, priority_2: list) -> None:
-    """Merge TI scrape results into *priority_1* / *priority_2* lists in-place."""
-    from engine.config import PRIORITY_1_MOMENTUM as _P1, PRIORITY_2_ESTABLISHED as _P2
-
-    by_dest: dict = {
-        "PRIORITY_1_MOMENTUM":   [],
-        "PRIORITY_2_ESTABLISHED": [],
-    }
-
-    for scan_key, tickers in results.items():
-        if scan_key in scans:
-            target_list_name = scans[scan_key]["target"]
-            label            = scans[scan_key]["label"]
-            if target_list_name == "BOTH":
-                continue
-        elif scan_key.endswith("_leaders"):
-            target_list_name = "PRIORITY_1_MOMENTUM"
-            label            = "stock_race_central_leaders"
-        elif scan_key.endswith("_laggards"):
-            target_list_name = "PRIORITY_2_ESTABLISHED"
-            label            = "stock_race_central_laggards"
-        else:
-            continue
-
-        valid = [t for t in tickers if is_valid_ti_ticker(t)]
-        if len(valid) < 5:
-            log.warning(
-                f"Trade Ideas {label}: only {len(valid)} valid ticker(s) after filtering "
-                f"(need ≥5) — likely a login-page scrape or empty scan; "
-                f"skipping to preserve {target_list_name}"
-            )
-            continue
-        by_dest[target_list_name].append((label, valid))
-
-    PRIMARY_SLOTS   = 35
-    SECONDARY_SLOTS = 50 - PRIMARY_SLOTS
-
-    for target_list_name, sources in by_dest.items():
-        if not sources:
-            continue
-
-        dest        = priority_1 if target_list_name == "PRIORITY_1_MOMENTUM" else priority_2
-        existing_set = set(dest)
-
-        if len(sources) == 1:
-            merged = sources[0][1][:]
-        else:
-            seen: set = set()
-            primary_part: List[str] = []
-            for t in sources[0][1]:
-                if len(primary_part) >= PRIMARY_SLOTS:
-                    break
-                if t not in seen:
-                    primary_part.append(t)
-                    seen.add(t)
-
-            secondary_part: List[str] = []
-            for _, src in sources[1:]:
-                for t in src:
-                    if len(secondary_part) >= SECONDARY_SLOTS:
-                        break
-                    if t not in seen:
-                        secondary_part.append(t)
-                        seen.add(t)
-            merged = primary_part + secondary_part
-
-        merged_set = set(merged)
-        new_tickers = [t for t in merged if t not in existing_set]
-        fresh       = [t for t in merged if t in existing_set]
-        demote      = [t for t in dest  if t not in merged_set]
-
-        dest.clear()
-        dest.extend(merged[:50])
-        for t in demote:
-            if t not in merged_set and t not in dest:
-                dest.append(t)
-
-        labels = " + ".join(f"{s[0]}({len(s[1])})" for s in sources)
-        if new_tickers:
-            log.info(
-                f"Trade Ideas [{target_list_name}] {labels}: "
-                f"+{len(new_tickers)} new, {len(fresh)} existing → top-10: {merged[:10]}"
-            )
-        else:
-            log.info(
-                f"Trade Ideas [{target_list_name}] {labels}: "
-                f"{len(fresh)} merged → top-10: {merged[:10]}"
-            )
-        log.info(
-            f"── TI top-20 [{target_list_name}] "
-            f"(primary={len(sources[0][1]) if sources else 0} "
-            f"secondary={sum(len(s[1]) for s in sources[1:]) if len(sources) > 1 else 0}): "
-            + ", ".join(dest[:20])
-        )
-
-
-def scan_tradeideas_universe(
+def scan_edgar(
     *,
-    enabled: bool,
-    scan_interval_min: float,
-    headless: bool,
-    chrome_profile,
-    update_config: bool,
-    priority_1: list,
-    priority_2: list,
-    browser: str = "edge",
-    remote_debug_port: int = 9222,
-) -> None:
-    """Submit or check a background TI scrape for core Trade Ideas pages."""
-    global last_ti_scan, _ti_future, _ti_started_at, _ti_warned_running
-
-    if not enabled:
-        return
-
-    try:
-        SCANS = get_scans()
-    except ImportError as e:
-        log.warning(f"Trade Ideas scraper unavailable (selenium not installed?): {e}")
-        last_ti_scan = time.time()
-        return
-
-    now = time.time()
-
-    # 1) Apply finished results.
-    if _ti_future is not None and _ti_future.done():
-        try:
-            results = _ti_future.result()
-            _apply_tradeideas_results(results, SCANS, priority_1, priority_2)
-        except Exception as e:
-            log.error(f"Trade Ideas scan failed: {e}")
-        finally:
-            _ti_future         = None
-            _ti_warned_running = False
-            last_ti_scan       = now
-
-    # 2) If still running, back off with escalating timeouts.
-    if _ti_future is not None:
-        elapsed = now - _ti_started_at
-        if elapsed > 180:
-            log.error(
-                f"Trade Ideas scrape hard-timeout ({elapsed:.0f}s) — "
-                "killing Chrome/chromedriver and resetting future"
-            )
-            import subprocess as _hk
-            for _exe in ("chromedriver.exe", "chrome.exe"):
-                try:
-                    _hk.run(["taskkill", "/F", "/IM", _exe, "/T"],
-                            capture_output=True, timeout=5)
-                except Exception:
-                    pass
-            _ti_future         = None
-            _ti_warned_running = False
-            last_ti_scan       = now
-            return
-        if elapsed > 90 and not _ti_warned_running:
-            log.warning(f"Trade Ideas scan still running ({elapsed:.0f}s) — trading loop continues")
-            _ti_warned_running = True
-        return
-
-    # 3) Schedule next scrape when due.
-    if (now - last_ti_scan) < (scan_interval_min * 60):
-        return
-
-    ti_profile  = (chrome_profile or "").strip() or None
-
-    log.info(
-        f"Scanning Trade Ideas core pages in background (browser=edge, profile={ti_profile or 'none'}) …"
-    )
-    _ti_started_at     = now
-    _ti_warned_running = False
-    _ti_future         = _ti_executor.submit(
-        scrape_tradeideas,
-        update_config=update_config,
-        chrome_profile=ti_profile,
-        select_minutes=15,
-        scan_keys=["marketscope360", "highshortfloat"],
-        remote_debug_port=remote_debug_port,
-    )
-
-
-def scan_tradeideas_unusual_options(
-    *,
-    enabled: bool,
-    scan_interval_min: float,
-    headless: bool,
-    chrome_profile,
-    update_config: bool,
-    priority_1: list,
-    priority_2: list,
-    browser: str = "edge",
-    remote_debug_port: int = 9222,
-) -> None:
-    """Submit or check a background Trade Ideas unusual options scrape."""
-    global last_ti_options_scan, _ti_future, _ti_started_at, _ti_warned_running
-
-    if not enabled:
-        return
-
-    try:
-        SCANS = get_scans()
-    except ImportError as e:
-        log.warning(f"Trade Ideas scraper unavailable (selenium not installed?): {e}")
-        last_ti_options_scan = time.time()
-        return
-
-    now = time.time()
-
-    if _ti_future is not None and _ti_future.done():
-        try:
-            results = _ti_future.result()
-            _apply_tradeideas_results(results, SCANS, priority_1, priority_2)
-        except Exception as e:
-            log.error(f"Trade Ideas unusual options scan failed: {e}")
-        finally:
-            _ti_future         = None
-            _ti_warned_running = False
-            last_ti_options_scan = now
-
-    if _ti_future is not None:
-        elapsed = now - _ti_started_at
-        if elapsed > 180:
-            log.error(
-                f"Trade Ideas unusual options scrape hard-timeout ({elapsed:.0f}s) — "
-                "killing Chrome/chromedriver and resetting future"
-            )
-            import subprocess as _hk
-            for _exe in ("chromedriver.exe", "chrome.exe"):
-                try:
-                    _hk.run(["taskkill", "/F", "/IM", _exe, "/T"],
-                            capture_output=True, timeout=5)
-                except Exception:
-                    pass
-            _ti_future         = None
-            _ti_warned_running = False
-            last_ti_options_scan = now
-            return
-        if elapsed > 90 and not _ti_warned_running:
-            log.warning(f"Trade Ideas unusual options scan still running ({elapsed:.0f}s) — trading loop continues")
-            _ti_warned_running = True
-        return
-
-    if (now - last_ti_options_scan) < (scan_interval_min * 60):
-        return
-
-    ti_profile  = (chrome_profile or "").strip() or None
-
-    log.info(
-        f"Scanning Trade Ideas unusual options in background (browser=edge, profile={ti_profile or 'none'}) …"
-    )
-    _ti_started_at     = now
-    _ti_warned_running = False
-    _ti_future         = _ti_executor.submit(
-        scrape_tradeideas,
-        update_config=update_config,
-        chrome_profile=ti_profile,
-        select_minutes=15,
-        scan_keys=["unusualoptionsvolume"],
-        remote_debug_port=remote_debug_port,
-    )
-
-
-def scan_sympathy_and_edgar(
-    *,
-    sympathy_enabled: bool,
     edgar_enabled: bool,
-    sympathy_interval_min: float,
     edgar_interval_min: float,
     priority_1: list,
     priority_2: list,
 ) -> None:
     """
-    Sector sympathy + EDGAR 8-K scanner.
-
-    Sympathy: checks leader stocks (via Finnhub quote) for gap/momentum moves
-    that historically pull related peers. Triggered sympathies are injected
-    into priority_1 for immediate scanning.
-
-    EDGAR: polls the SEC 8-K ATOM feed for material filings (supply agreements,
-    contract awards, acquisitions) and injects matched tickers into priority_2
-    for follow-on monitoring.
+    EDGAR 8-K feed scanner: polls the SEC 8-K ATOM feed for material
+    filings (supply agreements, contract awards, acquisitions) and
+    injects matched tickers into priority_2 for follow-on monitoring.
     """
-    global last_sympathy_scan, last_edgar_scan
+    global last_edgar_scan
 
     now = time.time()
     delisted: set = set()
@@ -836,28 +591,7 @@ def scan_sympathy_and_edgar(
     except Exception:
         pass
 
-    # ── Sector sympathy ───────────────────────────────────────────────────
-    if sympathy_enabled and (now - last_sympathy_scan) >= (sympathy_interval_min * 60):
-        try:
-            from engine.data.sector_sympathy import get_active_sympathies
-            sympathies = get_active_sympathies()
-            if sympathies:
-                p1_set = set(priority_1)
-                queue_set = set(_priority_scan_queue)
-                new_syms = [s for s in sympathies if s not in p1_set and s not in delisted]
-                if new_syms:
-                    log.info(f"[SYMPATHY] Injecting {len(new_syms)} sympathy tickers into P1 + scan queue: {new_syms}")
-                    priority_1.extend(new_syms)
-                    for s in new_syms:
-                        if s not in queue_set:
-                            _priority_scan_queue.append(s)
-                            queue_set.add(s)
-        except Exception as exc:
-            log.debug(f"[SYMPATHY] Scan error: {exc}")
-        finally:
-            last_sympathy_scan = now
-
-    # ── EDGAR 8-K feed ───────────────────────────────────────────────────
+    # -- EDGAR 8-K feed ---------------------------------------------------
     if edgar_enabled and (now - last_edgar_scan) >= (edgar_interval_min * 60):
         try:
             from engine.data.edgar_scraper import get_edgar_triggered_tickers
@@ -865,14 +599,11 @@ def scan_sympathy_and_edgar(
             if edgar_tickers:
                 p2_set = set(priority_2)
                 p1_set = set(priority_1)
-                queue_set = set(_priority_scan_queue)
+                now = time.time()
                 for sym in edgar_tickers:
                     if sym not in delisted and sym not in p2_set and sym not in p1_set:
-                        log.info(f"[EDGAR] Adding {sym} to P2 + scan queue for monitoring")
+                        log.info(f"[EDGAR] Adding {sym} to P2 for monitoring")
                         priority_2.append(sym)
-                    if sym not in delisted and sym not in queue_set:
-                        _priority_scan_queue.append(sym)
-                        queue_set.add(sym)
         except Exception as exc:
             log.debug(f"[EDGAR] Scan error: {exc}")
         finally:
@@ -881,15 +612,31 @@ def scan_sympathy_and_edgar(
 
 def scan_alpaca_movers(*, interval_min: float = 10.0, market_state: MarketState) -> None:
     """Fetch Alpaca Most Actives + Market Movers and inject qualifying symbols
-    into the priority scan queue.
+    into the dedicated _alpaca_movers_queue (equity scan) -- the movers-only
+    queue is what lets equity scan include movers while keeping EDGAR/sympathy
+    out (see the module comment above _alpaca_movers_queue's declaration).
 
-    The endpoint resets at market open — data before 09:30 ET is from the
+    The endpoint resets at market open -- data before 09:30 ET is from the
     previous session, so we only run during regular market hours.
     """
-    global last_alpaca_mover_scan, _priority_scan_queue
+    global last_alpaca_mover_scan, _alpaca_movers_queue, _alpaca_movers_day
 
     if not market_state.is_market_open:
         return
+
+    # 2026-08-27, user request ("the top 30 list seems to be not aligned
+    # with the morning runners"): reset the movers-only queue once per
+    # trading day, matching the endpoint's own "resets at market open"
+    # behavior -- replaces the old rolling 60-min TTL, which was evicting
+    # genuinely still-active movers mid-session (see the module comment
+    # above _alpaca_movers_queue's declaration for the live evidence).
+    today = market_state.now.date()
+    if _alpaca_movers_day != today:
+        if _alpaca_movers_queue:
+            log.info(f"[ALPACA-MOVERS-QUEUE] New trading day -- clearing {len(_alpaca_movers_queue)} ticker(s) from the previous session: {list(_alpaca_movers_queue.keys())}")
+        _alpaca_movers_queue = {}
+        _alpaca_movers_day = today
+        _save_movers_queue_to_disk()
 
     now = time.time()
     if now - last_alpaca_mover_scan < interval_min * 60:
@@ -908,11 +655,17 @@ def scan_alpaca_movers(*, interval_min: float = 10.0, market_state: MarketState)
 
         with ThreadPoolExecutor(max_workers=1) as _pool:
             try:
+                # top=100 (API max), not 30: market_movers.gainers (top-%-by-day, market-wide)
+                # and most_actives (top-volume, market-wide) are close to disjoint populations --
+                # wild % movers skew thin/small-cap, top raw-volume skews mega-cap/ETF. At
+                # top=30 the AND of both lists almost never has a member (confirmed: zero
+                # matches across 65 cycles on 2026-08-04, including a 20%+ PLTR day). Same
+                # single API call either way -- just asking for the widest slice the endpoint allows.
                 actives_resp = _pool.submit(
-                    sc.get_most_actives, MostActivesRequest(by=MostActivesBy.VOLUME, top=30)
+                    sc.get_most_actives, MostActivesRequest(by=MostActivesBy.VOLUME, top=100)
                 ).result(timeout=_SCREENER_TIMEOUT)
             except _FuturesTimeout:
-                log.warning("[ALPACA-MOVERS] most_actives timed out — skipping cycle")
+                log.warning("[ALPACA-MOVERS] most_actives timed out -- skipping cycle")
                 return
 
         # Build a set of symbols that cleared the trade-count floor (real participation)
@@ -924,15 +677,15 @@ def scan_alpaca_movers(*, interval_min: float = 10.0, market_state: MarketState)
 
         with ThreadPoolExecutor(max_workers=1) as _pool:
             try:
+                # top=50 (API max), not 20 -- same reasoning as most_actives above.
                 movers_resp = _pool.submit(
-                    sc.get_market_movers, MarketMoversRequest(market_type="stocks", top=20)
+                    sc.get_market_movers, MarketMoversRequest(market_type="stocks", top=50)
                 ).result(timeout=_SCREENER_TIMEOUT)
             except _FuturesTimeout:
-                log.warning("[ALPACA-MOVERS] market_movers timed out — skipping cycle")
+                log.warning("[ALPACA-MOVERS] market_movers timed out -- skipping cycle")
                 return
 
         injected: List[str] = []
-        queue_set = set(_priority_scan_queue)
         delisted  = set(_cfg.DELISTED_STOCKS)
 
         for m in movers_resp.gainers:
@@ -940,7 +693,7 @@ def scan_alpaca_movers(*, interval_min: float = 10.0, market_state: MarketState)
             # Structural filter: warrants/rights have > 5 chars (e.g. BZAIW, GFAIW)
             if len(sym) > 5:
                 continue
-            # Price band: cheap enough for options chains, not so high position-sizing breaks
+            # Price band: wide enough for gap runners, not so high position-sizing breaks
             if not (0.50 <= float(m.price) <= 500.0):
                 continue
             # Move band: meaningful but not a halt/binary-news situation
@@ -949,14 +702,16 @@ def scan_alpaca_movers(*, interval_min: float = 10.0, market_state: MarketState)
             # Volume confirmation: must also appear in most actives
             if sym not in active_syms:
                 continue
-            if sym in queue_set or sym in delisted:
+            if sym in delisted:
                 continue
-            _priority_scan_queue.append(sym)
-            queue_set.add(sym)
+            is_new = sym not in _alpaca_movers_queue
+            now_ts = time.time()
+            _alpaca_movers_queue.setdefault(sym, now_ts)
+            if not is_new:
+                continue  # already tracked -- nothing new to log
+            _save_movers_queue_to_disk()
             injected.append(sym)
-            log.info(
-                f"[ALPACA-MOVERS] Adding {sym} to P2 + scan queue for monitoring"
-            )
+            log.info(f"[ALPACA-MOVERS] Adding {sym} to the movers scan queue")
 
         last_alpaca_mover_scan = now
         if injected:
@@ -968,83 +723,68 @@ def scan_alpaca_movers(*, interval_min: float = 10.0, market_state: MarketState)
         log.warning(f"[ALPACA-MOVERS] Screener fetch failed: {exc}")
 
 
-def scan_tradeideas_toplists(
-    *,
-    enabled: bool,
-    scan_interval_min: float,
-    headless: bool,
-    chrome_profile,
-    update_config: bool,
-    priority_1: list,
-    priority_2: list,
-    browser: str = "edge",
-    remote_debug_port: int = 9222,
-) -> None:
-    """Submit or check a background TI toplist scrape."""
-    global last_ti_toplists_scan, _ti_future, _ti_started_at, _ti_warned_running
-
-    if not enabled:
-        return
-
-    try:
-        SCANS = get_scans()
-    except ImportError as e:
-        log.warning(f"Trade Ideas scraper unavailable (selenium not installed?): {e}")
-        last_ti_toplists_scan = time.time()
-        return
+def _demo() -> None:
+    """Self-check for the alpaca-movers-queue day-reset + disk persistence."""
+    _alpaca_movers_queue.clear()
 
     now = time.time()
+    _alpaca_movers_queue["MOVR"] = now
+    movers = get_alpaca_movers_queue()
+    assert movers == ["MOVR"], f"expected only MOVR in the movers queue, got {movers}"
 
-    if _ti_future is not None and _ti_future.done():
-        try:
-            results = _ti_future.result()
-            _apply_tradeideas_results(results, SCANS, priority_1, priority_2)
-        except Exception as e:
-            log.error(f"Trade Ideas toplists scan failed: {e}")
-        finally:
-            _ti_future         = None
-            _ti_warned_running = False
-            last_ti_toplists_scan = now
+    # 2026-08-27, user request ("the top 30 list seems to be not aligned
+    # with the morning runners"): the movers queue must NOT time-prune --
+    # confirmed live this evicted still-active movers (CRM/OKTA/CRWD/NVDX:
+    # added 08:35 ET, evicted 09:35 ET, still active). A very old timestamp
+    # must survive get_alpaca_movers_queue() -- only a new trading day
+    # (scan_alpaca_movers) or is_dead_ticker (engine/utils/bars.py, applied
+    # downstream in get_scan_targets) may remove it.
+    _alpaca_movers_queue["OLDMOVR"] = 1.0  # 1970 -- as old as a timestamp gets
+    assert "OLDMOVR" in get_alpaca_movers_queue(), "movers queue must not age out entries by elapsed time"
 
-    if _ti_future is not None:
-        elapsed = now - _ti_started_at
-        if elapsed > 180:
-            log.error(
-                f"Trade Ideas toplists scrape hard-timeout ({elapsed:.0f}s) — "
-                "killing Chrome/chromedriver and resetting future"
-            )
-            import subprocess as _hk
-            for _exe in ("chromedriver.exe", "chrome.exe"):
-                try:
-                    _hk.run(["taskkill", "/F", "/IM", _exe, "/T"],
-                            capture_output=True, timeout=5)
-                except Exception:
-                    pass
-            _ti_future         = None
-            _ti_warned_running = False
-            last_ti_toplists_scan = now
-            return
-        if elapsed > 90 and not _ti_warned_running:
-            log.warning(f"Trade Ideas toplists scan still running ({elapsed:.0f}s) — trading loop continues")
-            _ti_warned_running = True
-        return
+    # 2026-08-27, disk-persistence fix ("I have lost most of my gains due to
+    # these bugs"): the movers queue was pure in-memory -- every restart
+    # wiped it, stranding legitimately-active movers. Round-trip through a
+    # temp file (never the real data/alpaca_movers_queue.json) to verify
+    # save -> load survives a process restart, and that a stale (yesterday's)
+    # file is correctly ignored rather than resurrected.
+    import tempfile
+    global _MOVERS_QUEUE_FILE
+    real_file = _MOVERS_QUEUE_FILE
+    tmpdir = tempfile.mkdtemp()
+    try:
+        _MOVERS_QUEUE_FILE = Path(tmpdir) / "movers_test.json"
 
-    if (now - last_ti_toplists_scan) < (scan_interval_min * 60):
-        return
+        _alpaca_movers_queue.clear()
+        _alpaca_movers_queue["PERSIST"] = now
+        _save_movers_queue_to_disk()
+        assert _MOVERS_QUEUE_FILE.exists(), "save must write the file"
 
-    ti_profile  = (chrome_profile or "").strip() or None
+        _alpaca_movers_queue.clear()
+        _load_movers_queue_from_disk()
+        assert _alpaca_movers_queue == {"PERSIST": now}, \
+            f"load must restore exactly what was saved, got {_alpaca_movers_queue}"
 
-    log.info(
-        f"Scanning Trade Ideas toplists in background (browser=edge, profile={ti_profile or 'none'}) …"
-    )
-    _ti_started_at     = now
-    _ti_warned_running = False
-    _ti_future         = _ti_executor.submit(
-        scrape_tradeideas,
-        update_config=update_config,
-        chrome_profile=ti_profile,
-        select_minutes=15,
-        include_toplists=True,
-        scan_keys=["toplists"],
-        remote_debug_port=remote_debug_port,
-    )
+        # A file from a prior trading day must be ignored (daily reset owns
+        # clearing it, not the loader silently resurrecting stale movers).
+        stale = {"date": "2020-01-01", "tickers": {"STALE": now}}
+        _MOVERS_QUEUE_FILE.write_text(json.dumps(stale), encoding="utf-8")
+        _alpaca_movers_queue.clear()
+        _load_movers_queue_from_disk()
+        assert _alpaca_movers_queue == {}, \
+            f"a stale-dated file must not be loaded, got {_alpaca_movers_queue}"
+
+        # A missing/corrupt file must not raise -- restart must still boot.
+        _MOVERS_QUEUE_FILE.write_text("not json", encoding="utf-8")
+        _alpaca_movers_queue.clear()
+        _load_movers_queue_from_disk()  # must not raise
+        assert _alpaca_movers_queue == {}, "corrupt file must load as empty, not raise"
+    finally:
+        _MOVERS_QUEUE_FILE = real_file
+        _alpaca_movers_queue.clear()
+
+    print("discovery._demo: all assertions passed")
+
+
+if __name__ == "__main__":
+    _demo()

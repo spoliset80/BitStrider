@@ -1,5 +1,5 @@
 """
-engine/universe.py — Dynamic universe manager
+engine/universe.py -- Dynamic universe manager
 ===============================================
 All tickers added by Trade Ideas, predict_tomorrow, or manual injection live
 here in ``data/universe.json``.  Tickers expire automatically after their TTL
@@ -18,9 +18,9 @@ Schema (data/universe.json)
 }
 
 TTL rules (configurable via config.py or env):
-  Tier 1 (momentum)   → 30 minutes
-  Tier 2 (established)→ 30 minutes
-  Tier 3 (following)  → 30 minutes
+  Tier 1 (momentum)   -> 30 minutes
+  Tier 2 (established)-> 30 minutes
+  Tier 3 (following)  -> 30 minutes
 
 The 'added' field stores a full ISO-8601 datetime (UTC) so sub-day TTLs work.
 
@@ -36,14 +36,21 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Literal
 
-# ── Paths ─────────────────────────────────────────────────────────────────────
+# -- Paths ---------------------------------------------------------------------
 _REPO_ROOT   = Path(__file__).resolve().parents[2]
 DATA_DIR     = _REPO_ROOT / "data"
 UNIVERSE_FILE = DATA_DIR / "universe.json"
 TI_PRIMARY_FILE = DATA_DIR / "ti_primary.json"
-TI_PRIMARY_TTL_MINUTES = int(os.getenv("TI_PRIMARY_TTL_MINUTES", "15"))
+TI_PRIMARY_TTL_MINUTES = int(os.getenv("TI_PRIMARY_TTL_MINUTES", "125"))
+# ApexTraderTICapture runs every 20 min during 03:00-20:00 CT but only every
+# 2h overnight (added 2026-08-06, see add_overnight_ti_capture.ps1) -- this TTL
+# has to cover the *slower* cadence or ti_primary.json gets judged "stale" for
+# ~95 min of every overnight cycle even though it's the current data, silently
+# falling back to the static universe instead. 125 = 2h overnight cadence + 5
+# min buffer, same convention as the old comment; still comfortably covers the
+# 20-min daytime cadence too.
 
-# ── TTL per tier (minutes) ────────────────────────────────────────────────────
+# -- TTL per tier (minutes) ----------------------------------------------------
 # The primary dynamic universe should refresh frequently; default TTL is 15 min.
 TIER_TTL: dict[int, int] = {
     1: int(os.getenv("UNIVERSE_TTL_TIER1", "15")),
@@ -54,9 +61,9 @@ TIER_TTL: dict[int, int] = {
 _lock = threading.Lock()
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # Internal helpers
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 def _load_raw() -> dict:
     """Read universe.json from disk.  Returns empty schema on missing/corrupt file."""
@@ -84,20 +91,20 @@ def _is_expired(entry: dict) -> bool:
         added_str = entry["added"]
         # Support both legacy date-only strings and new full datetimes
         if len(added_str) <= 10:
-            # old format "YYYY-MM-DD" — treat as start-of-day UTC
+            # old format "YYYY-MM-DD" -- treat as start-of-day UTC
             added_dt = datetime.fromisoformat(added_str).replace(tzinfo=timezone.utc)
         else:
             added_dt = datetime.fromisoformat(added_str)
             if added_dt.tzinfo is None:
                 added_dt = added_dt.replace(tzinfo=timezone.utc)
     except (KeyError, ValueError):
-        return False  # unknown format → keep
+        return False  # unknown format -> keep
     return datetime.now(timezone.utc) - added_dt > timedelta(minutes=ttl_minutes)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # Public API
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 def add_tickers(
     symbols: list[str],
@@ -118,7 +125,7 @@ def add_tickers(
                 continue
             if sym not in tickers:
                 fresh += 1
-            # Refresh timestamp whether new or existing — keeps active ones alive
+            # Refresh timestamp whether new or existing -- keeps active ones alive
             tickers[sym] = {"tier": tier, "added": added_ts}
         _save_raw(data)
     return fresh
@@ -143,7 +150,7 @@ def get_latest_batch(window_minutes: int = 5) -> list[str]:
     The TI scraper writes 3 sub-batches in quick succession (each page gets its
     own timestamp a few seconds apart).  This function collects every ticker
     whose 'added' timestamp falls within *window_minutes* of the most recent
-    timestamp — i.e. the full output of the last scrape run.  Results are
+    timestamp -- i.e. the full output of the last scrape run.  Results are
     sorted newest-first within the window.
     """
     data = _load_raw()

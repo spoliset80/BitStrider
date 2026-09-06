@@ -1,6 +1,6 @@
 # ApexTrader
 
-> Automated trading bot — multi-strategy equity signals, A+ options scanner, adaptive scan intervals, tiered risk management, and clean email reports.
+> Automated trading bot — multi-strategy equity signals, adaptive scan intervals, tiered risk management, and clean email reports.
 
 **Version:** v1.3.0 · **Python:** 3.10+ · **Broker:** Alpaca (paper & live) · **Platform:** Windows / Linux / macOS
 
@@ -13,7 +13,6 @@
 3. [Quick Start](#quick-start)
 4. [Configuration Reference](#configuration-reference)
 5. [Equity Strategies](#equity-strategies)
-6. [Options Strategies](#options-strategies)
 7. [CLI Modes](#cli-modes)
 8. [Task Scheduler (Windows)](#task-scheduler-windows)
 9. [Email Notifications](#email-notifications)
@@ -33,16 +32,6 @@
 - **Kill mode** — emergency close-all on VIX ≥ 40, SPY intraday drop ≥ 3%, or VIX +50% in 5 h
 - **Position swap** — when at max 12 positions, auto-closes weakest for a higher-confidence new signal (swap-only in bear)
 - **Confidence gate** — executes signals ≥ 72% (longs); position sizing now scales with confidence up to 100% at 85%+
-
-**Options trading (Level 3, Alpaca)**
-- **A+ 9-filter scanner** — IV rank gate, EMA-20 trend, 3-day momentum, 5-day breakout/breakdown, chain liquidity, OI ≥ 500, spread ≤ 15%, R/R ≥ 1.5×, premium ≤ 3% of spot
-- **82% sniper threshold** — only executes the cleanest option setups by default via `OPTIONS_MIN_SIGNAL_CONFIDENCE`
-- **Open-window spread-first logic** — 9:35–9:45 ET prefers spreads; naked entries are allowed only when IV is very low and pre-market gap is small
-- **Options contract sizing scales by confidence** — low-conviction signals are smaller, stronger signals use full allocation
-- **Options diagnostic logging** — zero-signal scans now report fail reasons such as `adv`, `no_signal`, and cooldown rejections
-- **Watch list fallback** — when nothing clears the gate, shows the top-3 near-miss candidates (all structural filters passed) clearly labelled with their gate gap
-- **Master kill-switch** — `OPTIONS_ENABLED=false` in `.env` disables the entire options system without restart
-- **15% portfolio allocation**, max 3 concurrent contracts, 7–21 DTE, +45% profit target / -30% stop loss
 
 **Infrastructure**
 - **Trade Ideas integration** — headless Selenium scrape refreshes the universe every 30 min
@@ -66,8 +55,6 @@ apextrader/
 │   ├── config.py                 # All runtime constants
 │   ├── scan.py                   # get_scan_targets(), scan_universe(), filter_signals()
 │   ├── strategies.py             # 7 equity strategy classes
-│   ├── options/strategies.py      # A+ options: MomentumCall, BearPut, CoveredCall + scan_options_universe()
-│   ├── options/executor.py        # Options order placement (buy-to-open, close)
 │   ├── execution/enhanced.py      # Equity order placement, swap logic, bracket/stop orders
 │   ├── notifications.py          # Email templates: build_top5_report(), build_eod_report()
 │   ├── universe.py               # TTL-managed ticker universe (JSON-backed)
@@ -75,15 +62,13 @@ apextrader/
 │   ├── utils.py                  # Data services: get_bars(), get_vix(), sentiment, trending
 │   └── broker_factory.py         # Alpaca client factory (paper / live)
 ├── scripts/
-│   ├── _options_today.py         # Standalone A+ options scanner (run daily)
 │   ├── run_autobot_task.ps1      # Task Scheduler launcher
 │   ├── run_top3.py               # Standalone equity top-3 scan (dry-run)
-│   ├── capture_tradeideas.py     # Trade Ideas Selenium scraper
 │   ├── predict_tomorrow.py       # Next-day prediction generator
 │   ├── _validate_universe.py     # Validate universe.json integrity
 │   └── prune_universe.py         # Manual universe prune utility
 ├── data/
-│   ├── ti_primary.json           # Latest TI capture universe (primary scan source)
+│   ├── ti_primary.json           # Latest universe capture (Yahoo Finance, primary scan source)
 │   └── universe.json             # Dynamic ticker universe with TTL tiers
 ├── predictions/
 │   ├── day_picks.json            # Today's top picks (persisted each cycle)
@@ -123,8 +108,6 @@ PAPER_ALPACA_API_SECRET=your_paper_secret
 LIVE_ALPACA_API_KEY=your_live_key
 LIVE_ALPACA_API_SECRET=your_live_secret
 
-# ── Options trading ───────────────────────────────────────────────
-OPTIONS_ENABLED=true                # false = kill-switch (no restart needed)
 
 # ── Email notifications ───────────────────────────────────────────
 USE_EMAIL_NOTIFICATIONS=true
@@ -185,22 +168,6 @@ All tunable constants live in [`engine/config.py`](engine/config.py). Key settin
 | `DAILY_PROFIT_TARGET` | configured | Lock in gains above this |
 | `KILL_MODE_VIX_LEVEL` | `40.0` | Emergency close-all VIX threshold |
 | `KILL_MODE_SPY_DROP_PCT` | `3.0` | Emergency close-all SPY intraday drop % |
-| `USE_TRADEIDEAS_DISCOVERY` | `True` | Enable Trade Ideas selenium universe refresh |
-
-### Options trading
-
-| Setting | Default | Description |
-|---|---|---|
-| `OPTIONS_ENABLED` | `true` | Master kill-switch — set `false` to disable everything |
-| `OPTIONS_ALLOCATION_PCT` | `15.0` | % of equity for all options combined |
-| `OPTIONS_MAX_POSITIONS` | `3` | Max concurrent option contracts |
-| `OPTIONS_DTE_MIN` / `MAX` | `7` / `21` | Expiry window (near-term, higher-theta) |
-| `OPTIONS_DELTA_TARGET` | `0.40` | Target delta at entry (0.30–0.50 range) |
-| `OPTIONS_MIN_SIGNAL_CONFIDENCE` | `0.82` | Minimum confidence to consider an options signal |
-| `OPTIONS_PROFIT_TARGET_PCT` | `45.0` | Close contract at +45% gain |
-| `OPTIONS_STOP_LOSS_PCT` | `30.0` | Close contract at -30% loss |
-
----
 
 ## Equity Strategies
 
@@ -209,11 +176,11 @@ Each strategy in [`engine/strategies.py`](engine/strategies.py) receives OHLCV b
 
 ### Alpaca API Integration (Equity)
 
-All equity strategies now use the Alpaca API for historical price and volume data, mirroring the options pipeline. This ensures consistent, reliable data for both equities and options, and enables seamless live trading and backtesting. The yfinance fallback is retained for redundancy only.
+All equity strategies use the Alpaca API for historical price and volume data (options trading was removed 2026-09-01). This ensures consistent, reliable data and enables seamless live trading and backtesting. The yfinance fallback is retained for redundancy only.
 
 **Current Focus:**
 - Refactoring and enhancing equity strategies to leverage Alpaca data for all scans and signals
-- Unified data access layer for both equities and options
+- Unified data access layer for equities
 - Improved reliability and speed for live and backtest modes
 
 | Strategy | Edge |
@@ -230,45 +197,12 @@ Bear regime note: inverse ETFs (SQQQ, SPXU, UVXY, TZA, FAZ, SOXS, LABD, DUST) ar
 
 ---
 
-## Options Strategies
-
-Implemented in [`engine/options/strategies.py`](engine/options/strategies.py). The standalone daily scanner is [`scripts/_options_today.py`](scripts/_options_today.py).
-
-### A+ Filter Pipeline (all 9 must pass)
-
-1. **Liquid options chain** — expiry must exist in 7–21 DTE window  
-2. **IV rank gate** — calls: IV rank < 35%, puts: IV rank < 55% (not over-priced)  
-3. **EMA-20 trend** — price above EMA for calls, below for puts  
-4. **3-day momentum** — 3-day return in correct direction  
-5. **5-day breakout / breakdown** — price must clear prior 5-day high (calls) or break below prior 5-day low (puts)  
-6. **ATM open interest** — ≥ 500 contracts (liquidity floor)  
-7. **Bid/ask spread** — ≤ 15% of mid (not wide)  
-8. **R/R ratio** — ≥ 1.5× (breakeven vs. underlying move required)  
-9. **Premium cap** — mid ≤ 3% of spot price (avoids paying inflated premium)
-
-**Confidence gate:** sniper threshold defaults to 82% via `OPTIONS_MIN_SIGNAL_CONFIDENCE`; score is derived from the A+ filter composite and R/R adjustment.
-
-### Watch list fallback
-
-When zero signals clear the sniper threshold, the scanner shows the **top-3 near-miss candidates** — tickers that passed all 9 structural filters but scored below the gate — with their confidence gap and full metrics. A `[WATCH]` email is sent instead of suppressing output entirely.
-
-### Strategies
-
-| Strategy | Regime | Entry | IV constraint |
-|---|---|---|---|
-| `MomentumCallStrategy` | Bull | +3% day, RVOL ≥ 1.5×, RSI 50–72, prior 5d high breakout | IV rank < 35% |
-| `BearPutStrategy` | Bear / any | −2% day (bear) or −4% (bull), RVOL ≥ 1.2×, prior 5d low breakdown | IV rank < 55% |
-| `CoveredCallStrategy` | Bull | Existing long ≥ 100 shares, sell OTM calls ~0.25 delta | IV rank ≥ 50% (sell when expensive) |
-
----
-
 ## CLI Modes
 
 | Command | What it does |
 |---|---|
 | `python main.py` | Full loop: scan → signal → execute → EOD close |
 | `python autobot.py` | Watchdog: keeps main.py running, respects `TRADE_MODE` from `.env` |
-| `python scripts/_options_today.py` | Standalone A+ options scan — no orders placed |
 | `python scripts/run_top3.py` | Standalone equity top-3 scan (dry-run, no orders) |
 | `python scripts/predict_tomorrow.py` | Generate next-day prediction picks |
 | `python scripts/test_notifications.py` | Send a test email to verify SMTP config |
@@ -295,6 +229,20 @@ Override mode in `.env` by setting:
 $env:LIVE_TRADE_WINDOWS_ET = "09:30-11:00,15:00-16:00"
 ```
 
+### Watchdog code changes require a watchdog restart
+
+The watchdog (`autobot.py` / `engine/watchdog.py`) is a long-running process.
+Deploying new code via the deploy flag restarts `main.py` only - it does NOT
+restart the watchdog itself. Therefore:
+
+- Changes to `engine/watchdog.py` (or `autobot.py`) take effect only after the
+  watchdog process itself is restarted (end the Task Scheduler task / kill the
+  watchdog PID and let it relaunch, or reboot-schedule it).
+- The `.env` kill switch `DEPLOY_RESTART_ENABLED=false` is read live by the
+  updated watchdog - it has no effect until the updated watchdog code is
+  running.
+- Restarting `main.py` alone is never enough for watchdog-logic changes.
+
 ### Task Scheduler commands
 
 ```powershell
@@ -317,11 +265,11 @@ Stop-Process -Id <main_py_pid> -Force
 
 Two email types are sent automatically via Gmail SMTP (light-theme HTML).
 
-### Options / Equity Scan Email
+### Equity Scan Email
 Sent after each scan cycle with signals. Includes:
 - Market regime badge (BULL / BEAR) and sentiment
-- Top-3–5 signal cards with confidence bar, strike/expiry (options) or strategy (equity)
-- Per-pick: price, R/R, IV rank, breakeven, entry reason
+- Top-3–5 signal cards with confidence bar and strategy
+- Per-pick: price, R/R, breakeven, entry reason
 - `[WATCH]` prefix in subject when emailing near-miss candidates (no A+ signals today)
 
 ### EOD Report
@@ -349,13 +297,15 @@ python scripts/test_notifications.py
 | **Max positions cap** | Hard 12-position limit (90% equity deployed, 10% BP reserve) |
 | **Position swap** | Auto-exits weakest long for a stronger signal; swap-only in bear regime |
 | **Equity confidence gate** | 72% minimum for longs; position sizing scales with confidence up to 100% at 85%+ |
-| **Options confidence gate** | 82% default sniper threshold; only the strongest option setups are entered |
-| **Options kill-switch** | `OPTIONS_ENABLED=false` disables entire options system without restart |
 | **Dollar volume guardrail** | Skips illiquid symbols below minimum dollar volume |
 | **Long-only mode** | No short entries — avoids margin, HTB, PDT complications |
 | **Quarterly P&L target** | Tracks and logs progress toward quarterly gain goal |
 | **Same-day swap protection** | Positions entered today cannot be swapped out within the same day |
 | **Cycle swap protection** | Each symbol can only be swapped once per scan cycle |
+| **Staged allocation (25% x 4)** | Fresh entries split into 4 equal tranches; first submitted at signal time, rest added by the poller only while the position is not losing and the fresh EMA gate still passes |
+| **Never add while losing** | A staged tranche is only added when unrealized gain is strictly above `STAGED_ALLOCATION_MIN_GAIN_PCT` (default 0.0%) |
+| **Pre-entry opposite-order cancel** | Before a fresh entry, any resting DAY order on the opposite side for that symbol is cancelled; GTC protective trailing stops are never touched |
+| **ATR-based trailing stop** | Exit trailing stops scale per-symbol with ATR(14): `ATR × 1.5`, floored at the 1.5% `TRAIL_STOP_PCT` and capped at 4.0%, so volatile names get a volatility-sized leash while quiet names keep the flat floor; profit giveback widens past both on winners |
 
 ---
 
@@ -381,12 +331,11 @@ Get-Content .\apextrader.log -Tail 50 | Select-String "ERROR|TOP 5|EXECUTE|SWAP|
 ## Contributing
 
 ```
-feature/options-trading   ← active development branch
 main                      ← stable releases (tagged vX.Y.Z)
+feature/*                 ← active development branches
 ```
 
 1. Branch off `main` for new work
-2. Test the options scanner: `python scripts/_options_today.py`
 3. Test equity scan: `python scripts/run_top3.py`
 4. Merge to `main` when stable, tag with `git tag vX.Y.Z`
 

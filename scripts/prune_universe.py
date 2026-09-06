@@ -1,5 +1,5 @@
 """
-scripts/prune_universe.py — Universe maintenance tool
+scripts/prune_universe.py -- Universe maintenance tool
 ======================================================
 Show and optionally remove expired tickers from data/universe.json.
 

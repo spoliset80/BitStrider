@@ -1,0 +1,280 @@
+{
+  "updated": "2026-09-05T19:25:14.533332+00:00",
+  "count": 30,
+  "tickers": [
+    "GPRO",
+    "SNDG",
+    "SNXX",
+    "CBRG",
+    "AXTX",
+    "AEHR",
+    "SNDK",
+    "COHU",
+    "CBRS",
+    "ALAB",
+    "AXTI",
+    "AAPL",
+    "AI",
+    "AMD",
+    "AMZN",
+    "ARM",
+    "AVGO",
+    "GOOGL",
+    "META",
+    "MRVL",
+    "MSFT",
+    "MU",
+    "NFLX",
+    "NVDA",
+    "ORCL",
+    "PLTR",
+    "QLD",
+    "SMCI",
+    "SPCX",
+    "TSM"
+  ],
+  "longs": [
+    {
+      "symbol": "GPRO",
+      "action": "buy"
+    },
+    {
+      "symbol": "SNDG",
+      "action": "buy"
+    },
+    {
+      "symbol": "SNXX",
+      "action": "buy"
+    },
+    {
+      "symbol": "CBRG",
+      "action": "buy"
+    },
+    {
+      "symbol": "AXTX",
+      "action": "buy"
+    },
+    {
+      "symbol": "AEHR",
+      "action": "buy"
+    },
+    {
+      "symbol": "SNDK",
+      "action": "buy"
+    },
+    {
+      "symbol": "COHU",
+      "action": "buy"
+    },
+    {
+      "symbol": "CBRS",
+      "action": "buy"
+    },
+    {
+      "symbol": "ALAB",
+      "action": "buy"
+    },
+    {
+      "symbol": "AXTI",
+      "action": "buy"
+    },
+    {
+      "symbol": "AAPL",
+      "action": "buy"
+    },
+    {
+      "symbol": "AI",
+      "action": "buy"
+    },
+    {
+      "symbol": "AMD",
+      "action": "buy"
+    },
+    {
+      "symbol": "AMZN",
+      "action": "buy"
+    },
+    {
+      "symbol": "ARM",
+      "action": "buy"
+    },
+    {
+      "symbol": "AVGO",
+      "action": "buy"
+    },
+    {
+      "symbol": "GOOGL",
+      "action": "buy"
+    },
+    {
+      "symbol": "META",
+      "action": "buy"
+    },
+    {
+      "symbol": "MRVL",
+      "action": "buy"
+    },
+    {
+      "symbol": "MSFT",
+      "action": "buy"
+    },
+    {
+      "symbol": "MU",
+      "action": "buy"
+    },
+    {
+      "symbol": "NFLX",
+      "action": "buy"
+    },
+    {
+      "symbol": "NVDA",
+      "action": "buy"
+    },
+    {
+      "symbol": "ORCL",
+      "action": "buy"
+    },
+    {
+      "symbol": "PLTR",
+      "action": "buy"
+    },
+    {
+      "symbol": "QLD",
+      "action": "buy"
+    },
+    {
+      "symbol": "SMCI",
+      "action": "buy"
+    },
+    {
+      "symbol": "SPCX",
+      "action": "buy"
+    },
+    {
+      "symbol": "TSM",
+      "action": "buy"
+    }
+  ],
+  "shorts": [
+    {
+      "symbol": "AAPL",
+      "action": "short"
+    },
+    {
+      "symbol": "AI",
+      "action": "short"
+    },
+    {
+      "symbol": "AMD",
+      "action": "short"
+    },
+    {
+      "symbol": "AMZN",
+      "action": "short"
+    },
+    {
+      "symbol": "ARM",
+      "action": "short"
+    },
+    {
+      "symbol": "AVGO",
+      "action": "short"
+    },
+    {
+      "symbol": "GOOGL",
+      "action": "short"
+    },
+    {
+      "symbol": "META",
+      "action": "short"
+    },
+    {
+      "symbol": "MRVL",
+      "action": "short"
+    },
+    {
+      "symbol": "MSFT",
+      "action": "short"
+    },
+    {
+      "symbol": "MU",
+      "action": "short"
+    },
+    {
+      "symbol": "NFLX",
+      "action": "short"
+    },
+    {
+      "symbol": "NVDA",
+      "action": "short"
+    },
+    {
+      "symbol": "ORCL",
+      "action": "short"
+    },
+    {
+      "symbol": "PLTR",
+      "action": "short"
+    },
+    {
+      "symbol": "QLD",
+      "action": "short"
+    },
+    {
+      "symbol": "SMCI",
+      "action": "short"
+    },
+    {
+      "symbol": "SPCX",
+      "action": "short"
+    },
+    {
+      "symbol": "TSM",
+      "action": "short"
+    },
+    {
+      "symbol": "GPRO",
+      "action": "short"
+    },
+    {
+      "symbol": "SNDG",
+      "action": "short"
+    },
+    {
+      "symbol": "SNXX",
+      "action": "short"
+    },
+    {
+      "symbol": "CBRG",
+      "action": "short"
+    },
+    {
+      "symbol": "AXTX",
+      "action": "short"
+    },
+    {
+      "symbol": "LCID",
+      "action": "short"
+    },
+    {
+      "symbol": "MVIS",
+      "action": "short"
+    },
+    {
+      "symbol": "WKHS",
+      "action": "short"
+    },
+    {
+      "symbol": "SNDX",
+      "action": "short"
+    },
+    {
+      "symbol": "FUBO",
+      "action": "short"
+    },
+    {
+      "symbol": "INDO",
+      "action": "short"
+    }
+  ]
+}

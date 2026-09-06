@@ -1,17 +1,5 @@
-# ── Fix: __future__ import must be first ──
+# -- Fix: __future__ import must be first --
 from __future__ import annotations
-
-# Allocation split logic for equity/options based on market hours
-def get_allocation_split(market_state: MarketState) -> tuple[float, float]:
-    """
-    Returns (equity_pct, options_pct) allocation based on market hours.
-    - Off hours: (1.0, 0.0) — all BP to equity
-    - Market hours: (0.3, 0.7) — 30% equity, 70% options
-    """
-    if market_state.is_regular_hours:
-        return 0.3, 0.7
-    else:
-        return 1.0, 0.0
 
 """
 engine.utils.market
@@ -39,7 +27,6 @@ class MarketState:
     weekday: bool
     is_market_open: bool
     is_regular_hours: bool
-    is_options_lull_hours: bool
     is_open_window: bool
     sentiment: Optional[str] = None
     bull_regime: Optional[bool] = None
@@ -58,13 +45,8 @@ class MarketState:
 
         is_market_open = weekday and "07:00" <= t <= "20:00"
         is_regular_hours = weekday and "09:30" <= t <= "16:00"
-        is_options_lull_hours = False
         is_open_window = False
         if weekday and not PAPER:
-            is_options_lull_hours = (
-                (9.5 <= hour < (9.5 + 5 / 60.0))
-                or (11.5 <= hour < 13.75)
-            )
             is_open_window = ((9.5 + 5 / 60.0) <= hour < (9.5 + 15 / 60.0))
 
         return cls(
@@ -73,7 +55,6 @@ class MarketState:
             weekday=weekday,
             is_market_open=is_market_open,
             is_regular_hours=is_regular_hours,
-            is_options_lull_hours=is_options_lull_hours,
             is_open_window=is_open_window,
         )
 
@@ -127,39 +108,20 @@ class MarketState:
         return self.vix, self.vix_interval, self.volatility_label
 
 
-# ── Market hours ──────────────────────────────────────────────────────────────
+# -- Market hours --------------------------------------------------------------
 
 def is_market_open() -> bool:
-    """Extended hours: 7:00 AM – 8:00 PM ET, weekdays only."""
+    """Extended hours: 7:00 AM - 8:00 PM ET, weekdays only."""
     return MarketState.from_now().is_market_open
 
 
 def is_regular_hours() -> bool:
-    """Regular session: 9:30 AM – 4:00 PM ET, weekdays only."""
+    """Regular session: 9:30 AM - 4:00 PM ET, weekdays only."""
     return MarketState.from_now().is_regular_hours
 
 
-def is_options_lull_hours() -> bool:
-    """True during low-liquidity windows where options spreads are typically wide.
-
-    Blocks new option *entries* during:
-      - Open auction (9:30–9:35 ET): price discovery unstable, spreads widest
-      - Midday lull  (11:30–13:45 ET): low volume, inflated spreads
-
-    Monitoring and exits are never blocked. Paper mode always returns False.
-    """
-    from engine.config import PAPER
-    if PAPER:
-        return False
-    now = datetime.datetime.now(ET)
-    if now.weekday() >= 5:
-        return False
-    h = now.hour + now.minute / 60.0
-    return (9.5 <= h < (9.5 + 5 / 60.0)) or (11.5 <= h < 13.75)
-
-
 def is_open_window() -> bool:
-    """True during 9:35–9:45 ET — post-auction, pre-trend-lock options entry window.
+    """True during 9:35-9:45 ET -- post-auction, pre-trend-lock options entry window.
 
     Live mode only. Paper mode always returns False.
     """
@@ -173,7 +135,61 @@ def is_open_window() -> bool:
     return (9.5 + 5 / 60.0) <= h < (9.5 + 15 / 60.0)
 
 
-# ── VIX ───────────────────────────────────────────────────────────────────────
+# -- Entry-window membership (two-segment) -------------------------------------
+# 2026-09-01, user request ("time for entry 9:14AM to 11:00AM and 2:45 PM to
+# 3:50PM ET"): the entry window is now TWO disjoint segments separated by a
+# midday break. Single source of truth for both membership questions --
+# orchestrator._within_entry_window, the options/equity entry gates, the 5s
+# retry gate, and the re-entry/blocked-entry guards all go through these.
+
+def within_entry_window(now_et: datetime.datetime) -> bool:
+    """True if now_et (ET, tz-aware) falls within either entry segment:
+    [ENTRY_WINDOW_START_ET, ENTRY_WINDOW_BREAK_START_ET) (09:14-11:00) or
+    [ENTRY_WINDOW_BREAK_END_ET, ENTRY_WINDOW_END_ET) (14:15-15:44).
+
+    2026-09-04: SECOND-PRECISE and END-EXCLUSIVE. The old minute-string
+    inclusive comparison let the whole final minute count as "inside" -- a
+    trailing-buy resting through 15:44:59 filled at 15:44:37 (NFLX, 9/4)
+    AFTER the EOD flatten had begun. Now the segment START minute is
+    inclusive (09:14:00 / 14:15:00 open trading) and the END minute
+    (11:00:00 / 15:44:00) belongs to the flatten, not to entries.
+    """
+    from engine.config import (
+        ENTRY_WINDOW_START_ET,
+        ENTRY_WINDOW_BREAK_START_ET,
+        ENTRY_WINDOW_BREAK_END_ET,
+        ENTRY_WINDOW_END_ET,
+    )
+
+    def _t(hhmm: str) -> datetime.time:
+        h, m = map(int, hhmm.split(":"))
+        return datetime.time(h, m)
+
+    t = now_et.time()
+    return (
+        _t(ENTRY_WINDOW_START_ET) <= t < _t(ENTRY_WINDOW_BREAK_START_ET)
+        or _t(ENTRY_WINDOW_BREAK_END_ET) <= t < _t(ENTRY_WINDOW_END_ET)
+    )
+
+
+def in_lunch_break(now_et: datetime.datetime) -> bool:
+    """True if now_et falls inside the midday break
+    [ENTRY_WINDOW_BREAK_START_ET, ENTRY_WINDOW_BREAK_END_ET) (11:00-14:15 ET)
+    when the book is hard-flatted and no new entry/re-entry order may be
+    placed. Start inclusive (the flat sweep begins the minute the morning
+    segment ends), end exclusive (the afternoon segment opens at
+    ENTRY_WINDOW_BREAK_END_ET -- 14:15 since 2026-09-04)."""
+    from engine.config import ENTRY_WINDOW_BREAK_START_ET, ENTRY_WINDOW_BREAK_END_ET
+
+    def _t(hhmm: str) -> datetime.time:
+        h, m = map(int, hhmm.split(":"))
+        return datetime.time(h, m)
+
+    t = now_et.time()
+    return _t(ENTRY_WINDOW_BREAK_START_ET) <= t < _t(ENTRY_WINDOW_BREAK_END_ET)
+
+
+# -- VIX -----------------------------------------------------------------------
 
 def get_vix() -> float:
     """Return the latest VIX daily close. Defaults to 15.0 on failure."""
@@ -210,7 +226,7 @@ def check_vix_roc_filter() -> Tuple[bool, float]:
         return True, 0.0
 
 
-# ── Adaptive interval helpers ─────────────────────────────────────────────────
+# -- Adaptive interval helpers -------------------------------------------------
 
 def get_vix_interval(vix: float, config: dict) -> Tuple[int, str]:
     """Map VIX level to scan interval (minutes) and volatility label."""
@@ -249,8 +265,8 @@ def get_position_tuning_interval(pos_count: int, config: dict) -> Tuple[Optional
     return None, "DISABLED"
 
 
-# ── Market sentiment ──────────────────────────────────────────────────────────
-# Cached for 15 min — SPY momentum + VIX threshold composite.
+# -- Market sentiment ----------------------------------------------------------
+# Cached for 15 min -- SPY momentum + VIX threshold composite.
 
 _sentiment_cache: dict = {"ts": 0.0, "value": "neutral"}
 _SENTIMENT_TTL   = 900  # seconds
@@ -259,7 +275,7 @@ _SENTIMENT_TTL   = 900  # seconds
 def get_market_sentiment() -> str:
     """Return 'bullish', 'bearish', or 'neutral' based on 5-day SPY momentum + VIX.
 
-    Designed to be cheap — result is cached for 15 minutes.
+    Designed to be cheap -- result is cached for 15 minutes.
     """
     now = time.monotonic()
     if now - _sentiment_cache["ts"] < _SENTIMENT_TTL:
@@ -287,20 +303,24 @@ def get_market_sentiment() -> str:
     return result
 
 
-# ── Live holdings ─────────────────────────────────────────────────────────────
+# -- Live holdings -------------------------------------------------------------
 
 def get_live_holdings(client) -> Tuple[set, set, set]:
     """Return (positions, buy_orders, combined) symbol sets from the broker.
 
-    Only buy-side orders are included — stop/TP sell legs are already covered by
+    Only buy-side orders are included -- stop/TP sell legs are already covered by
     the positions set and must not block re-investment in the same ticker.
     """
     log = logging.getLogger("ApexTrader")
     try:
         positions = {p.symbol for p in client.get_all_positions()}
+        # o.side is an OrderSide enum; str(enum) is "OrderSide.BUY", not "buy" --
+        # comparing that against a bare "buy" literal never matched, so every
+        # pending buy order was silently excluded from this set (2026-08-14,
+        # same root cause as the entry_log rebuild no-op in enhanced.py).
         orders    = {
             o.symbol for o in client.get_orders()
-            if str(getattr(o, "side", "")).lower() == "buy"
+            if str(getattr(getattr(o, "side", ""), "value", getattr(o, "side", ""))).lower() == "buy"
         }
         return positions, orders, positions | orders
     except Exception as e:
@@ -308,8 +328,8 @@ def get_live_holdings(client) -> Tuple[set, set, set]:
         return set(), set(), set()
 
 
-# ── Market regime (SPY 200-SMA) ───────────────────────────────────────────────
-# Canonical single-source definition — imported by equity, options, scan, orchestrator.
+# -- Market regime (SPY 200-SMA) -----------------------------------------------
+# Canonical single-source definition -- imported by equity, scan, orchestrator.
 # Previously duplicated in equity/strategies.py as a private underscore function.
 
 _regime_cache: dict = {"ts": 0.0, "bull": True}
@@ -340,12 +360,12 @@ def is_bull_regime() -> bool:
     return bull
 
 
-# Backward-compat alias — callers using the private name still work
+# Backward-compat alias -- callers using the private name still work
 _is_bull_regime = is_bull_regime
 
 
-# ── Inverse ETF universe ──────────────────────────────────────────────────────
-# ETFs that profit from market declines — treated as LONG buys in bear regime.
+# -- Inverse ETF universe ------------------------------------------------------
+# ETFs that profit from market declines -- treated as LONG buys in bear regime.
 INVERSE_ETFS: frozenset = frozenset({
     "SQQQ", "SPXU", "UVXY", "TZA", "FAZ", "SOXS", "LABD", "DUST",
 })

@@ -1,0 +1,22 @@
+# Non-source: runtime artifacts, environments, machine state
+apextrader/
+.git/
+.claude/
+.pytest_cache/
+__pycache__/
+graphify-out/
+data/
+predictions/
+drivers/
+
+# Logs and runtime files
+*.log
+*.log.*
+*.log-*
+heartbeat.txt
+*.pid
+*.lock
+
+# Env / local config
+.env
+.env.*

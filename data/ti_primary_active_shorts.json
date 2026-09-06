@@ -1,0 +1,126 @@
+{
+  "updated": "2026-09-05T19:25:14.533332+00:00",
+  "count": 30,
+  "signals": [
+    {
+      "symbol": "AAPL",
+      "action": "short"
+    },
+    {
+      "symbol": "AI",
+      "action": "short"
+    },
+    {
+      "symbol": "AMD",
+      "action": "short"
+    },
+    {
+      "symbol": "AMZN",
+      "action": "short"
+    },
+    {
+      "symbol": "ARM",
+      "action": "short"
+    },
+    {
+      "symbol": "AVGO",
+      "action": "short"
+    },
+    {
+      "symbol": "GOOGL",
+      "action": "short"
+    },
+    {
+      "symbol": "META",
+      "action": "short"
+    },
+    {
+      "symbol": "MRVL",
+      "action": "short"
+    },
+    {
+      "symbol": "MSFT",
+      "action": "short"
+    },
+    {
+      "symbol": "MU",
+      "action": "short"
+    },
+    {
+      "symbol": "NFLX",
+      "action": "short"
+    },
+    {
+      "symbol": "NVDA",
+      "action": "short"
+    },
+    {
+      "symbol": "ORCL",
+      "action": "short"
+    },
+    {
+      "symbol": "PLTR",
+      "action": "short"
+    },
+    {
+      "symbol": "QLD",
+      "action": "short"
+    },
+    {
+      "symbol": "SMCI",
+      "action": "short"
+    },
+    {
+      "symbol": "SPCX",
+      "action": "short"
+    },
+    {
+      "symbol": "TSM",
+      "action": "short"
+    },
+    {
+      "symbol": "GPRO",
+      "action": "short"
+    },
+    {
+      "symbol": "SNDG",
+      "action": "short"
+    },
+    {
+      "symbol": "SNXX",
+      "action": "short"
+    },
+    {
+      "symbol": "CBRG",
+      "action": "short"
+    },
+    {
+      "symbol": "AXTX",
+      "action": "short"
+    },
+    {
+      "symbol": "LCID",
+      "action": "short"
+    },
+    {
+      "symbol": "MVIS",
+      "action": "short"
+    },
+    {
+      "symbol": "WKHS",
+      "action": "short"
+    },
+    {
+      "symbol": "SNDX",
+      "action": "short"
+    },
+    {
+      "symbol": "FUBO",
+      "action": "short"
+    },
+    {
+      "symbol": "INDO",
+      "action": "short"
+    }
+  ]
+}

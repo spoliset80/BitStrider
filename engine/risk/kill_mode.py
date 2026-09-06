@@ -1,5 +1,5 @@
 """
-ApexTrader — Kill Mode
+ApexTrader -- Kill Mode
 Extreme bear-market circuit breaker.
 Extracted from main.py to keep the main entry point lean.
 """
@@ -12,7 +12,7 @@ from typing import Optional
 
 log = logging.getLogger("ApexTrader")
 
-# ── State ──────────────────────────────────────────────────────────────────
+# -- State ------------------------------------------------------------------
 _active: bool                       = False
 _date:   Optional[datetime.date]    = None
 
@@ -20,7 +20,6 @@ _date:   Optional[datetime.date]    = None
 def check(
     client,
     executor,
-    options_executor,
     *,
     vix_level:      float,
     spy_drop_pct:   float,
@@ -43,7 +42,7 @@ def check(
         _date   = today
 
     if _active:
-        log.warning("KILL MODE ACTIVE — all new entries blocked for today")
+        log.warning("KILL MODE ACTIVE -- all new entries blocked for today")
         return True
 
     trigger_reason: Optional[str] = None
@@ -71,7 +70,7 @@ def check(
                 if drop_pct <= -spy_drop_pct:
                     trigger_reason = (
                         f"SPY intraday {drop_pct:.2f}% "
-                        f"(open ${spy_open:.2f} → now ${spy_now:.2f})"
+                        f"(open ${spy_open:.2f} -> now ${spy_now:.2f})"
                     )
 
             if trigger_reason is None:
@@ -84,7 +83,7 @@ def check(
                         if roc >= vix_roc_pct:
                             trigger_reason = (
                                 f"VIX +{roc:.0f}% in 5h "
-                                f"({past_vix:.1f} → {current_vix:.1f})"
+                                f"({past_vix:.1f} -> {current_vix:.1f})"
                             )
         except Exception:
             pass
@@ -94,7 +93,7 @@ def check(
 
     log.warning("=" * 70)
     log.warning(f"KILL MODE TRIGGERED: {trigger_reason}")
-    log.warning("EXTREME BEAR MARKET — CLOSING ALL POSITIONS TO PROTECT CAPITAL")
+    log.warning("EXTREME BEAR MARKET -- CLOSING ALL POSITIONS TO PROTECT CAPITAL")
     log.warning("=" * 70)
     _active = True
     _date   = today
@@ -102,8 +101,6 @@ def check(
     try:
         _acct = client.get_account()
         executor.emergency_close_all(float(_acct.equity))
-        if options_executor is not None:
-            options_executor.close_all()
     except Exception as e:
         log.error(f"Kill mode close error: {e}")
 

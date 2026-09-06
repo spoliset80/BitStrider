@@ -11,9 +11,10 @@ from __future__ import annotations
 
 import logging
 import os
+from pathlib import Path
 from typing import List, Tuple
 
-# ── Finnhub SDK availability ──────────────────────────────────────────────────
+# -- Finnhub SDK availability --------------------------------------------------
 try:
     import finnhub as _finnhub_mod
     FINNHUB_SDK_AVAILABLE = True
@@ -21,7 +22,7 @@ except ImportError:
     FINNHUB_SDK_AVAILABLE = False
 
 
-# ── Env / format helpers ──────────────────────────────────────────────────────
+# -- Env / format helpers ------------------------------------------------------
 
 def bool_env(name: str, default: str = "false") -> bool:
     """Parse a boolean environment variable. Truthy: '1', 'true', 'yes'."""
@@ -37,13 +38,26 @@ def format_currency(value: float) -> str:
     return f"${value:,.2f}"
 
 
-# ── Logging setup ─────────────────────────────────────────────────────────────
+# -- Logging setup -------------------------------------------------------------
 
 def setup_logging() -> logging.Logger:
-    """Configure root logger with console + rotating file handlers.
+    """Configure root logger with rotating file handler.
 
     Level is driven by APEXTRADER_LOG_LEVEL env var (default INFO).
-    Safe to call multiple times — duplicate handlers are removed first.
+    Safe to call multiple times -- duplicate handlers are removed first.
+
+    2026-09-02: two hardening changes after a morning of repeated freezes:
+      1. Log file moved OUT of the OneDrive repo to
+         %LOCALAPPDATA%\\ApexTrader\\logs\\apextrader.log -- OneDrive's
+         sync/lock behavior on repo files (see watchdog's autobot.log
+         Errno 22) made file writes intermittently block.
+      2. Console handler removed. The watchdog drains this process's stdout
+         through a pipe; when that drain stalls (it was choking on its own
+         OneDrive log errors), the pipe fills and the console write blocks
+         while HOLDING the logging module's handler lock -- which freezes
+         every thread that tries to log (confirmed 2026-09-02: bot froze
+         CPU 0, no output, rescue paths couldn't even log). The file is
+         the single source of truth now.
     """
     from logging.handlers import TimedRotatingFileHandler
 
@@ -57,18 +71,21 @@ def setup_logging() -> logging.Logger:
     for handler in list(root.handlers):
         root.removeHandler(handler)
 
-    console = logging.StreamHandler()
-    console.setFormatter(formatter)
+    _local_dir = os.path.join(
+        os.environ.get("LOCALAPPDATA", str(Path.home())),
+        "ApexTrader", "logs",
+    )
+    os.makedirs(_local_dir, exist_ok=True)
+    log_path = os.path.join(_local_dir, "apextrader.log")
 
     file_h = TimedRotatingFileHandler(
-        filename="apextrader.log",
+        filename=log_path,
         when="midnight", interval=1, backupCount=14,
         encoding="utf-8", delay=True, utc=False,
     )
     file_h.setFormatter(formatter)
     file_h.suffix = "%Y-%m-%d"
 
-    root.addHandler(console)
     root.addHandler(file_h)
 
     for noisy in ("urllib3", "selenium", "webdriver_manager", "WDM"):
@@ -77,7 +94,7 @@ def setup_logging() -> logging.Logger:
     return logging.getLogger("ApexTrader")
 
 
-# ── Finnhub client ────────────────────────────────────────────────────────────
+# -- Finnhub client ------------------------------------------------------------
 
 def get_finnhub_client():
     from engine.config import FINNHUB_API_KEY
@@ -88,10 +105,10 @@ def get_finnhub_client():
     return _finnhub_mod.Client(api_key=FINNHUB_API_KEY)
 
 
-# ── Trending discovery ────────────────────────────────────────────────────────
+# -- Trending discovery --------------------------------------------------------
 
 def get_trending_tickers(max_results: int = 20) -> List[str]:
-    """Trending ticker discovery. Returns empty list — external screener removed."""
+    """Trending ticker discovery. Returns empty list -- external screener removed."""
     return []
 
 
@@ -124,7 +141,7 @@ def get_finnhub_trending_tickers() -> List[str]:
     from engine.config import FINNHUB_API_KEY
     log = logging.getLogger("ApexTrader")
     if not FINNHUB_API_KEY:
-        log.warning("FINNHUB_API_KEY not set — skipping Finnhub trending")
+        log.warning("FINNHUB_API_KEY not set -- skipping Finnhub trending")
         return []
     try:
         import requests
@@ -149,7 +166,7 @@ def check_sentiment_gate(ticker: str) -> Tuple[bool, float]:
     """Return (passes_gate, bullish_pct) from Alpaca News headline sentiment.
 
     Scores the last 10 news headlines for *ticker* using keyword matching.
-    Returns (True, 0.5) when credentials are absent or the call fails —
+    Returns (True, 0.5) when credentials are absent or the call fails --
     defaulting to allow so a news outage never blocks all trades.
     """
     from engine import config as _cfg

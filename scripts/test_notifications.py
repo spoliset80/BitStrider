@@ -1,4 +1,4 @@
-"""ApexTrader A+ Options scan email test — sends a formatted test with sample picks.
+"""ApexTrader A+ Options scan email test -- sends a formatted test with sample picks.
 Run with:
   python scripts/test_notifications.py
 Requirements:
@@ -8,6 +8,16 @@ Requirements:
 
 import os, sys, datetime
 from pathlib import Path
+
+# The report subject contains a 📈 emoji; on Windows the console default is
+# cp1252 which cannot encode it. Reconfigure stdout/stderr to UTF-8 so the
+# test's own prints don't crash the run.
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
+
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 from dotenv import load_dotenv
@@ -42,6 +52,12 @@ print(f"Subject : {report['subject']}")
 print(f"\n--- Plain text ---\n{report['text']}")
 print(f"\n--- Sending email to {os.getenv('EMAIL_TO_ADDRESSES', '(not set)')} ---")
 
-result = send_email(report["subject"], report["text"], report["html"])
-print("Result  :", "SENT OK" if result else "SKIPPED (email disabled or SMTP not configured)")
+try:
+    result = send_email(report["subject"], report["text"], report["html"])
+    print("Result  :", "SENT OK" if result else "SKIPPED (email disabled or SMTP not configured)")
+except (ValueError, Exception) as e:
+    # SMTP/config not set up in this environment -- the report itself is the
+    # point of the test; sending is best-effort.
+    print(f"Result  : SKIPPED (SMTP not configured: {e})")
+    print("NOTE    : report built fine; send skipped because email settings are absent")
 

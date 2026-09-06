@@ -1,12 +1,13 @@
-﻿"""
+"""
 ApexTrader - Strategies
 Trading strategy implementations:
-  - SweepeaStrategy      : Liquidity Sweep + Pinbar (Donchian Channel)
   - TechnicalStrategy    : Multi-indicator technical analysis
   - MomentumStrategy     : Pure momentum with volume confirmation
   - GapBreakoutStrategy  : Gap-up from prior close with volume confirmation
   - ORBStrategy          : Opening Range Breakout (first 15-min high)
   - VWAPReclaimStrategy  : Price reclaims VWAP from below with volume
+  - VWAPFadeStrategy     : Mean-reversion fade back toward VWAP once stretched
+  - LiquiditySweepStrategy: Fade a swing-high/low sweep, confirmed by a Break of Structure
   - FloatRotationStrategy: High volume relative to float (low-float runners)
 """
 
@@ -21,15 +22,19 @@ from typing import Optional
 
 from engine.utils import get_bars, calc_rsi, calc_macd, get_premarket_bars
 from engine.config import (
-    SWEEPEA, TECHNICAL, MOMENTUM, GAP_BREAKOUT, ORB, VWAP_RECLAIM, FLOAT_ROTATION, LONG_ONLY_MODE,
+    TECHNICAL, MOMENTUM, GAP_BREAKOUT, ORB, VWAP_RECLAIM, VWAP_FADE, VWAP_FADE_ENABLED,
+    LIQUIDITY_SWEEP, FLOAT_ROTATION, LONG_ONLY_MODE,
     ATR_STOP_MULTIPLIER, ATR_TP_RATIO, HIGH_SHORT_FLOAT_STOCKS, is_high_short_float,
     PRE_MARKET_MOMENTUM, OPENING_BELL_SURGE, PM_HIGH_BREAKOUT, EARLY_SQUEEZE, BEAR_BREAKDOWN,
     SENTIMENT_STRATEGY,
+    MOMENTUM_ENABLED, SENTIMENT_ENABLED, LIQUIDITY_SWEEP_ENABLED,
+    PRE_MARKET_MOMENTUM_ENABLED, PM_HIGH_BREAKOUT_ENABLED, TECHNICAL_ENABLED,
+    FLOAT_ROTATION_ENABLED,
 )
 
 ET = pytz.timezone("America/New_York")
 
-# Inverse ETFs profit from market declines — treat as LONG buys in bear regime
+# Inverse ETFs profit from market declines -- treat as LONG buys in bear regime
 _INVERSE_ETFS: frozenset = frozenset({
     "SQQQ", "SPXU", "UVXY", "TZA", "FAZ", "SOXS", "LABD", "DUST",
 })
@@ -44,6 +49,22 @@ class Signal:
     reason:     str
     strategy:   str
     atr_stop:   Optional[float] = None   # ATR-based stop distance ($); None = use % fallback
+    thin_liquidity: bool = False  # reduced-conviction admit: below a guardrail floor
+                                   # (2026-08-12, set by scan.py) or a stale/faded momentum
+                                   # entry traded anyway (2026-08-14, set in enhanced.py
+                                   # _validate_trade) -- either way sized at THIN_LIQUIDITY_
+                                   # POSITION_SIZE_PCT instead of the normal POSITION_SIZE_PCT,
+                                   # read by _execute_entry() in engine/execution/enhanced.py
+    stale_entry: bool = False  # narrower than thin_liquidity: True ONLY for the faded/
+                                # stale-momentum reason (_resolve_freshness_reject), never for
+                                # a guardrail-floor admit. 2026-08-17, CDTG: a fresh guardrail-
+                                # rescued signal (e.g. FIEE, thin float) has no "fade" to wait
+                                # out and should still enter at the normal marketable price --
+                                # only a confirmed-faded signal should get the passive/capped
+                                # entry treatment in _create_bracket_order. Confirmed live:
+                                # collapsing this into thin_liquidity would have delayed/risked
+                                # missing CDTG trade 1 (+$1.64) and both FIEE trades (+$0.30,
+                                # -$0.60), none of which were fading.
 
 
 def _calc_atr14(bars: pd.DataFrame, period: int = 14) -> float:
@@ -59,189 +80,28 @@ def _calc_atr14(bars: pd.DataFrame, period: int = 14) -> float:
         return 0.0
 
 
-# ── Market Regime Filter ──────────────────────────────────────────────────────
+# -- Market Regime Filter ------------------------------------------------------
 # Canonical implementation lives in engine.utils.market.
 # Imported here so existing strategy code continues to call _is_bull_regime() directly.
-from engine.utils.market import _is_bull_regime  # canonical regime function — shared across all strategy modules
+from engine.utils.market import _is_bull_regime  # canonical regime function -- shared across all strategy modules
 
 
-# ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
-# Sweepea Strategy
-# ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
-class SweepeaStrategy:
-    """Liquidity Sweep + Pinbar with Donchian Channel swing detection.
-    Also fires on daily 8/20-EMA pullback after an initial squeeze (secondary move)."""
-
-    def scan(self, symbol: str) -> Optional[Signal]:
-        # ── Path A: daily 8/20-EMA pullback (post-squeeze secondary entry) ──────
-        try:
-            # Daily bar only meaningful after 10 AM ET — skip pre-market noise
-            if datetime.datetime.now(ET).hour >= 10:
-              daily = get_bars(symbol, "90d", "1d")
-            else:
-              daily = pd.DataFrame()
-            if not daily.empty and len(daily) >= 25:
-                daily = daily.copy()
-                daily["ema8"]  = daily["close"].ewm(span=8,  adjust=False).mean()
-                daily["ema20"] = daily["close"].ewm(span=20, adjust=False).mean()
-                cur  = daily.iloc[-1]
-                prev = daily.iloc[-2]
-                # Price touched or slightly undercut EMA and recovered above it
-                pb8  = (cur["low"] <= float(cur["ema8"])  * 1.005
-                        and cur["close"] >= float(cur["ema8"]) * 0.995)
-                pb20 = (cur["low"] <= float(cur["ema20"]) * 1.005
-                        and cur["close"] >= float(cur["ema20"]) * 0.995)
-                # Prior trend must be up (close > 8-bar lookback mean)
-                uptrend = float(prev["close"]) > float(daily["close"].iloc[-10:-2].mean())
-                is_inverse = symbol in _INVERSE_ETFS
-                # Inverse ETFs are valid LONG buys in bear regime
-                regime_ok = is_inverse or _is_bull_regime()
-                if (pb8 or pb20) and uptrend and regime_ok:
-                    atr14   = _calc_atr14(daily)
-                    ema_lbl = "8-EMA" if pb8 else "20-EMA"
-                    # High-Tight Flag: up ≥50% in last 4 weeks + tight 5-day consolidation
-                    is_htf   = False
-                    htf_note = ""
-                    if len(daily) >= 22:
-                        price_4w    = float(daily["close"].iloc[-22])
-                        gain_4w_pct = ((float(cur["close"]) - price_4w) / price_4w * 100
-                                       if price_4w > 0 else 0.0)
-                        last5_hi = float(daily["high"].iloc[-6:-1].max())
-                        last5_lo = float(daily["low"].iloc[-6:-1].min())
-                        tight    = (last5_hi - last5_lo) < float(cur["close"]) * 0.10
-                        if gain_4w_pct >= 50.0 and tight:
-                            is_htf   = True
-                            htf_note = f" | HTF +{gain_4w_pct:.0f}% / 4w"
-                    conf = 0.88 if is_htf else 0.82
-                    return Signal(
-                        symbol, "buy", float(cur["close"]), conf,
-                        f"Daily Sweepea pullback to {ema_lbl}{htf_note} | ATR ${atr14:.2f}",
-                        "Sweepea",
-                        atr_stop=atr14 * ATR_STOP_MULTIPLIER if atr14 > 0 else None,
-                    )
-        except Exception:
-            pass
-
-        # ── Path B: intraday liquidity sweep + pinbar ────────────────────────────
-        bars = get_bars(symbol, "10d", f"{SWEEPEA['timeframe']}m")
-        if bars.empty or len(bars) < 30:
-            return None
-        bars = bars.copy()
-
-        # Moving averages
-        bars["ma_fast"] = bars["close"].rolling(SWEEPEA["ma_fast"]).mean()
-        bars["ma_slow"] = bars["close"].rolling(SWEEPEA["ma_slow"]).mean()
-
-        # Bollinger Bands
-        sma = bars["close"].rolling(SWEEPEA["bb_period"]).mean()
-        std = bars["close"].rolling(SWEEPEA["bb_period"]).std()
-        bars["bb_up"] = sma + SWEEPEA["bb_std"] * std
-        bars["bb_lo"] = sma - SWEEPEA["bb_std"] * std
-
-        # Donchian Channel (20-period, shift to avoid lookahead bias)
-        lookback = 20
-        bars["swing_low"]  = bars["low"].shift(1).rolling(lookback).min()
-        bars["swing_high"] = bars["high"].shift(1).rolling(lookback).max()
-
-        # Volume MA
-        bars["vol_ma"] = bars["volume"].rolling(20).mean()
-
-        cur = bars.iloc[-2]  # Last closed candle
-        range_val = cur["high"] - cur["low"]
-        if range_val == 0:
-            return None
-
-        # Liquidity sweep detection with volatility-aware threshold.
-        # Absolute min_sweep alone is too small for high-priced names and too large
-        # for microcaps, so blend it with a small % of price and 15m ATR proxy.
-        tr = (bars["high"] - bars["low"]).rolling(14).mean()
-        atr14_i = float(tr.iloc[-2]) if not pd.isna(tr.iloc[-2]) else 0.0
-        sweep_threshold = max(
-            float(SWEEPEA["min_sweep"]),
-            float(cur["close"]) * 0.0015,   # 0.15% of price
-            atr14_i * 0.20,                  # 20% of local ATR
-        )
-
-        # Use configurable sweep_bars window (>=1).
-        sweep_bars = max(1, int(SWEEPEA.get("sweep_bars", 1)))
-        recent = bars.iloc[-(sweep_bars + 1):-1]
-        if recent.empty:
-            recent = bars.iloc[-2:-1]
-
-        swept_below = float(recent["low"].min())  < (float(cur["swing_low"])  - sweep_threshold)
-        swept_above = float(recent["high"].max()) > (float(cur["swing_high"]) + sweep_threshold)
-
-        # Pinbar wick ratios
-        lower_wick       = min(cur["open"], cur["close"]) - cur["low"]
-        lower_wick_ratio = (lower_wick / range_val) * 100
-        upper_wick       = cur["high"] - max(cur["open"], cur["close"])
-        upper_wick_ratio = (upper_wick / range_val) * 100
-
-        # Volume confirmation
-        high_volume = cur["volume"] >= (cur["vol_ma"] * 1.05)
-
-        bull_pin = swept_below and lower_wick_ratio >= SWEEPEA["pinbar_threshold"] and high_volume
-        bear_pin = swept_above and upper_wick_ratio >= SWEEPEA["pinbar_threshold"] and high_volume
-
-        # Optional Bollinger touch filter (configured but previously unused).
-        if SWEEPEA.get("use_bb", False):
-            if bull_pin and not pd.isna(cur["bb_lo"]):
-                if float(cur["low"]) > float(cur["bb_lo"]) * 1.01:
-                    bull_pin = False
-            if bear_pin and not pd.isna(cur["bb_up"]):
-                if float(cur["high"]) < float(cur["bb_up"]) * 0.99:
-                    bear_pin = False
-
-        # MA Filter
-        if SWEEPEA["use_ma"]:
-            if pd.isna(cur["ma_fast"]) or pd.isna(cur["ma_slow"]):
-                return None
-
-            if bull_pin:
-                ma_touch       = cur["low"]   <= cur["ma_fast"]
-                close_recovery = cur["close"] >= cur["ma_fast"] * 0.98
-                if not (ma_touch and close_recovery):
-                    return None
-
-            if bear_pin:
-                ma_touch        = cur["high"]  >= cur["ma_fast"]
-                close_rejection = cur["close"] <= cur["ma_fast"] * 1.02
-                if not (ma_touch and close_rejection):
-                    return None
-
-        # Confidence scales with wick quality and volume expansion.
-        vol_ratio = float(cur["volume"] / cur["vol_ma"]) if cur["vol_ma"] and cur["vol_ma"] > 0 else 1.0
-        bull_conf = min(0.72 + max(lower_wick_ratio - SWEEPEA["pinbar_threshold"], 0) / 200 + max(vol_ratio - 1.0, 0) * 0.05, 0.88)
-        bear_conf = min(0.72 + max(upper_wick_ratio - SWEEPEA["pinbar_threshold"], 0) / 200 + max(vol_ratio - 1.0, 0) * 0.05, 0.88)
-
-        _is_inv = symbol in _INVERSE_ETFS
-        if bull_pin and (_is_bull_regime() or _is_inv):
-            return Signal(symbol, "buy",  float(cur["close"]), bull_conf,
-                          f"Liquidity sweep + bullish pinbar | wick {lower_wick_ratio:.0f}% | vol x{vol_ratio:.1f}", "Sweepea")
-        # Shorts are globally disabled
-        # elif bear_pin and not LONG_ONLY_MODE:
-        #     return Signal(symbol, "sell", float(cur["close"]), bear_conf,
-        #                   f"Liquidity sweep + bearish pinbar | wick {upper_wick_ratio:.0f}% | vol x{vol_ratio:.1f}", "Sweepea")
-
-        return None
-
-
-# ──────────────────────────────────────────────────────────────────────────────
+# ------------------------------------------------------------------------------
 # TrendBreaker Strategy
-# ──────────────────────────────────────────────────────────────────────────────
+# ------------------------------------------------------------------------------
 class TrendBreakerStrategy:
     """Detects upside trend breaks on high short float stocks.
 
     Pattern (short-squeeze breakout):
-      - Stock was below 20-day SMA for ≥5 consecutive days (bears in control)
+      - Stock was below 20-day SMA for >=5 consecutive days (bears in control)
       - Current price breaks back above 20SMA AND above 10-day high
-      - Volume spike ≥2x average (shorts forced to cover)
+      - Volume spike >=2x average (shorts forced to cover)
       - RSI crossing above 50 (momentum flip confirmation)
-      - Bonus: in HIGH_SHORT_FLOAT_STOCKS set → higher confidence
+      - Bonus: in HIGH_SHORT_FLOAT_STOCKS set -> higher confidence
     """
 
     def scan(self, symbol: str) -> Optional[Signal]:
-        # Daily bar only meaningful after 10 AM ET — pre-market bar has <5% of normal volume
+        # Daily bar only meaningful after 10 AM ET -- pre-market bar has <5% of normal volume
         if datetime.datetime.now(ET).hour < 10:
             return None
         daily = get_bars(symbol, "60d", "1d")
@@ -276,7 +136,7 @@ class TrendBreakerStrategy:
         if vol_avg <= 0:
             return None
         vol_ratio = vol_today / vol_avg
-        if vol_ratio < 3.0:   # "Volume Gift": need 3×–5× for aggressive squeeze entry
+        if vol_ratio < 3.0:   # "Volume Gift": need 3x-5x for aggressive squeeze entry
             return None
         if vol_ratio > 40:    # extreme outlier = likely pump/manipulation, not a squeeze
             return None
@@ -297,7 +157,7 @@ class TrendBreakerStrategy:
         # Small-cap gate: disabled until a market-cap data source is wired into utils.
         # Wire in get_market_cap(symbol) here when available; check < $1B for squeeze plays.
 
-        # Confidence: base 0.78, scales with volume gift (3×→5× = 0.78→0.83)
+        # Confidence: base 0.78, scales with volume gift (3x->5x = 0.78->0.83)
         confidence = 0.78 + min((vol_ratio - 3.0) * 0.025, 0.12)
         if is_high_short_float(symbol):
             confidence = min(confidence + 0.07, 0.95)
@@ -354,9 +214,9 @@ class SentimentStrategy:
         return None
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+# ------------------------------------------------------------------------------
 # Technical Strategy
-# ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+# ----------------------------------------------------------------------------------------------------------------------------
 class TechnicalStrategy:
     """Multi-indicator technical analysis (RSI, MACD, MA, Volume)."""
 
@@ -365,7 +225,7 @@ class TechnicalStrategy:
         if bars.empty or len(bars) < 50:
             return None
 
-        # Inverse ETFs are LONG buys in bear market — flip sentiment and relax thresholds
+        # Inverse ETFs are LONG buys in bear market -- flip sentiment and relax thresholds
         is_inverse = symbol in _INVERSE_ETFS
         if is_inverse and market_sentiment in ("bearish", "neutral"):
             market_sentiment = "bullish"  # bear/neutral market = tailwind for inverse ETFs
@@ -385,7 +245,7 @@ class TechnicalStrategy:
             score += 0.3
             reasons.append("Oversold")
         elif cur_rsi > TECHNICAL["rsi_overbought"]:
-            # Inverse ETFs can stay overbought during sustained bear markets — don't penalize
+            # Inverse ETFs can stay overbought during sustained bear markets -- don't penalize
             if not is_inverse:
                 score -= 0.3
             reasons.append("Overbought")
@@ -456,9 +316,9 @@ class TechnicalStrategy:
         return None
 
 
-# ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+# ----------------------------------------------------------------------------------------------------------------------------
 # Momentum Strategy
-# ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+# ----------------------------------------------------------------------------------------------------------------------------
 class MomentumStrategy:
     """Pure momentum trading with volume confirmation."""
 
@@ -506,8 +366,9 @@ class MomentumStrategy:
             return Signal(symbol, "buy", price, confidence,
                           f"Strong momentum ({momentum:.1f}%) + volume x{vol_ratio:.1f} + above SMA20", "Momentum")
 
-        # Bear-market momentum reversal short signal
-        if market_regime == "bear" and not LONG_ONLY_MODE:
+        # Individual-stock momentum reversal short signal. Market regime does
+        # not decide direction; the stock's own momentum, volume, and SMA do.
+        if not LONG_ONLY_MODE:
             if (momentum <= -MOMENTUM["min_momentum"] * 0.8
                     and vol_ratio >= MOMENTUM["volume_surge"]
                     and price < sma20):
@@ -518,9 +379,9 @@ class MomentumStrategy:
         return None
 
 
-# ──────────────────────────────────────────────────────────────
+# --------------------------------------------------------------
 # Gap Breakout Strategy
-# ──────────────────────────────────────────────────────────────
+# --------------------------------------------------------------
 class GapBreakoutStrategy:
     """Gap-up continuation: stock opens significantly above prior close.
 
@@ -532,7 +393,7 @@ class GapBreakoutStrategy:
     """
 
     def scan(self, symbol: str) -> Optional[Signal]:
-        # Daily bars — need at least 2 to get prior close
+        # Daily bars -- need at least 2 to get prior close
         daily = get_bars(symbol, "5d", "1d")
         if daily.empty or len(daily) < 2:
             return None
@@ -583,9 +444,9 @@ class GapBreakoutStrategy:
         )
 
 
-# ──────────────────────────────────────────────────────────────
+# --------------------------------------------------------------
 # Opening Range Breakout (ORB) Strategy
-# ──────────────────────────────────────────────────────────────
+# --------------------------------------------------------------
 class ORBStrategy:
     """Opening Range Breakout: buy when price breaks above the first-N-minute high.
 
@@ -643,11 +504,11 @@ class ORBStrategy:
         )
 
 
-# ──────────────────────────────────────────────────────────────
+# --------------------------------------------------------------
 # VWAP Reclaim Strategy
-# ──────────────────────────────────────────────────────────────
+# --------------------------------------------------------------
 class VWAPReclaimStrategy:
-    """Price reclaims VWAP from below with accelerating volume — second-leg setup.
+    """Price reclaims VWAP from below with accelerating volume -- second-leg setup.
 
     Logic:
       - Calculate intraday VWAP from 1-min bars
@@ -706,10 +567,167 @@ class VWAPReclaimStrategy:
         )
 
 
-# ──────────────────────────────────────────────────────────────
+# --------------------------------------------------------------
+# VWAP Fade Strategy
+# --------------------------------------------------------------
+class VWAPFadeStrategy:
+    """Mean-reversion counter-play to VWAPReclaimStrategy: that one bets on
+    continuation through VWAP, this one bets on a snap-back once price is
+    stretched unusually far from it. Meant for range/chop days where
+    continuation entries just grind into stops.
+
+    Logic:
+      - Calculate intraday VWAP and today's std-dev of (price - VWAP)
+      - Signal: price stretched >= VWAP_FADE['zscore_threshold'] std-devs AND
+        >= VWAP_FADE['min_stretch_pct'] away from VWAP (z-score alone isn't
+        enough on a very quiet session where any wobble looks "extreme")
+      - Recent volume must be cooling off vs the session average -- the move
+        that created the stretch is already losing steam, not a fresh
+        breakdown/breakout worth respecting
+      - Price must already show a small reversal tick off the recent
+        extreme, i.e. catching the turn, not the falling knife
+    """
+
+    def scan(self, symbol: str) -> Optional[Signal]:
+        bars = get_bars(symbol, "1d", "1m")
+        if bars.empty or len(bars) < 30:
+            return None
+
+        bars = bars.copy()
+        bars["tp"]         = (bars["high"] + bars["low"] + bars["close"]) / 3
+        bars["cum_vol"]    = bars["volume"].cumsum()
+        bars["cum_tp_vol"] = (bars["tp"] * bars["volume"]).cumsum()
+        bars["vwap"]       = bars["cum_tp_vol"] / bars["cum_vol"].replace(0, float("nan"))
+
+        cur_close = float(bars["close"].iloc[-1])
+        cur_vwap  = float(bars["vwap"].iloc[-1])
+        if pd.isna(cur_vwap) or cur_vwap <= 0:
+            return None
+
+        deviation = bars["close"] - bars["vwap"]
+        std = float(deviation.std())
+        if not std or pd.isna(std):
+            return None
+        zscore      = float(deviation.iloc[-1]) / std
+        stretch_pct = (cur_close - cur_vwap) / cur_vwap * 100
+
+        vol_recent  = float(bars["volume"].iloc[-3:].mean())
+        vol_session = float(bars["volume"].mean())
+        if vol_session == 0:
+            return None
+        cooling = vol_recent < vol_session
+
+        n = VWAP_FADE["reversal_bars"]
+
+        # Stretched below VWAP + cooling volume + already ticking back up
+        if (zscore <= -VWAP_FADE["zscore_threshold"]
+                and stretch_pct <= -VWAP_FADE["min_stretch_pct"]
+                and cooling):
+            recent_low = float(bars["low"].iloc[-n:].min())
+            if cur_close > recent_low * 1.002:
+                confidence = min(0.70 + abs(zscore) * 0.05, 0.90)
+                return Signal(
+                    symbol, "buy", cur_close, confidence,
+                    f"VWAP fade: {stretch_pct:.1f}% below VWAP (z={zscore:.1f}), volume cooling, turning up",
+                    "VWAPFade",
+                )
+
+        # Symmetric short: stretched above VWAP + cooling volume + already turning down
+        if (not LONG_ONLY_MODE
+                and zscore >= VWAP_FADE["zscore_threshold"]
+                and stretch_pct >= VWAP_FADE["min_stretch_pct"]
+                and cooling):
+            recent_high = float(bars["high"].iloc[-n:].max())
+            if cur_close < recent_high * 0.998:
+                confidence = min(0.70 + abs(zscore) * 0.05, 0.90)
+                return Signal(
+                    symbol, "short", cur_close, confidence,
+                    f"VWAP fade short: {stretch_pct:.1f}% above VWAP (z={zscore:.1f}), volume cooling, turning down",
+                    "VWAPFade",
+                )
+
+        return None
+
+
+# --------------------------------------------------------------
+# Liquidity Sweep Continuation Strategy
+# --------------------------------------------------------------
+class LiquiditySweepStrategy:
+    """'Stop hunt' reversal: a recent swing high/low gets briefly violated
+    (the stops resting there get taken out), price closes back on the
+    original side, then a Break of Structure (BOS) confirms the original
+    trend is resuming. Distinct from ORB/TrendBreaker, which trade the
+    breakout itself -- this trades the fakeout-then-reversal.
+
+    Logic (bullish case, mirrored for bearish):
+      - Establish a prior swing low from an earlier window of bars (the
+        "liquidity pool" resting below it)
+      - Sweep: a more recent bar's low pierces that swing low by
+        >= sweep_buffer_pct, but the current close is back above it
+        (the breakdown didn't hold)
+      - BOS: current close breaks back above the most recent local high
+        by >= bos_buffer_pct -- confirms continuation, not just a bounce
+      - Volume on the BOS move must be elevated vs session average
+    """
+
+    def scan(self, symbol: str) -> Optional[Signal]:
+        lookback = LIQUIDITY_SWEEP["swing_lookback_bars"]
+        recent_n = LIQUIDITY_SWEEP["swing_exclude_bars"]
+
+        bars = get_bars(symbol, "1d", "1m")
+        if bars.empty or len(bars) < lookback + recent_n:
+            return None
+
+        swing_window = bars.iloc[-(lookback + recent_n):-recent_n]
+        recent       = bars.iloc[-recent_n:]
+
+        swing_low  = float(swing_window["low"].min())
+        swing_high = float(swing_window["high"].max())
+        cur_close  = float(bars["close"].iloc[-1])
+
+        vol_avg = float(bars["volume"].mean())
+        if vol_avg == 0:
+            return None
+        vol_ratio = float(bars["volume"].iloc[-2:].mean()) / vol_avg
+
+        sweep_buf = LIQUIDITY_SWEEP["sweep_buffer_pct"] / 100
+        bos_buf   = LIQUIDITY_SWEEP["bos_buffer_pct"] / 100
+        prior_bars = recent.iloc[:-1]  # everything in the recent window except the current bar
+
+        # Bullish: sell-side sweep below swing_low, held, then BOS above a recent local high
+        if (float(recent["low"].min()) < swing_low * (1 - sweep_buf)
+                and cur_close > swing_low
+                and vol_ratio >= LIQUIDITY_SWEEP["volume_surge"]):
+            bos_level = float(prior_bars["high"].max()) if not prior_bars.empty else swing_high
+            if cur_close > bos_level * (1 + bos_buf):
+                confidence = min(0.72 + vol_ratio * 0.03, 0.92)
+                return Signal(
+                    symbol, "buy", cur_close, confidence,
+                    f"Liquidity sweep: swept low ${swing_low:.2f}, BOS above ${bos_level:.2f}, vol x{vol_ratio:.1f}",
+                    "LiquiditySweep",
+                )
+
+        # Bearish: buy-side sweep above swing_high, held, then BOS below a recent local low
+        if not LONG_ONLY_MODE:
+            if (float(recent["high"].max()) > swing_high * (1 + sweep_buf)
+                    and cur_close < swing_high
+                    and vol_ratio >= LIQUIDITY_SWEEP["volume_surge"]):
+                bos_level = float(prior_bars["low"].min()) if not prior_bars.empty else swing_low
+                if cur_close < bos_level * (1 - bos_buf):
+                    confidence = min(0.72 + vol_ratio * 0.03, 0.92)
+                    return Signal(
+                        symbol, "short", cur_close, confidence,
+                        f"Liquidity sweep short: swept high ${swing_high:.2f}, BOS below ${bos_level:.2f}, vol x{vol_ratio:.1f}",
+                        "LiquiditySweep",
+                    )
+
+        return None
+
+
+# --------------------------------------------------------------
 # Float Rotation Strategy
-# ──────────────────────────────────────────────────────────────
-# Module-level caches — persist across scan cycles and strategy instances
+# --------------------------------------------------------------
+# Module-level caches -- persist across scan cycles and strategy instances
 _float_info_cache: dict = {}   # {symbol: float_shares or 0.0 if unavailable}
 _mcap_cache:        dict = {}  # {symbol: market_cap_float}
 
@@ -719,7 +737,7 @@ def _get_float_shares(symbol: str) -> Optional[float]:
     Returns None when float data is unavailable (yfinance not installed, or
     the symbol has no float data). Caches both hits and misses for the session
     so repeated scans of the same symbol don't re-fetch.
-    TTL: session-level (process restart clears it — float data is stable intraday).
+    TTL: session-level (process restart clears it -- float data is stable intraday).
     """
     if symbol in _float_info_cache:
         v = _float_info_cache[symbol]
@@ -734,6 +752,25 @@ def _get_float_shares(symbol: str) -> Optional[float]:
     except Exception:
         pass
     _float_info_cache[symbol] = 0.0   # cache miss so we don't re-fetch this session
+    return None
+
+
+def _get_market_cap(symbol: str) -> Optional[float]:
+    """Cached market cap sourced from yfinance. Returns None when unavailable.
+    Same cache/miss semantics as _get_float_shares -- see there for details."""
+    if symbol in _mcap_cache:
+        v = _mcap_cache[symbol]
+        return v if v > 0 else None
+    try:
+        import yfinance as _yf
+        info = _yf.Ticker(symbol).info
+        mcap = info.get("marketCap")
+        if mcap and float(mcap) > 0:
+            _mcap_cache[symbol] = float(mcap)
+            return float(mcap)
+    except Exception:
+        pass
+    _mcap_cache[symbol] = 0.0
     return None
 
 
@@ -784,14 +821,14 @@ class FloatRotationStrategy:
         )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # Early Momentum / Opening Strategies
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 class PreMarketMomentumStrategy:
-    """Fires 7:00–10:00 AM ET when a stock shows a gap ≥3%, strong pre-market
-    volume (≥15% of average daily vol), and an upward PM price trend.
-    Classic KOD / EEIQ style — catch the runner before the open.
+    """Fires 7:00-10:00 AM ET when a stock shows a gap >=3%, strong pre-market
+    volume (>=15% of average daily vol), and an upward PM price trend.
+    Classic KOD / EEIQ style -- catch the runner before the open.
     """
 
     def scan(self, symbol: str) -> Optional[Signal]:
@@ -849,8 +886,8 @@ class PreMarketMomentumStrategy:
 
 
 class OpeningBellSurgeStrategy:
-    """Fires 9:30–9:45 AM ET when the first N 1-min bars show volume ≥4×
-    the expected baseline AND price is up ≥2% from the open.
+    """Fires 9:30-9:45 AM ET when the first N 1-min bars show volume >=4x
+    the expected baseline AND price is up >=2% from the open.
     Catches explosive gap-and-go moves right at the bell.
     """
 
@@ -902,9 +939,9 @@ class OpeningBellSurgeStrategy:
 
 
 class PMHighBreakoutStrategy:
-    """Fires 9:31–10:30 AM ET when the regular session price breaks out
+    """Fires 9:31-10:30 AM ET when the regular session price breaks out
     above the pre-market high with volume confirmation.  The breakout must
-    be fresh (prior bar still ≤ PM high) to avoid chasing old moves.
+    be fresh (prior bar still <= PM high) to avoid chasing old moves.
     """
 
     def scan(self, symbol: str) -> Optional[Signal]:
@@ -965,8 +1002,8 @@ class PMHighBreakoutStrategy:
 
 
 class EarlySqueezeDetector:
-    """Fires 9:30–10:15 AM ET for low-float stocks showing gap + projected
-    RVOL >4× + price above VWAP + RSI not yet overbought.
+    """Fires 9:30-10:15 AM ET for low-float stocks showing gap + projected
+    RVOL >4x + price above VWAP + RSI not yet overbought.
     Designed to catch KOD / EEIQ / IMTE style small-float squeeze plays.
     """
 
@@ -1010,7 +1047,7 @@ class EarlySqueezeDetector:
         if rvol < EARLY_SQUEEZE["rvol_multiplier"]:
             return None
 
-        # VWAP check — price must be above session VWAP
+        # VWAP check -- price must be above session VWAP
         df       = intraday.copy()
         df["tp"] = (df["high"] + df["low"] + df["close"]) / 3
         cum_tpv  = (df["tp"] * df["volume"]).cumsum()
@@ -1019,7 +1056,7 @@ class EarlySqueezeDetector:
         if cur_price < vwap_now:
             return None
 
-        # RSI check — not yet overbought
+        # RSI check -- not yet overbought
         rsi = calc_rsi(df["close"])
         if not rsi.empty and not pd.isna(rsi.iloc[-1]):
             if rsi.iloc[-1] > EARLY_SQUEEZE["rsi_max"]:
@@ -1036,9 +1073,9 @@ class EarlySqueezeDetector:
         )
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+# ------------------------------------------------------------------------------
 # Bear Breakdown Strategy
-# ──────────────────────────────────────────────────────────────────────────────
+# ------------------------------------------------------------------------------
 class BearBreakdownStrategy:
     """Short-entry: daily breakdown below 20-SMA + 10-day low with volume spike.
 
@@ -1054,9 +1091,9 @@ class BearBreakdownStrategy:
     """
 
     def scan(self, symbol: str) -> Optional[Signal]:
-        if LONG_ONLY_MODE or _is_bull_regime():
+        if LONG_ONLY_MODE:
             return None
-        # Never short inverse ETFs — they're already bearish instruments
+        # Never short inverse ETFs -- they're already bearish instruments
         if symbol in _INVERSE_ETFS:
             return None
         # Daily bar only meaningful after 10 AM ET
@@ -1118,7 +1155,7 @@ class BearBreakdownStrategy:
 
         atr14      = _calc_atr14(daily)
         confidence = 0.78 + min((vol_ratio - 1.5) * 0.03, 0.10)
-        if rsi_now < rsi_prev:       # RSI still falling — extra confirmation
+        if rsi_now < rsi_prev:       # RSI still falling -- extra confirmation
             confidence += 0.02
         confidence = round(min(confidence, 0.92), 2)
 
@@ -1130,15 +1167,15 @@ class BearBreakdownStrategy:
         )
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Power of 3 Strategy  (ICT: Accumulation → Manipulation → Distribution)
-# ──────────────────────────────────────────────────────────────────────────────
+# ------------------------------------------------------------------------------
+# Power of 3 Strategy  (ICT: Accumulation -> Manipulation -> Distribution)
+# ------------------------------------------------------------------------------
 class PowerOf3Strategy:
-    """ICT Power of 3: tight morning accumulation → sweep below the range low
-    (manipulation) → recovery and breakout above morning high (distribution).
+    """ICT Power of 3: tight morning accumulation -> sweep below the range low
+    (manipulation) -> recovery and breakout above morning high (distribution).
 
-    Entry window: 11:30 AM–2:30 PM ET (pattern must have fully formed).
-    Stop: just below the manipulation low — very tight relative to target.
+    Entry window: 11:30 AM-2:30 PM ET (pattern must have fully formed).
+    Stop: just below the manipulation low -- very tight relative to target.
     Target: morning range high (distribution leg).
     """
 
@@ -1147,7 +1184,7 @@ class PowerOf3Strategy:
         market_open = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
         mins_since  = (now_et - market_open).total_seconds() / 60.0
 
-        # Pattern needs ≥120 min to form; stale after 2:30 PM
+        # Pattern needs >=120 min to form; stale after 2:30 PM
         if not (120.0 <= mins_since <= 300.0):
             return None
 
@@ -1155,17 +1192,17 @@ class PowerOf3Strategy:
         if bars.empty or len(bars) < 125:
             return None
 
-        # ── Accumulation: first 120 bars (9:30–11:30) ────────────────────
+        # -- Accumulation: first 120 bars (9:30-11:30) --------------------
         accum  = bars.iloc[:120]
         a_high = float(accum["high"].max())
         a_low  = float(accum["low"].min())
         if a_low <= 0:
             return None
         range_pct = (a_high - a_low) / a_low * 100
-        if range_pct > 3.0:       # must be a tight consolidation (≤3%)
+        if range_pct > 3.0:       # must be a tight consolidation (<=3%)
             return None
 
-        # ── Post-accumulation bars ────────────────────────────────────────
+        # -- Post-accumulation bars ----------------------------------------
         post = bars.iloc[120:]
         if len(post) < 3:
             return None
@@ -1173,20 +1210,20 @@ class PowerOf3Strategy:
         cur_close  = float(bars["close"].iloc[-1])
         prev_close = float(bars["close"].iloc[-2])
 
-        # ── Manipulation: price swept below accumulation low ──────────────
+        # -- Manipulation: price swept below accumulation low --------------
         post_low = float(post["low"].min())
-        if post_low >= a_low:      # no sweep — pattern not triggered
+        if post_low >= a_low:      # no sweep -- pattern not triggered
             return None
 
-        # ── Distribution entry ────────────────────────────────────────────
-        # Case A: fresh reclaim of morning low (prev ≤ a_low, cur > a_low)
+        # -- Distribution entry --------------------------------------------
+        # Case A: fresh reclaim of morning low (prev <= a_low, cur > a_low)
         # Case B: already breaking above morning high (distribution fully underway)
         fresh_reclaim    = prev_close <= a_low   and cur_close >  a_low
         breaking_high    = prev_close <= a_high * 1.002 and cur_close > a_high
         if not (fresh_reclaim or breaking_high):
             return None
 
-        # ── Volume: post-accum bars must be livelier than accumulation avg ─
+        # -- Volume: post-accum bars must be livelier than accumulation avg -
         vol_accum_avg = float(accum["volume"].mean())
         vol_recent    = float(post["volume"].iloc[-3:].mean())
         if vol_accum_avg <= 0:
@@ -1195,7 +1232,7 @@ class PowerOf3Strategy:
         if vol_ratio < 1.5:
             return None
 
-        # ── RSI not yet overbought ────────────────────────────────────────
+        # -- RSI not yet overbought ----------------------------------------
         rsi = calc_rsi(bars["close"])
         if not rsi.empty and not pd.isna(rsi.iloc[-1]):
             if rsi.iloc[-1] > 75:
@@ -1224,21 +1261,33 @@ def get_strategy_instances(bull_regime: bool = True):
         GapBreakoutStrategy(),
         ORBStrategy(),
         VWAPReclaimStrategy(),
-        FloatRotationStrategy(),
-        MomentumStrategy(),
-        TechnicalStrategy(),
-        SweepeaStrategy(),
         TrendBreakerStrategy(),
-        SentimentStrategy(),
-        PreMarketMomentumStrategy(),
         OpeningBellSurgeStrategy(),
-        PMHighBreakoutStrategy(),
         EarlySqueezeDetector(),
         PowerOf3Strategy(),
     ]
 
-    # Only add bear-regime strategies when we are actually in a bear regime
-    if not bull_regime:
-        strategies.append(BearBreakdownStrategy())
+    # 2026-08-14/15: disabled -- backtested net-negative (see the toggles'
+    # block in config.py for the numbers behind each one).
+    if VWAP_FADE_ENABLED:
+        strategies.append(VWAPFadeStrategy())
+    if MOMENTUM_ENABLED:
+        strategies.append(MomentumStrategy())
+    if FLOAT_ROTATION_ENABLED:
+        strategies.append(FloatRotationStrategy())
+    if TECHNICAL_ENABLED:
+        strategies.append(TechnicalStrategy())
+    if SENTIMENT_ENABLED:
+        strategies.append(SentimentStrategy())
+    if PRE_MARKET_MOMENTUM_ENABLED:
+        strategies.append(PreMarketMomentumStrategy())
+    if PM_HIGH_BREAKOUT_ENABLED:
+        strategies.append(PMHighBreakoutStrategy())
+    if LIQUIDITY_SWEEP_ENABLED:
+        strategies.append(LiquiditySweepStrategy())
+
+    # Stock-level breakdown conditions decide whether this strategy emits a
+    # short; do not disable it just because the broad market is bullish.
+    strategies.append(BearBreakdownStrategy())
     return strategies
 

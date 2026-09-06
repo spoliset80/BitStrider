@@ -1,5 +1,5 @@
 """
-Dry-run top-3 scanner: scrape TI -> update config -> run all strategies -> print top 3.
+Dry-run top-3 scanner: refresh Yahoo universe -> update config -> run all strategies -> print top 3.
 No orders are placed.
 """
 import warnings, logging, sys, os
@@ -8,12 +8,12 @@ logging.basicConfig(level=logging.ERROR)
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, os.path.dirname(__file__))
 
-# ── Step 1: Fresh TI scrape ──────────────────────────────────────
-from engine.ti.capture_tradeideas import scrape_tradeideas
-print("Step 1/3: Scraping Trade Ideas (15min)...")
-scrape_tradeideas(update_config=True, headless=True, select_minutes=15)
+# -- Step 1: Fresh Yahoo universe refresh ----------------------------
+from engine.ti.yahoo_universe import write_ti_primary
+print("Step 1/3: Refreshing Yahoo Finance universe...")
+write_ti_primary()
 
-# ── Step 2: Reload config & scan ────────────────────────────────
+# -- Step 2: Reload config & scan --------------------------------
 import importlib
 import engine.config as cfg
 importlib.reload(cfg)
@@ -31,12 +31,12 @@ if scan_errors:
 
 signals.sort(key=lambda x: -x.confidence)
 
-# ── Step 3: Print results ────────────────────────────────────────
+# -- Step 3: Print results ----------------------------------------
 print()
 print(f"Step 3/3: Total signals found: {len(signals)}")
 print()
 print("=" * 57)
-print("  TOP 3 STRATEGY PICKS  (DRY RUN — no orders placed)")
+print("  TOP 3 STRATEGY PICKS  (DRY RUN -- no orders placed)")
 print("=" * 57)
 
 for i, s in enumerate(signals[:3], 1):

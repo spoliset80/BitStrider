@@ -1,0 +1,126 @@
+{
+  "updated": "2026-09-05T19:25:14.533332+00:00",
+  "count": 30,
+  "signals": [
+    {
+      "symbol": "GPRO",
+      "action": "buy"
+    },
+    {
+      "symbol": "SNDG",
+      "action": "buy"
+    },
+    {
+      "symbol": "SNXX",
+      "action": "buy"
+    },
+    {
+      "symbol": "CBRG",
+      "action": "buy"
+    },
+    {
+      "symbol": "AXTX",
+      "action": "buy"
+    },
+    {
+      "symbol": "AEHR",
+      "action": "buy"
+    },
+    {
+      "symbol": "SNDK",
+      "action": "buy"
+    },
+    {
+      "symbol": "COHU",
+      "action": "buy"
+    },
+    {
+      "symbol": "CBRS",
+      "action": "buy"
+    },
+    {
+      "symbol": "ALAB",
+      "action": "buy"
+    },
+    {
+      "symbol": "AXTI",
+      "action": "buy"
+    },
+    {
+      "symbol": "AAPL",
+      "action": "buy"
+    },
+    {
+      "symbol": "AI",
+      "action": "buy"
+    },
+    {
+      "symbol": "AMD",
+      "action": "buy"
+    },
+    {
+      "symbol": "AMZN",
+      "action": "buy"
+    },
+    {
+      "symbol": "ARM",
+      "action": "buy"
+    },
+    {
+      "symbol": "AVGO",
+      "action": "buy"
+    },
+    {
+      "symbol": "GOOGL",
+      "action": "buy"
+    },
+    {
+      "symbol": "META",
+      "action": "buy"
+    },
+    {
+      "symbol": "MRVL",
+      "action": "buy"
+    },
+    {
+      "symbol": "MSFT",
+      "action": "buy"
+    },
+    {
+      "symbol": "MU",
+      "action": "buy"
+    },
+    {
+      "symbol": "NFLX",
+      "action": "buy"
+    },
+    {
+      "symbol": "NVDA",
+      "action": "buy"
+    },
+    {
+      "symbol": "ORCL",
+      "action": "buy"
+    },
+    {
+      "symbol": "PLTR",
+      "action": "buy"
+    },
+    {
+      "symbol": "QLD",
+      "action": "buy"
+    },
+    {
+      "symbol": "SMCI",
+      "action": "buy"
+    },
+    {
+      "symbol": "SPCX",
+      "action": "buy"
+    },
+    {
+      "symbol": "TSM",
+      "action": "buy"
+    }
+  ]
+}

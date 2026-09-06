@@ -1,47 +1,47 @@
 {
-  "generated_at": "2026-04-24T21:03:09-04:00",
-  "date": "2026-04-24",
-  "market_regime": "bull",
+  "generated_at": "2026-09-04T15:44:09-04:00",
+  "date": "2026-09-04",
+  "market_regime": "stock",
   "picks": [
     {
-      "symbol": "ANAB",
+      "symbol": "AXTI",
       "action": "buy",
-      "price": 59.02,
-      "confidence": 0.8398,
-      "strategy": "Momentum",
-      "reason": "Strong momentum (11.0%) + volume x8.2 + above SMA20"
+      "price": 61.445,
+      "confidence": 0.75,
+      "strategy": "TopList",
+      "reason": "Top-list candidate after guardrails; waiting on EMA entry conditions"
     },
     {
-      "symbol": "ELPW",
+      "symbol": "AVGO",
       "action": "buy",
-      "price": 3.62,
-      "confidence": 0.82,
-      "strategy": "Sweepea",
-      "reason": "Daily Sweepea pullback to 20-EMA | ATR $0.52"
+      "price": 356.87,
+      "confidence": 0.75,
+      "strategy": "TopList",
+      "reason": "Top-list candidate after guardrails; waiting on EMA entry conditions"
     },
     {
-      "symbol": "HLX",
+      "symbol": "AMD",
       "action": "buy",
-      "price": 9.89,
-      "confidence": 0.82,
-      "strategy": "Sweepea",
-      "reason": "Daily Sweepea pullback to 8-EMA | ATR $0.37"
+      "price": 473.625,
+      "confidence": 0.75,
+      "strategy": "TopList",
+      "reason": "Top-list candidate after guardrails; waiting on EMA entry conditions"
     },
     {
-      "symbol": "KN",
+      "symbol": "META",
       "action": "buy",
-      "price": 30.61,
-      "confidence": 0.82,
-      "strategy": "Sweepea",
-      "reason": "Daily Sweepea pullback to 8-EMA | ATR $1.14"
+      "price": 615.55,
+      "confidence": 0.75,
+      "strategy": "TopList",
+      "reason": "Top-list candidate after guardrails; waiting on EMA entry conditions"
     },
     {
-      "symbol": "CSL",
+      "symbol": "GOOGL",
       "action": "buy",
-      "price": 360.07,
-      "confidence": 0.82,
-      "strategy": "Sweepea",
-      "reason": "Daily Sweepea pullback to 8-EMA | ATR $14.74"
+      "price": 338.69,
+      "confidence": 0.75,
+      "strategy": "TopList",
+      "reason": "Top-list candidate after guardrails; waiting on EMA entry conditions"
     }
   ]
 }

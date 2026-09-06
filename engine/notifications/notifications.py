@@ -44,55 +44,8 @@ def _format_signal_text(signals) -> str:
     return "\n".join(lines)
 
 
-def _format_signal_html(signals) -> str:
-    if not signals:
-        return "<p>No signals</p>"
-    rows = "".join(
-        f"<tr><td>{i+1}</td><td>{s.symbol}</td><td>{s.action.upper()}</td><td>${s.price:.2f}</td><td>{s.confidence:.0%}</td><td>{s.strategy}</td><td>{s.reason}</td></tr>"
-        for i, s in enumerate(signals[:3])
-    )
-    return (
-        "<table border='1' cellpadding='4' cellspacing='0' style='border-collapse:collapse;'>"
-        "<thead><tr><th>#</th><th>Symbol</th><th>Action</th><th>Price</th><th>Confidence</th><th>Strategy</th><th>Reason</th></tr></thead>"
-        f"<tbody>{rows}</tbody></table>"
-    )
-
-
 def _build_html_section(title: str, content: str) -> str:
     return f"<h2>{title}</h2>\n{content}\n"
-
-
-def _build_signal_table(signals) -> str:
-    if not signals:
-        return "<p>No signals available.</p>"
-
-    rows = "".join(
-        f"<tr><td>{i+1}</td><td>{s.symbol}</td><td>{s.action.upper()}</td><td>${s.price:.2f}</td><td>{s.confidence:.0%}</td><td>{s.strategy}</td><td>{s.reason}</td></tr>"
-        for i, s in enumerate(signals)
-    )
-    return (
-        "<table border='1' cellpadding='5' cellspacing='0' style='border-collapse:collapse;width:100%;'>"
-        "<thead><tr><th>#</th><th>Symbol</th><th>Action</th><th>Price</th><th>Confidence</th><th>Strategy</th><th>Reason</th></tr></thead>"
-        f"<tbody>{rows}</tbody></table>"
-    )
-
-
-def _build_positions_table(positions) -> str:
-    if not positions:
-        return "<p>No open positions at EOD.</p>"
-
-    sorted_positions = sorted(positions, key=lambda p: float(p.unrealized_pl), reverse=True)
-    rows = "".join(
-        f"<tr><td>{p.symbol}</td><td>{p.qty}</td><td>${float(p.avg_entry_price):,.2f}</td>"
-        f"<td>{float(p.current_price):,.2f}</td><td>{float(p.unrealized_pl):,.2f}</td>"  # type: ignore
-        f"<td>{float(p.unrealized_plpc) * 100:.2f}%</td></tr>"
-        for p in sorted_positions
-    )
-    return (
-        "<table border='1' cellpadding='5' cellspacing='0' style='border-collapse:collapse;'>"
-        "<thead><tr><th>Symbol</th><th>Qty</th><th>Entry</th><th>Current</th><th>Unrealized P&L</th><th>Unrealized %</th></tr></thead>"
-        f"<tbody>{rows}</tbody></table>"
-    )
 
 
 def build_top5_report(signals, report_date: date, sentiment: str = "neutral",
@@ -108,7 +61,7 @@ def build_top5_report(signals, report_date: date, sentiment: str = "neutral",
 
     # Plain text
     text_lines = [
-        f"ApexTrader Top 5 Scan Picks — {report_date.isoformat()}",
+        f"ApexTrader Top 5 Scan Picks -- {report_date.isoformat()}",
         f"Market Sentiment: {sentiment.upper()} | Regime: {regime.upper()}",
         (
             f"Action Mix: BUY {action_counts.get('buy', 0)} | "
@@ -128,14 +81,13 @@ def build_top5_report(signals, report_date: date, sentiment: str = "neutral",
 
     # Strategy insight blurbs
     _strat_insight = {
-        "TrendBreaker":    "Shorts trapped above key MA — squeeze in progress",
-        "Sweepea":         "Liquidity swept below support, pinbar reversal forming",
-        "GapBreakout":     "Gap-up continuation — momentum carrying overnight move",
-        "ORB":             "Opening range cleared — intraday breakout confirmed",
-        "VWAPReclaim":     "VWAP reclaimed with volume — institutional buying",
-        "FloatRotation":   "Low float rotating fast — high short interest catalyst",
+        "TrendBreaker":    "Shorts trapped above key MA -- squeeze in progress",
+        "GapBreakout":     "Gap-up continuation -- momentum carrying overnight move",
+        "ORB":             "Opening range cleared -- intraday breakout confirmed",
+        "VWAPReclaim":     "VWAP reclaimed with volume -- institutional buying",
+        "FloatRotation":   "Low float rotating fast -- high short interest catalyst",
         "Momentum":        "Strong price momentum with volume surge backing it",
-        "Technical":       "Multi-indicator confluence — RSI, MACD, MA aligned",
+        "Technical":       "Multi-indicator confluence -- RSI, MACD, MA aligned",
     }
 
     medals = ["\U0001f947", "\U0001f948", "\U0001f949", "\U0001f3c5", "\U0001f396\ufe0f"]
@@ -361,7 +313,7 @@ def build_eod_report(
             mp = float(t.get('momentum_pct', 0))
             cp = float(t.get('current_price', 0)) if t.get('current_price') is not None else 0
             sentiment = t.get('sentiment', 'n/a')
-            html.append(f"<li style='margin-bottom:4px;'><strong>{symbol}</strong> — {mp:+.1f}% | ${cp:,.2f} | sentiment: {sentiment}</li>")
+            html.append(f"<li style='margin-bottom:4px;'><strong>{symbol}</strong> -- {mp:+.1f}% | ${cp:,.2f} | sentiment: {sentiment}</li>")
         html.append("</ul>")
     else:
         html.append("<p style='margin:0;color:#c5d6ff;font-size:13px;'>No recent discovery tickers available.</p>")
@@ -454,7 +406,7 @@ def send_email(subject: str, text: str, html: Optional[str] = None) -> bool:
     _th.join(timeout=60)
 
     if _th.is_alive():
-        # Thread still blocked after 60 s — log and return; trading loop continues.
+        # Thread still blocked after 60 s -- log and return; trading loop continues.
         print(f"[WARN ] send_email timed out (>60 s) for subject: {subject!r}")
         return False
     if _exc[0] is not None:
@@ -462,7 +414,7 @@ def send_email(subject: str, text: str, html: Optional[str] = None) -> bool:
     return bool(_result[0])
 
 
-# ── High-level notification helpers ───────────────────────────────────────
+# -- High-level notification helpers ---------------------------------------
 import logging as _logging
 _nlog = _logging.getLogger("ApexTrader")
 _last_scan_sent_at: float = 0.0
